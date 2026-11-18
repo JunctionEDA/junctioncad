@@ -1,0 +1,6 @@
+# Web test files that already fail on master (2026-11-16).  CI (scripts/ci-web-tests.mjs) lets these fail and
+# fails on any other.  Fix one, then take its line out; CI says when a listed test starts passing.
+pcb-tools
+fab
+sch-visuals
+sweep7-ui

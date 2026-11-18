@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitHub — Junction</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<script>try { var t = localStorage.getItem("kui.theme"); if (t === "dark" || t === "light") document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<style>
+{{THEME}}
+  html, body { margin: 0; }
+  body { min-height: 100vh; color: var(--ink); font: var(--fs-md)/1.5 var(--font); -webkit-font-smoothing: antialiased;
+         background-color: var(--paper);
+         background-image: radial-gradient(color-mix(in srgb, var(--line-2) 55%, transparent) 1px, transparent 1.3px);
+         background-size: 20px 20px; }
+  header { display: flex; align-items: center; gap: 10px; padding: 8px var(--s-4); background: var(--bench);
+           border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+  header .mark svg { width: 20px; height: 20px; display: block; }
+  header b { font-weight: 600; }
+  header .crumb { color: var(--ink-2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  header .backlink { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px 3px 6px; border: 1px solid var(--line); border-radius: var(--r-2);
+           color: var(--ink-2); text-decoration: none; font-size: var(--fs-sm); font-weight: 500; white-space: nowrap; }
+  header .backlink:hover { color: var(--ink); border-color: var(--line-2); background: var(--sel-soft); }
+  header .sp { flex: 1; }
+  header .who { font: var(--fs-sm) var(--mono); color: var(--ink-3); white-space: nowrap; }
+  main { max-width: 860px; margin: 0 auto; padding: 20px var(--s-4) 60px; display: grid; gap: var(--s-4); }
+  .box > h2 .sp { flex: 1; }
+  h1 { margin: 0 0 4px; font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.01em; }
+  p { margin: 0 0 10px; } p:last-child { margin-bottom: 0; }
+  .muted { font-size: var(--fs-base); }
+  .mono { font-size: var(--fs-sm); }
+  /* Pages use the large control size; the header's back button stays small. */
+  .btn { min-height: var(--h-lg); padding: 5px 14px; }
+  .btn.small { min-height: var(--h-md); padding: 2px 10px; }
+  input[type=text], select, textarea { width: 100%; min-height: var(--h-lg); padding: 5px 9px; border-radius: var(--r-2); border: 1px solid var(--line);
+         background: var(--panel); color: var(--ink); font: var(--fs-base) var(--font); }
+  input[type=text]:hover, select:hover, textarea:hover { border-color: var(--line-2); }
+  input[type=text]:focus, select:focus, textarea:focus { outline: 0; border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue); }
+  select { width: auto; max-width: 100%; }
+  label.f { display: grid; gap: 4px; font-size: var(--fs-sm); color: var(--ink-2); font-weight: 500; }
+  .row { gap: 10px; align-items: end; flex-wrap: wrap; }
+  .row > .grow { flex: 1 1 200px; min-width: 0; }
+  .list { border: 1px solid var(--line); border-radius: var(--r-2); max-height: 300px; overflow: auto; background: var(--panel); }
+  .list .it { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--line); cursor: pointer;
+              width: 100%; text-align: left; background: none; border-left: 0; border-right: 0; border-top: 0; color: inherit; font: inherit; }
+  .list .it:last-child { border-bottom: 0; }
+  .list .it:hover { background: var(--sel-soft); } .list .it.sel { background: var(--sel); }
+  .list .it .nm { font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .list .it .sp { flex: 1; }
+  .list .empty { padding: 14px; border: 0; background: none; font-size: var(--fs-base); text-align: left; }
+  .pill { text-transform: none; letter-spacing: 0; font-size: var(--fs-xs); }
+  .pill.push { color: var(--blue); border-color: var(--blue); }
+  .pill.pull { color: var(--teal); border-color: var(--teal); }
+  .pill.conflict { color: var(--warn); border-color: var(--warn); }
+  .pill.synced { color: var(--wire); border-color: color-mix(in srgb, var(--wire) 50%, var(--line)); }
+  .chips { display: flex; gap: var(--s-2); flex-wrap: wrap; }
+  .chip { flex: 1 1 110px; border: 1px solid var(--line); border-radius: var(--r-2); padding: 8px 10px; background: var(--paper); }
+  .chip b { display: block; font: 600 var(--fs-xl)/1.2 var(--font); }
+  .chip span { font-size: var(--fs-sm); color: var(--ink-2); }
+  .chip.push b { color: var(--blue); } .chip.pull b { color: var(--teal); } .chip.conflict b { color: var(--warn); } .chip.zero b { color: var(--ink-3); }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font: 500 var(--fs-xs) var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
+       padding: 6px 14px; border-bottom: 1px solid var(--line); background: var(--paper); }
+  td { padding: 7px 14px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  tr:last-child td { border-bottom: 0; }
+  td.path { font: var(--fs-sm) var(--mono); overflow-wrap: anywhere; }
+  td.detail { color: var(--ink-2); font-size: var(--fs-sm); }
+  tr.diffrow td { background: var(--paper); padding: 10px 14px; }
+  .sides { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+  .side h3 { margin: 0 0 4px; font-size: var(--fs-sm); font-weight: 600; }
+  ul.changes { margin: 0; padding: 0; list-style: none; font-size: var(--fs-sm); max-height: 260px; overflow: auto; }
+  ul.changes li { padding: 2px 0; overflow-wrap: anywhere; }
+  .k { display: inline-block; min-width: 58px; font: var(--fs-xs) var(--mono); }
+  .k.added { color: var(--wire); } .k.removed { color: var(--err); } .k.changed { color: var(--blue); }
+  td.act { white-space: nowrap; text-align: right; } td.act select { margin-right: 6px; }
+  .seg button { min-height: calc(var(--h-lg) - 2px); }
+  .commit { display: flex; gap: 10px; align-items: baseline; padding: 6px 14px; border-bottom: 1px solid var(--line); font-size: var(--fs-base); }
+  .commit:last-child { border-bottom: 0; }
+  .commit.proj { align-items: center; padding: 8px 14px; flex-wrap: wrap; }
+  .commit.proj .msg { white-space: normal; display: grid; gap: 2px; }
+  .commit.proj .where { font-size: var(--fs-sm); }
+  #folders .btn.on { border-color: var(--accent); }
+  .commit .msg { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* A project to pick in a repository: a tick box, its name and folder, and what it shares. */
+  .list .it.pick { align-items: flex-start; cursor: pointer; }
+  .list .it.pick.isOnline { cursor: default; }
+  .list .it.pick input[type=checkbox], .list .it.pick .tick { margin: 3px 0 0; flex: 0 0 auto; width: 14px; height: 14px; }
+  .list .it.pick .what { min-width: 0; display: grid; gap: 2px; }
+  .list .it.pick .line { display: flex; gap: 10px; align-items: baseline; min-width: 0; flex-wrap: wrap; }
+  .list .it.pick .about { font-size: var(--fs-sm); overflow-wrap: anywhere; }
+  .list .it.pick > .muted, .list .it.pick > .btn { flex: 0 0 auto; white-space: nowrap; }
+  .warnText { color: var(--warn); }
+  td.path .was { font-size: var(--fs-xs); }
+  td.path .tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 3px; }
+  .callout ul { margin: 4px 0 0; padding-left: 18px; }
+  .hide { display: none !important; }
+  @media (max-width: 600px) {
+    main { padding: 12px 10px 50px; gap: 12px; }
+    header .who { display: none; }
+    /* The file table becomes a stack of cards: a row per file would not fit. */
+    table.files thead { display: none; }
+    table.files tr { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+    table.files tr:last-child { border-bottom: 0; }
+    table.files td { padding: 0; border: 0; }
+    table.files td.path { grid-column: 1; }
+    table.files td.st { grid-column: 2; grid-row: 1; text-align: right; }
+    table.files td.detail { grid-column: 1 / -1; }
+    table.files td.act { grid-column: 1 / -1; } table.files td.act:empty { display: none; }
+    table.files td.act { display: flex; gap: 6px; margin-top: 4px; white-space: normal; } table.files td.act select { flex: 1; margin: 0; }
+    table.files tr.diffrow { display: block; padding: 0; } table.files tr.diffrow td { display: block; padding: 10px 12px; }
+    .btn, .btn.small { min-height: var(--h-touch); } input[type=text], select { min-height: var(--h-touch); font-size: 16px; }
+    .actions .btn { flex: 1 1 auto; }
+    .chip { flex: 1 1 40%; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <a class="mark" href="/" title="Home">{{MARK}}</a>
+  <a class="backlink" href="/" id="toProjects" title="Back to your projects"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M9.5 3.5 5 8l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Projects</a>
+  <b>GitHub</b>
+  <span class="crumb" id="crumb"></span>
+  <span class="sp"></span>
+  <span class="who" id="who"></span>
+  <a class="btn small hide" id="back" href="/">Open project</a>
+</header>
+<main id="app"><div class="muted">Loading…</div></main>
+<script src="/static/github.js"></script>
+</body>
+</html>

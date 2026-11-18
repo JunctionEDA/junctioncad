@@ -1,0 +1,171 @@
+/* tailwind.css — the Tailwind v4 entry for the React chrome (web/**.tsx).  Built by
+   `@tailwindcss/cli -i web/shared/styles/tailwind.css -o static/dist/ui.css` (see package.json).
+   It is the chrome's only stylesheet: every rule of the former chrome.css is now a utility on the
+   element that needs it, and the classes that other code still queries (`kb`, `on`, `desk`, `kbody`,
+   `#ltools .tb.on`, …) are bare hooks with no rule of their own.
+
+   The tokens (--bench, --paper, --ink, …, light AND dark) live in static/theme.css and are the
+   only colour source: the @theme below just maps them into Tailwind's namespaces, so `bg-bench`
+   emits `background-color: var(--color-bench)` → `var(--bench)` and follows the theme automatically.
+
+   Preflight is deliberately NOT imported.  ui.css is loaded before app.html's <style>, and the home
+   view, the stage, the KiCad dialogs (.kd-*), props.js and the tool modules render markup that
+   relies on UA defaults (unclassed <button>s, <p>/<h3> margins, `ol.lead` numbering, textarea
+   resize, …) — preflight would reset all of it.  Only the theme and the utilities are used. */
+
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme" layer(theme);
+
+/* Only the React sources are scanned (no automatic cwd detection — static/*.js and the generated
+   spec would otherwise contribute stray candidates). */
+@source "../../main.tsx";
+@source "../components/**/*.tsx";
+@source "../../domains/pcb/ai/**/*.tsx";
+@source "../../domains/pcb/plugins/**/*.tsx";
+@source "../../platform/review/**/*.tsx";
+@source "../../platform/doctabs/**/*.tsx";
+@source "../../platform/projecthome/**/*.tsx";
+@source "../../platform/history/**/*.tsx";
+@source "../../domains/mechanical/**/*.tsx";
+@source "../../domains/assembly/**/*.tsx";
+@source "../*.ts";
+@source "../../domains/pcb/*.ts";
+@source not "../../domains/pcb/generated";
+
+@theme {
+  /* Wipe Tailwind's stock palette / fonts / shadows / type scale so only the theme.css tokens exist:
+     `bg-red-500` or `text-slate-400` fail to build instead of shipping a hard-coded colour. */
+  --color-*: initial;
+  --font-*: initial;
+  --shadow-*: initial;
+  --text-*: initial;
+  --radius-*: initial;
+
+  /* ---- surfaces & lines (theme.css :root, both themes) ---- */
+  --color-bench: var(--bench);        /* chrome: toolbars, docks, captions      → bg-bench   */
+  --color-paper: var(--paper);        /* the sheet; pane bodies, hover fill      → bg-paper   */
+  --color-panel: var(--panel);        /* inputs, menus, raised surfaces          → bg-panel   */
+  --color-panel-2: var(--panel-2);    /* legacy alias of --paper                 → bg-panel-2 */
+  --color-line: var(--line);          /* 1px rules                               → border-line */
+  --color-line-2: var(--line-2);      /* grid dots                               → border-line-2 */
+  /* ---- text ---- */
+  --color-ink: var(--ink);            /* primary text                            → text-ink   */
+  --color-ink-2: var(--ink-2);        /* secondary                               → text-ink-2 */
+  --color-ink-3: var(--ink-3);        /* tertiary / mono captions                → text-ink-3 */
+  /* ---- accents (KiCad layer colours) ---- */
+  --color-copper: var(--copper);      /* F.Cu — primary action                   → bg-copper  */
+  --color-copper-2: var(--copper-2);  /* pressed/border of primary               → border-copper-2 */
+  --color-blue: var(--blue);          /* B.Cu — links, selection, menu hover     → bg-blue    */
+  --color-teal: var(--teal);          /* values & references                     → text-teal  */
+  --color-wire: var(--wire);          /* live / ok                               → bg-wire    */
+  --color-warn: var(--warn);          /* ERC warning                             → text-warn  */
+  --color-err: var(--err);            /* ERC error                               → text-err   */
+  --color-silk: var(--silk);          /* silkscreen (canvas labels)              → text-silk  */
+  --color-canvas: var(--canvas);      /* board background                        → bg-canvas  */
+  /* older names theme.css also defines */
+  --color-accent: var(--accent);      /* primary action fill                     → bg-accent  */
+  --color-hot: var(--hot);            /* = --warn */
+  --color-ok: var(--ok);              /* = --wire */
+  --color-danger: var(--danger);      /* = --err  */
+  /* theme-invariant colours the chrome hard-codes on purpose (text on a --blue/--copper fill) */
+  --color-white: #fff;
+  --color-black: #000;
+
+  --color-accent-2: var(--accent-2);  /* its border, hover, pressed              → border-accent-2 */
+  --color-on-accent: var(--on-accent);/* text on an accent or error fill          → text-on-accent */
+  --color-err-2: var(--err-2);        /* destructive hover                        → bg-err-2 */
+  --color-sheet: var(--sheet);        /* schematic background                     → bg-sheet */
+  --color-mark: var(--mark);          /* canvas annotations                       → text-mark */
+
+  /* ---- states (opaque mixes defined in theme.css — NOT Tailwind's `/22` opacity modifier, which
+          mixes with transparent in oklab and renders differently) ---- */
+  --color-on: var(--on);                                                   /* .kb.on fill          → bg-on         */
+  --color-on-line: var(--on-line);                                         /* .kb.on border        → border-on-line */
+  --color-tb-hover: var(--tb-hover);                                       /* toolbar button hover / checked */
+  --color-tb-on-hover: var(--tb-on-hover);                                 /* checked button hovered */
+  --color-tb-press: var(--tb-press);                                       /* toolbar button pressed */
+  --color-sel: var(--sel);                                                 /* selected row / node  → bg-sel        */
+  --color-sel-soft: var(--sel-soft);                                       /* table row hover      → bg-sel-soft   */
+  --color-line-soft: color-mix(in srgb, var(--line) 50%, transparent);     /* table cell rule      → border-line-soft */
+
+  /* ---- radii ---- */
+  --radius-xs: var(--r-1);            /* badges, kbd                             → rounded-xs */
+  --radius-sm: var(--r-2);            /* buttons, inputs, menu items             → rounded-sm */
+  --radius-md: var(--r-3);            /* menus, popovers, dialogs                → rounded-md */
+  --radius-full: 999px;               /* dots, avatars                           → rounded-full */
+
+  /* ---- fonts ---- */
+  --font-sans: var(--font);           /* IBM Plex Sans stack                     → font-sans  */
+  --font-mono: var(--mono);           /* IBM Plex Mono stack                     → font-mono  */
+
+  /* ---- shadows ---- */
+  --shadow-panel: var(--shadow);      /* menus, palettes, popover                → shadow-panel */
+  --shadow-window: var(--shadow-dialog); /* dialogs and windows                → shadow-window */
+
+  /* ---- type scale: the chrome's px sizes, font-size ONLY (no paired line-height, so the inherited
+          13px/1.45 body leading is kept exactly as the old chrome.css did) ---- */
+  --text-2xs: var(--fs-2xs);          /* 10px  pane h3 captions                  → text-2xs */
+  --text-xs: var(--fs-xs);            /* 11px  mono meta, kbd, status bar        → text-xs  */
+  --text-sm: var(--fs-sm);            /* 12px  pane bodies, buttons, controls    → text-sm  */
+  --text-base: var(--fs-base);        /* 13px  body default                      → text-base */
+  --text-lg: var(--fs-md);            /* 14px  pane close glyph, dialog titles   → text-lg  */
+}
+
+/* ---- variants ---- */
+/* Tailwind wraps `hover:` in `@media (hover: hover)`; the old chrome.css applied :hover unconditionally.
+   Restore the plain pseudo-class so touch devices behave exactly as before. */
+@custom-variant hover (&:hover);
+/* The chrome's state classes.  They stay as class names (other code queries `.on`, `.desk`, …) and
+   the variant styles them in the same className string: `kb on:bg-on on:border-on-line`. */
+@custom-variant on (&.on);
+@custom-variant desk (&.desk);
+@custom-variant cur (&.cur);
+@custom-variant sel (&.sel);
+@custom-variant show (&.show);
+@custom-variant open (&.open);
+@custom-variant live (&.live);
+@custom-variant err (&.err);
+@custom-variant resolved (&.resolved);
+@custom-variant primary (&.primary);
+@custom-variant long (&.long);
+/* app.html sets [data-theme] on <html>; system dark is the media query without an explicit light. */
+@custom-variant dark {
+  &:where(:root[data-theme="dark"] *) { @slot; }
+  @media (prefers-color-scheme: dark) { &:where(:root:not([data-theme="light"]) *) { @slot; } }
+}
+
+/* ---- utilities Tailwind lacks ---- */
+/* Vertical toolbars: scroll in one column, never wrap, and hide the scrollbar (both engines). */
+@utility scrollbar-none {
+  scrollbar-width: none;
+  &::-webkit-scrollbar { display: none; }
+}
+/* `display: grid` WITHOUT Tailwind's `grid` class: app.html's `.grid` (the home-view card grid,
+   auto-fill columns + 14px gap) shares that name and, loading after ui.css, would win. */
+@utility d-grid { display: grid; }
+
+/* The menu bar's link to the page that connects an AI assistant (any MCP client) to the project. */
+@layer components {
+  .ai-connect { display: inline-flex; align-items: center; gap: 5px; height: 22px; margin-right: 10px; padding: 0 8px 0 6px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-2); color: var(--ink); font: inherit; font-size: 12px; text-decoration: none; cursor: pointer; flex: none; }
+  .ai-connect:hover { border-color: var(--ink-3); }
+  .ai-connect svg { width: 13px; height: 13px; fill: none; stroke: var(--blue); stroke-width: 1.8; stroke-linejoin: round; }
+}
+/* Plugins: the dock, toolbar buttons, host dialogs and the manager (web/domains/pcb/plugins/plugins.css). */
+@import "../../domains/pcb/plugins/plugins.css" layer(components);
+/* Design review: the Compare window and the comment threads (web/platform/review/review.css).  Unlayered on purpose:
+   it resizes theme.css's dialog frame (.kd-dialog), and theme.css is unlayered, so a layered rule would lose to it. */
+@import "../../platform/review/review.css";
+/* The project chat: its pane, the menu bar button and the cursor-chat bubble (chat.css). */
+@import "./chat.css";
+
+@tailwind utilities source(none);
+
+/* The home view (web/platform/home) is plain CSS on the same tokens: see home.css. */
+@import "./home.css";
+@import "../../platform/onboarding/onboarding.css";
+
+/* LIB_TREE_RENDERER's canvas-item marker: the on-canvas footprint (or its collapsed library) in an arrow outline */
+.ktree .canvas-item { position: relative; padding: 0 6px 0 3px; border: 1px solid var(--color-ink); border-right: 0; margin-right: 6px; }
+.ktree .canvas-item::before, .ktree .canvas-item::after { content: ""; position: absolute; right: -4px; width: 0; height: calc(50% + 1px); border-right: 1px solid var(--color-ink); }
+.ktree .canvas-item::before { top: -1px; transform-origin: bottom; transform: skewX(23deg); }
+.ktree .canvas-item::after { bottom: -1px; transform-origin: top; transform: skewX(-23deg); }

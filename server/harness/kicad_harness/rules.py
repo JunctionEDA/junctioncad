@@ -1,0 +1,1172 @@
+"""The house design rules as calls: the review against the checklists, and what the checklists ask a design to carry.
+
+The rules are Andrew Greenberg's "Actually Useful Schematics" (KiCon 2025) with his Checklist for Schematics and
+Checklist for PCB Layout, and Graham Sutherland's "Creating high quality electronics schematics".  `review()` judges
+a sheet or the board against every item a program can judge (the engine does the judging, so the MCP tool
+`review_design` gives the same answer); the other calls add what the lists ask for: global labels with a direction
+on net stubs, supplies with their voltage range and current written down, test points, MFR and MPN fields,
+fiducials, the board's name and version on the silkscreen, ground stitching.
+
+The methods are attached to Schematic, Board and Project when the package is imported.
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import math
+import re
+import uuid as _uuid
+
+from .transport import HarnessError
+
+_LINE = 2.286
+
+
+def _r(v: float) -> float:
+    return round(v, 4)
+
+
+# ---------------------------------------------------------------- review
+
+def _review(self, level: str | None = None, rule: str | None = None, limit: int = 40) -> dict:
+    """Check this sheet or board against the house checklists.
+
+    Returns {"errors", "warnings", "notes", "passed": [rule ids], "findings": ["error power.direction: ... [items]"],
+    "manual": [what only a person can judge]}.  `level="error"` lists only errors, `rule="power"` one family.
+    A design is not finished while errors are listed; fix warnings or say in a note on the sheet why one stands.
+    """
+    args = {k: v for k, v in (("level", level), ("rule", rule)) if v}
+    r = self._call("review_design", **args)
+    rows = []
+    for f in r.get("findings", [])[:limit]:
+        rows.append(f"{f['level']} {f['rule']}: {f['message']}" + (f" [{'; '.join(f['items'])}]" if f.get("items") else ""))
+    out = {"check": r.get("check"), "errors": r.get("errors", 0), "warnings": r.get("warnings", 0), "notes": r.get("notes", 0),
+           "passed": r.get("passed", []), "findings": rows, "manual": r.get("manual", [])}
+    self.project.note(f"{getattr(self, 'path', 'document')}: review {out['errors']} errors, {out['warnings']} warnings, {len(out['passed'])} of {r.get('rules', 0)} rules clean")
+    return out
+
+
+def _project_review(self, level: str | None = "warning") -> dict:
+    """Review every sheet and the board; one entry per document."""
+    out = {}
+    for d in self._docs:
+        doc = self._doc(d["path"], d["type"]) if d["type"] in ("schematic", "board") else None
+        if doc is None:
+            continue
+        try:
+            out[d["path"]] = doc.review(level=level)
+        except HarnessError as e:
+            out[d["path"]] = {"error": str(e)}
+    return out
+
+
+# ---------------------------------------------------------------- schematic
+
+def _globalize(self, *names: str, all: bool = False) -> int:   # noqa: A002
+    """Turn the plain labels that sit on a wire end or straight on a pin into global labels with a direction shape
+    (input, output, bidirectional, passive, from the pins on the wire).  A net that continues somewhere else by name must
+    say so; a plain label reads as the name of a wire.  Names in the middle of a wire stay as they are.  Without names
+    every label whose name is used more than once is converted; `all=True` converts single ones too.  Returns the count."""
+    self.flush()
+    e: dict = {"op": "globalize_labels"}
+    if names:
+        e["names"] = list(names)
+    if all:
+        e["all"] = True
+    self._edit(e)
+    try:
+        res = self.flush() or {}
+    except HarnessError as err:
+        if "no plain label" in str(err):
+            return 0
+        raise
+    d = next((x["globalize_labels"] for x in res.get("details") or [] if "globalize_labels" in x), {})
+    return int(d.get("converted", 0))
+
+
+def _fmt_range(v, unit: str, scale: float = 1.0) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, (int, float)):
+        return f"{v * scale:g} {unit}"
+    v = (list(v) + [None, None, None])[:3]
+    return "(" + ", ".join("" if x is None else f"{x * scale:g}" for x in v) + f") {unit}"
+
+
+def _supplies(self, table: dict, at=None, title: str = "Power supplies (min, typ, max)") -> list:
+    """Write down what each supply is: {"VUSB": {"volts": (4.5, 5.0, 5.5), "amps": (None, 0.035, 0.5), "from": "J1"}}
+    becomes the line "VUSB = (4.5, 5, 5.5) V @ (, 35, 500) mA from J1" in a list on the sheet (in free space, or at `at`).
+    A reader then knows the range and the load of every rail without opening a datasheet, and the review uses the
+    stated maximum to check capacitor voltage ratings and resistor dissipation.  A single number is taken as typical."""
+    lines = []
+    for name, spec in table.items():
+        spec = spec if isinstance(spec, dict) else {"volts": spec}
+        amps = spec.get("amps")
+        small = amps is not None and max([abs(x) for x in ([amps] if isinstance(amps, (int, float)) else amps) if x is not None] + [0]) < 1
+        line = f"{name} = {_fmt_range(spec.get('volts'), 'V')}"
+        if amps is not None:
+            line += " @ " + (_fmt_range(amps, "mA", 1000) if small else _fmt_range(amps, "A"))
+        if spec.get("from"):
+            line += f" from {spec['from']}"
+        if spec.get("note"):
+            line += f" ({spec['note']})"
+        lines.append(line)
+        if not self._is_power(name):
+            self.supply(name)
+    if not lines:
+        return []
+    self.flush()
+    w = max(self._width(title) * 1.1, max(self._width(x) for x in lines)) + 1.5
+    h = (len(lines) + 1) * _LINE + 1.0
+    if at is None:
+        spot = self._call("check_layout", limit=1, free={"w": _r(w), "h": _r(h)}).get("free")
+        if not spot:
+            raise HarnessError("There is no free space for the supply list on the page; make the page larger with page(\"A2\") or give at=(x, y).")
+        at = (spot["x"], spot["y"])
+    y = at[1] + _LINE
+    self.text(title, (at[0] + 0.5, y), bold=True)
+    for line in lines:
+        y += _LINE
+        self.text(line, (at[0] + 0.5, y))
+    self.flush()
+    return [_r(at[0]), _r(at[1])]
+
+
+def _power_flags(self) -> list:
+    """Give every supply that comes in through a connector (no pin on it is a power output, so KiCad's ERC reports
+    "power pin not driven") a PWR_FLAG: the supply's symbol and the flag side by side on a short wire, in free space on the
+    sheet.  `build` does this by itself.  Returns the names flagged."""
+    self.flush()
+    d = self.check(kind="power_pin_not_driven", limit=40, warnings=True)
+    refs = {m for t in d.get("first") or [] for m in re.findall(r"\[(#PWR\w+)\]", t)}
+    if not refs:
+        return []
+    names = sorted({p.get("value") for p in self.geometry()["parts"] if p.get("ref") in refs and p.get("value")})
+    if not names:
+        return []
+    step = 20.32
+    w, h = step * len(names) + 5.08, 15.24
+    spot = self._call("check_layout", limit=1, free={"w": _r(w), "h": _r(h)}).get("free")
+    if not spot:
+        return []
+    y = round((spot["y"] + 7.62) / 2.54) * 2.54
+    for i, name in enumerate(names):
+        x = round((spot["x"] + 5.08 + i * step) / 2.54) * 2.54
+        self._edit(self._power_edit(name, x, y))
+        self._edit({"op": "add_symbol", "lib_id": "power:PWR_FLAG", "x": x + 10.16, "y": y, "rotation": 0})
+        self._edit({"op": "add_wire", "points": [[x, y], [x + 10.16, y]]})
+    self.flush()
+    return names
+
+
+def _test_point(self, net: str, ref: str | None = None, expect: str | None = None,
+                footprint: str = "TestPoint:TestPoint_Pad_D1.0mm") -> str:
+    """A test point on a net ("+3V3", "GND", "~{RESET}" or a pin like "U1.RUN").  `expect` is written beside it
+    ("3.3 V", "low while in reset"): tell the reader what to expect at a test point.  Returns its reference.
+
+    Planned before anything is drawn: one free box holds the point, its supply symbol (the point hangs straight under a
+    supply arrow, or stands straight on a ground symbol, so no wire runs past the symbol's name) or its label, and the
+    note beside it, so nothing of it lands on anything else or on the next test point."""
+    from .project import _GROUND
+    self.flush()
+    name = net
+    if "." in net and not self._is_power(net):
+        try:
+            name = self.pin(net)["net"] or net
+        except HarnessError:
+            name = net
+    bare = name.lstrip("/")
+    power = bool(bare) and self._is_power(bare)
+    gnd = power and bool(_GROUND.match(bare))
+    note = f"{ref or 'TP'}: expect {expect}" if expect else ""
+    lines = self._note_lines(note.replace("TP:", "TP99:"), 60.0) if note else []
+    nw = max([w for _, w in lines] + [0.0])
+    w = max(15.24, nw + 2.54)
+    h = 17.78 + (len(lines) * 2.54 if lines else 0)     # the note gets its own line(s) under the point, clear of its name
+    spot = None
+    try:
+        spot = self._call("check_layout", limit=1, free={"w": round(w, 2), "h": h}).get("free")
+    except HarnessError:
+        pass
+    if spot:
+        x = round((spot["x"] + 5.08) / 1.27) * 1.27
+        y0 = round((spot["y"] + 2.54) / 1.27) * 1.27
+    else:
+        x = y0 = None
+    if power and x is not None:
+        if gnd:       # the point stands on the ground symbol: circle up, pin down, a short wire to the symbol
+            pin_y, sym_y, rot = y0 + 10.16, y0 + 12.7, 0
+        else:         # the point hangs from the supply arrow: arrow up, a short wire, the circle under it
+            pin_y, sym_y, rot = y0 + 5.08, y0 + 2.54, 180
+        tp = self.place("Connector:TestPoint", at=(x, pin_y), ref=ref, value=bare, footprint=footprint, rotation=rot)
+        self._edit(self._power_edit(bare, x, sym_y))
+        self._edit({"op": "add_wire", "points": [[x, min(pin_y, sym_y)], [x, max(pin_y, sym_y)]]})
+        self.flush()
+        self._edit({"op": "clear_fields", "refs": [tp]})
+        self.flush()
+    else:
+        tp = self.place("Connector:TestPoint", at=(x, y0 + 7.62) if x is not None else None, ref=ref, value=bare, footprint=footprint)
+        self.flush()
+        if name != net and (not name or name.startswith(("Net-(", "unconnected-"))):
+            self.connect(net, f"{tp}.1")
+        else:
+            self.net(name, f"{tp}.1")
+        self.flush()
+    if expect:
+        text = f"{tp}: expect {expect}"
+        try:
+            if x is not None:
+                self.note(text, at=(x - 3.81, y0 + 15.24), width=60.0)
+            else:
+                self.note(text, near=tp)
+        except HarnessError:
+            pass
+    return tp
+
+
+def _bom(self, ref: str, mfr: str | None = None, mpn: str | None = None, **more) -> None:
+    """The ordering fields of a part: sch.bom("U1", mfr="Texas Instruments", mpn="TLV62569DBVR", LCSC="C141836",
+    Voltage="16V", Power="0.1W").  MFR and MPN are what the checklist asks of every component."""
+    fields = {k: v for k, v in (("MFR", mfr), ("MPN", mpn)) if v}
+    fields.update({k: v for k, v in more.items() if v is not None})
+    if fields:
+        self.set(ref, **fields)
+
+
+def _fiducials(self, count: int = 3, footprint: str = "Fiducial:Fiducial_1mm_Mask2mm") -> list:
+    """Fiducial marks for pick and place (three per assembled side).  Places the symbols; board.sync() brings them
+    across and board.fiducials() puts them in the corners."""
+    have = [r for r in self.refs() if re.match(r"FID\d", r)]
+    out = list(have)
+    need = count - len(have)
+    if need <= 0:
+        return out
+    self.flush()
+    spot = None
+    try:      # a row of them in free room, clear of the blocks
+        spot = self._call("check_layout", limit=1, free={"w": 15.24 * need + 5.08, "h": 15.24}).get("free")
+    except HarnessError:
+        pass
+    for k, i in enumerate(range(len(have), count)):
+        at = (round((spot["x"] + 7.62 + k * 15.24) / 1.27) * 1.27, round((spot["y"] + 8.89) / 1.27) * 1.27) if spot else None
+        out.append(self.place("Mechanical:Fiducial", at=at, ref=f"FID{i + 1}", footprint=footprint))
+    self.flush()
+    return out
+
+
+# ---------------------------------------------------------------- board
+
+def _corner_spots(self, inset: float):
+    g = self.geometry()
+    o = g.get("outline")
+    if not o:
+        raise HarnessError("The board has no outline yet; draw it first with board.outline(x0, y0, x1, y1).")
+    x0, y0, x1, y1 = o
+    return g, [(x0 + inset, y0 + inset), (x1 - inset, y1 - inset), (x0 + inset, y1 - inset), (x1 - inset, y0 + inset)]
+
+
+def _free_at(g, at, r: float, skip=()) -> bool:
+    for p in g["parts"]:
+        if p["ref"] in skip:
+            continue
+        b = p.get("courtyard") or p.get("box")
+        if b and at[0] > b[0] - r and at[0] < b[2] + r and at[1] > b[1] - r and at[1] < b[3] + r:
+            return False
+    return True
+
+
+def _clear_of_pads(g, at, net: str, r: float) -> bool:
+    """A stitching via may stand inside a part's courtyard (beside a header row, under a switch): what it must stay off
+    is the pads of other nets.  The rules check that follows takes out any that still sits too close to copper."""
+    for p in g["parts"]:
+        for q in p["pads"]:
+            if q[3] != net and math.hypot(at[0] - q[1], at[1] - q[2]) < r:
+                return False
+    return True
+
+
+def _clear_of_copper(self, at, net: str, need: float) -> bool:
+    """No track or via of another net within `need` mm of a via's centre at `at` (edge to centre): checked before the via
+    is laid, so ground_pads tries its spots in one look instead of a rules check per spot."""
+    near = {"x": at[0], "y": at[1], "radius": need + 0.6}
+    try:
+        mine = {it["id"] for it in self._call("get_items", kinds=["segment", "via"], near=near, net=net).get("items", [])}
+        got = self._call("get_items", kinds=["segment", "via"], near=near).get("items", [])
+    except HarnessError:
+        return True
+    for it in got:
+        if it["id"] in mine:
+            continue
+        sx = it.get("sexpr", "")
+        a = re.search(r"\(start ([\d.\-]+) ([\d.\-]+)\)\s*\(end ([\d.\-]+) ([\d.\-]+)\)", sx)
+        if a and it.get("kind") == "segment":
+            x0, y0, x1, y1 = map(float, a.groups()); w = float((re.search(r"\(width ([\d.]+)\)", sx) or [0, 0.2])[1])
+            if _seg_dist(at, (x0, y0), (x1, y1)) - w / 2 < need:
+                return False
+        else:
+            v = re.search(r"\(at ([\d.\-]+) ([\d.\-]+)\)", sx); z = re.search(r"\(size ([\d.]+)", sx)
+            if v and math.hypot(at[0] - float(v.group(1)), at[1] - float(v.group(2))) - (float(z.group(1)) / 2 if z else 0.25) < need:
+                return False
+    return True
+
+
+def _board_fiducials(self, inset: float = 2.5) -> dict:
+    """Put the board's fiducials (FID1..) in three corners, as far apart as the outline allows, clear of other parts.
+    The schematic must have them first (sch.fiducials(), then board.sync())."""
+    self.flush()
+    g, corners = _corner_spots(self, inset)
+    fids = sorted(p["ref"] for p in g["parts"] if re.match(r"FID\d", p["ref"]))
+    if not fids:
+        raise HarnessError("The board has no fiducials. Add them in the schematic with sch.fiducials(), then board.sync().")
+    o = g["outline"]
+    placed = {}
+    # Every free spot on a 0.5 mm grid (the mark and its mask opening clear of every courtyard and of the marks
+    # already put down); each mark takes the free spot nearest its corner, so on a tightly packed board it still
+    # lands by the corner -- beside the part that fills it -- rather than wandering into the middle.
+    free, step = [], 0.5
+    nx, ny = int((o[2] - o[0] - 2 * 1.5) / step), int((o[3] - o[1] - 2 * 1.5) / step)
+    for i in range(nx + 1):
+        for j in range(ny + 1):
+            q = (o[0] + 1.5 + i * step, o[1] + 1.5 + j * step)
+            if _free_at(g, q, 1.2, skip=fids):
+                free.append(q)
+    for ref, c in zip(fids, corners):
+        cand = [q for q in free if all(math.hypot(q[0] - a[0], q[1] - a[1]) >= 3.0 for a in placed.values())]
+        at = min(cand, key=lambda q: math.hypot(q[0] - c[0], q[1] - c[1])) if cand else c
+        self.place(ref, (_r(at[0]), _r(at[1])))
+        placed[ref] = [_r(at[0]), _r(at[1])]
+    self.flush()
+    for ref, at in placed.items():      # bare board around the mark, so no pour or track fills its mask opening
+        side = next((p.get("side", "front") for p in g["parts"] if p["ref"] == ref), "front")
+        try:
+            self.keepout([_r(at[0] - 1.15), _r(at[1] - 1.15), _r(at[0] + 1.15), _r(at[1] + 1.15)], layers=["B.Cu" if side == "back" else "F.Cu"], name=f"{ref} clear")
+        except HarnessError:
+            pass
+    self.flush()
+    return placed
+
+
+def _mark(self, name: str | None = None, rev: str | None = None, date: str | None = None, org: str | None = None,
+          at=None, layer: str = "F.SilkS", size: float = 1.0) -> dict:
+    """Print the board's identity on the silkscreen: organisation, name, version and date (today's by default), as the
+    layout checklist asks.  It goes in free space, from the bottom edge up, on one line or broken over two or three and
+    in smaller type where the board is crowded, and on the back when the front has no room; `at` (top left of the text) puts it exactly there."""
+    self.flush()
+    date = date or _dt.date.today().isoformat()
+    name = name or self.project.name
+    tail = " ".join(x for x in (rev, date) if x)
+    shapes = [[" ".join(x for x in (org, name, tail) if x)]]
+    if org:
+        shapes.append([org, " ".join(x for x in (name, tail) if x)])
+    shapes.append([x for x in (org, name, tail) if x])
+    g = self.geometry()
+    o = g.get("outline")
+
+    def emit(lines, pos, lay, sz):
+        mirror = " mirror" if lay.startswith("B.") else ""
+        text = "\\n".join(lines)
+        if mirror:      # mirrored text runs toward smaller x from where it starts: start it at the right end of its room
+            pos = (pos[0] + max(len(x) for x in lines) * sz * 0.9, pos[1])
+        self.add_item(f'(gr_text "{text}" (at {_r(pos[0])} {_r(pos[1])}) (layer "{lay}") (uuid "{_uuid.uuid4()}") '
+                      f'(effects (font (size {sz} {sz}) (thickness {_r(sz * 0.15)})) (justify left top{mirror})))')
+        self.flush()
+        return {"text": " / ".join(lines), "at": [_r(pos[0]), _r(pos[1])], "layer": lay, "size": sz}
+
+    if at is not None:
+        return emit(shapes[0], at, layer, size)
+    if not o:
+        raise HarnessError("The board has no outline yet; draw it first with board.outline(x0, y0, x1, y1), or give at=(x, y).")
+    other = "B.SilkS" if layer.startswith("F.") else "F.SilkS"
+    try:
+        printed = self._call("get_geometry", silk=True).get("silk") or []
+    except HarnessError:
+        printed = []
+    for lay in (layer, other):
+        side = "back" if lay.startswith("B.") else "front"
+        boxes = [b[:4] for b in printed if b[4] == lay]      # what is printed there already: references, pin names, outlines
+        for p in g["parts"]:
+            b = p.get("courtyard") or p.get("box")
+            if b and (p.get("side", "front") == side or len(p.get("pads", [])) > 0 and re.match(r"(J|P|H|MH|TP)\d", p["ref"])):
+                boxes.append(b)
+        for sz in dict.fromkeys((size, 0.8, 0.6)):
+            if sz > size:
+                continue
+            for lines in shapes:
+                w, h = max(len(x) for x in lines) * sz * 0.9 + 0.4, len(lines) * sz * 1.65 + 0.3
+                if w > o[2] - o[0] - 1.6 or h > o[3] - o[1] - 1.6:
+                    continue
+                y = o[3] - 0.8 - h
+                while y >= o[1] + 0.8:
+                    x = o[0] + 0.8
+                    while x + w <= o[2] - 0.8:
+                        hit = next((b for b in boxes if x < b[2] + 0.25 and x + w > b[0] - 0.25 and y < b[3] + 0.25 and y + h > b[1] - 0.25), None)
+                        if hit is None:
+                            return emit(lines, (x + 0.2, y + 0.15), lay, sz)
+                        x = max(x + 0.5, hit[2] + 0.3)
+                    y -= 0.5
+    raise HarnessError(f"There is no room for \"{shapes[0][0]}\" on the silkscreen of either side, even at 0.6 mm in three lines; give at=(x, y).")
+
+
+def _silkscreen(self, name: str | bool | None = None, rev: str | None = None, date: str | None = None, org: str | None = None,
+                size: float = 1.0, min_size: float | None = None, pin_labels: bool | list = True, refs: list | None = None, unhide: bool = False) -> dict:
+    """The last pass of a layout, as a careful person does it by hand.  Call it when placement and routing are final.
+
+    - Every reference designator goes beside its part where it lies on nothing: not a pad, not other silkscreen, not
+      another part, not the board edge, and nearer to its own part than to any other.  One that does not fit at
+      `size` is made smaller, turned on its side, or moved a little further out; it is hidden only when it finds no
+      place on its own side or, failing that, on the other side of the board right under the part
+      (`other_side`: on a crowded board the name is read from the back).  `min_size` is the smallest it may get: by default the board's own rule (0.8 mm unless
+      board.rules(min_text_height=...) says otherwise); 0.6 mm with a 0.1 mm pen is what most board houses still
+      print, so on a crowded board set board.rules(min_text_height=0.6) first.  `refs` limits the pass to those parts, `unhide=True` also brings
+      back references that are hidden now.
+    - `pin_labels`: each connector pin's net name is printed beside it (True for every connector J/P/CN/X/BT with
+      pins 1.9 mm or more apart, or a list of references; False for none).  A connector is labelled whole or not at
+      all: if its own side has no clear row for every name, a through-hole connector gets them on the other side of
+      the board (`pin_labels_other_side`), and one with no room on either is listed in `pin_labels_skipped` with the
+      pins that are in the way.
+    - The board's name, version and date are printed in free space, outside copper keep-outs such as an antenna's (board.mark()) when the board has no such text yet;
+      `name=False` leaves that out, and name / rev / date / org are passed on.
+
+    All of it is planned together and written as one edit: the pin names first (their place is fixed by the pins),
+    then the name (it needs the biggest free block), then the references around both, so nothing lands on anything
+    and one call finishes the job.
+
+    Returns what it did, short: {"references", "moved", "resized": {ref: size}, "turned", "hidden", "pin_labels": {ref:
+    pins named}, "pin_labels_skipped", "mark"}.  Only what did not fit needs reading: `hidden` and `pin_labels_skipped`."""
+    self.flush()
+    e = {"op": "silkscreen", "size": size, "unhide": bool(unhide), "pin_labels": True if pin_labels is True else list(pin_labels) if pin_labels else False}
+    if min_size:
+        e["min_size"] = min_size
+    if refs:
+        e["refs"] = list(refs)
+    if name is not False:      # the ways to break the name into lines, widest first; the engine takes the first that fits
+        date = date or _dt.date.today().isoformat()
+        title = name or self.project.name
+        tail = " ".join(x for x in (rev, date) if x)
+        shapes = [[" ".join(x for x in (org, title, tail) if x)]]
+        if org:
+            shapes.append([org, " ".join(x for x in (title, tail) if x)])
+        shapes.append([x for x in (org, title, tail) if x])
+        e["mark"] = shapes
+    self._edit(e)
+    res = self.flush() or {}
+    d = next((x["silkscreen"] for x in res.get("details") or [] if "silkscreen" in x), {})
+    out = {"references": d.get("references", 0), "hidden": d.get("hidden", [])}
+    for key in ("moved", "resized", "turned", "shown", "smallest", "min_size", "pin_labels_skipped", "pin_labels_other_side", "other_side", "mark"):
+        if d.get(key) not in (None, [], {}):
+            out[key] = d[key]
+    out["pin_labels"] = {ref: len(names) for ref, names in (d.get("pin_labels") or {}).items()}      # how many pins of each connector were named
+    return out
+
+
+def _cleanup(self, merge: bool = True, vias: bool = True, in_pads: bool = False, dangling: bool = False, shorts: bool = False) -> dict:
+    """Tidy the copper after routing, as KiCad's Cleanup Tracks & Vias does: segments in one line or lying on each
+    other become one and a via on top of another goes.  `in_pads=True` also removes tracks wholly inside a pad (the
+    router's short runs to the pad centre, which are kept by default), `dangling=True` track ends and vias that
+    lead nowhere, `shorts=True` tracks that short two nets.  A connection the clean-up
+    opened (it should open none) is routed again.  Returns {"removed", "changed", "by_kind", "reopened"}."""
+    self.flush()
+    before = self.unrouted()
+    self._edit({"op": "cleanup", "merge": merge, "vias": vias, "in_pads": in_pads, "dangling": dangling, "shorts": shorts})
+    try:
+        res = self.flush() or {}
+    except HarnessError as e:
+        if "clean already" in str(e):
+            return {"removed": 0, "changed": 0, "by_kind": {}, "reopened": {}}
+        raise
+    out = dict(next((x["cleanup"] for x in res.get("details") or [] if "cleanup" in x), {}))
+    after = self.unrouted()
+    opened = {n: c - before.get(n, 0) for n, c in after.items() if c > before.get(n, 0)}
+    if opened:
+        self.route(nets=list(opened), time_s=20)
+        left = self.unrouted()
+        opened = {n: left.get(n, 0) - before.get(n, 0) for n in opened if left.get(n, 0) > before.get(n, 0)}
+    out["reopened"] = opened
+    return out
+
+
+_SUPPLY = re.compile(r"^/?(\+?\d+V\d*|\+?\d*V?\d+V\d*|VCC\w*|VDD\w*|VBUS\w*|VBAT\w*|VIN\w*|VSYS\w*|AVDD\w*|DVDD\w*|IOVDD\w*|\+\d.*)$", re.I)
+_GROUND = re.compile(r"^/?(A|D|P)?(GND|VSS)\w*$", re.I)
+
+
+def _ramp(v: float, good: float, bad: float) -> int:
+    """100 at `good` or better, 0 at `bad` or worse, a straight line between."""
+    if good == bad:
+        return 100 if v == good else 0
+    t = (v - bad) / (good - bad)
+    return int(round(100 * min(1.0, max(0.0, t))))
+
+
+def _tree_length(pts: list) -> float:
+    """The shortest set of straight lines that joins the points (a minimum spanning tree): what a net needs at least."""
+    if len(pts) < 2:
+        return 0.0
+    left, best, total = list(range(1, len(pts))), {i: math.hypot(pts[i][0] - pts[0][0], pts[i][1] - pts[0][1]) for i in range(1, len(pts))}, 0.0
+    while left:
+        i = min(left, key=lambda k: best[k])
+        total += best[i]
+        left.remove(i)
+        for k in left:
+            best[k] = min(best[k], math.hypot(pts[k][0] - pts[i][0], pts[k][1] - pts[i][1]))
+    return total
+
+
+def _score(self) -> dict:
+    """How good the layout is, as one number from 0 to 100 with the reasons: a quick way to compare two placements
+    or to see what to fix next without looking at a picture.
+
+    Parts of the score (each 0 to 100): `space` (courtyards fill 30 to 65 percent of the board), `connectors`
+    (connectors sit at a board edge), `rotation` (parts stand at 0, 90, 180 or 270 degrees), `decoupling` (each small
+    capacitor on a supply is within 3 mm of a pin it serves; 8 mm scores nothing), `tracks` (routed length against the
+    least each net needs), `vias` (vias per routed net), `silkscreen` (no silkscreen warning in the rules check).
+    Gates: an open connection, a rules error or a part off the board caps the score at 49.
+    Returns {"score", "parts": {...}, "gates": [...], "worst": ["what is poor and the call that fixes it", ...]}."""
+    self.flush()
+    g = self.geometry()
+    o = g.get("outline")
+    parts = [p for p in g["parts"] if not re.match(r"(FID|REF\*\*|#|G|LOGO|H|MH)\d*", p["ref"])]
+    nets = self.nets()
+    chk = self.check(warnings=True)
+    info = self.info()
+    sub, worst, gates = {}, [], []
+    pad_at = {f"{p['ref']}.{q[0]}": (q[1], q[2]) for p in g["parts"] for q in p.get("pads", [])}
+    pad_net = {f"{p['ref']}.{q[0]}": q[3] for p in g["parts"] for q in p.get("pads", [])}
+    # ---- gates
+    left = sum(v["unrouted"] for v in nets.values())
+    if left:
+        gates.append(f"{left} connection{'s' if left > 1 else ''} not routed: board.route(), then board.unrouted()")
+    if chk["errors"]:
+        gates.append(f"{chk['errors']} rules error{'s' if chk['errors'] > 1 else ''}: board.check() lists them")
+    if o:
+        out = [p["ref"] for p in parts if (p.get("courtyard") or p.get("box")) and not (o[0] - 0.05 <= p["x"] <= o[2] + 0.05 and o[1] - 0.05 <= p["y"] <= o[3] + 0.05)]
+        if out:
+            gates.append(f"off the board: {', '.join(out[:8])}: board.place(ref, (x, y)) or board.autoplace()")
+    # ---- space
+    if o and parts:
+        area = max(1e-6, (o[2] - o[0]) * (o[3] - o[1]))
+        used = sum((b[2] - b[0]) * (b[3] - b[1]) for b in (p.get("courtyard") or p.get("box") for p in parts) if b) / area
+        sub["space"] = _ramp(used, 0.30, 0.08) if used < 0.30 else _ramp(used, 0.65, 0.90)
+        if sub["space"] < 70:
+            worst.append((sub["space"], f"space: the parts cover {round(used * 100)}% of the board ({'make the outline smaller: board.outline(...)' if used < 0.30 else 'the board is crowded: a larger outline or parts on the back'})"))
+    # ---- connectors at an edge
+    conns = [p for p in parts if re.match(r"(J|P|CN|USB|X)\d", p["ref"]) and (p.get("courtyard") or p.get("box"))]
+    if o and conns:
+        far = []
+        for p in conns:
+            b = p.get("courtyard") or p["box"]
+            d = min(b[0] - o[0], o[2] - b[2], b[1] - o[1], o[3] - b[3])
+            if d > 1.5:
+                far.append((d, p["ref"]))
+        sub["connectors"] = int(round(100 * (1 - len(far) / len(conns))))
+        if far:
+            worst.append((sub["connectors"], "connectors: " + ", ".join(f"{r} is {round(d, 1)} mm from the nearest edge" for d, r in sorted(far, reverse=True)[:5]) + ": put connectors at an edge (board.autoplace(edge={ref: side}) or board.place)"))
+    # ---- rotation
+    if parts:
+        odd = [p["ref"] for p in parts if abs((p.get("rotation") or 0) % 90) > 0.01]
+        sub["rotation"] = int(round(100 * (1 - len(odd) / len(parts))))
+        if odd:
+            worst.append((sub["rotation"], f"rotation: {', '.join(odd[:8])} {'stand' if len(odd) > 1 else 'stands'} at an odd angle: board.place(ref, (x, y), rotation=0 or 90)"))
+    # ---- decoupling
+    caps, poor = [], []
+    for p in parts:
+        if not re.match(r"C\d", p["ref"]) or len(p.get("pads", [])) != 2:
+            continue
+        a, b = p["pads"]
+        sup = a if _SUPPLY.match(a[3] or "") and _GROUND.match(b[3] or "") else b if _SUPPLY.match(b[3] or "") and _GROUND.match(a[3] or "") else None
+        if sup is None:
+            continue
+        ics = [(math.hypot(q[1] - sup[1], q[2] - sup[2]), f"{ip['ref']}.{q[0]}") for ip in parts if re.match(r"(U|IC)\d", ip["ref"]) for q in ip.get("pads", []) if q[3] == sup[3]]
+        if not ics:
+            continue
+        d, pin = min(ics)
+        caps.append(_ramp(d, 3.0, 8.0))
+        if d > 3.0:
+            poor.append((d, f"{p['ref']} is {round(d, 1)} mm from {pin}"))
+    if caps:
+        sub["decoupling"] = int(round(sum(caps) / len(caps)))
+        if poor:
+            worst.append((sub["decoupling"], "decoupling: " + ", ".join(t for _, t in sorted(poor, reverse=True)[:5]) + ": move each capacitor to within 3 mm of the supply pin it serves (board.place)"))
+    # ---- tracks and vias
+    ratios, long = [], []
+    for n, v in nets.items():
+        pts = [pad_at[x] for x in v["pads"] if x in pad_at]
+        need = _tree_length(pts)
+        if v["unrouted"] or need < 1.0 or v["length_mm"] < need * 0.7:      # not routed, trivial, or carried by a pour
+            continue
+        r = v["length_mm"] / need
+        ratios.append(r)
+        if r > 1.8:
+            long.append((r, f"{n} is {round(v['length_mm'], 1)} mm for {round(need, 1)} mm needed"))
+    if ratios:
+        sub["tracks"] = _ramp(sum(ratios) / len(ratios), 1.25, 2.5)
+        if long:
+            worst.append((sub["tracks"], "tracks: " + ", ".join(t for _, t in sorted(long, reverse=True)[:5]) + ": move the parts of these nets closer, or route them first (board.route(order=[...]))"))
+        per = (info.get("vias") or 0) / len(ratios)
+        sub["vias"] = _ramp(per, 0.6, 3.0)
+        if sub["vias"] < 70:
+            worst.append((sub["vias"], f"vias: {info.get('vias')} vias for {len(ratios)} routed nets: board.route(max_vias=2), or place parts so nets need not change sides"))
+    # ---- silkscreen
+    silk = sum(c for k, c in (chk.get("warnings_by_kind") or {}).items() if k.startswith("silk") or k.startswith("text"))
+    sub["silkscreen"] = _ramp(silk, 0, 20)
+    if silk:
+        worst.append((sub["silkscreen"], f"silkscreen: {silk} silkscreen warning{'s' if silk > 1 else ''} in the rules check: board.silkscreen() clears every reference; what is left after it is a part's own outline at the board edge or over a pad"))
+    weights = {"space": 1, "connectors": 1, "rotation": 1, "decoupling": 2, "tracks": 2, "vias": 1, "silkscreen": 1}
+    total = sum(sub[k] * w for k, w in weights.items() if k in sub) / max(1, sum(w for k, w in weights.items() if k in sub))
+    score = int(round(total))
+    if gates:
+        score = min(score, 49)
+    return {"score": score, "parts": sub, "gates": gates, "worst": [t for _, t in sorted(worst)]}
+
+
+def _stitch(self, spacing: float = 2.0, net: str = "GND", margin: float = 1.5, size: float | None = None, drill: float | None = None) -> dict:
+    """Tie the ground planes together with a grid of vias, about every `spacing` mm, wherever one fits: clear of
+    parts, and taken back out wherever the rules check says it is too close to other copper.  Call it after routing,
+    with ground poured on at least two layers."""
+    self.flush()
+    g = self.geometry()
+    o = g.get("outline")
+    if not o:
+        raise HarnessError("The board has no outline yet.")
+    name = self._net(net)
+    # ground vias stay out of other nets' pours (a supply fill, a switch node) and out of keep-outs: a via there
+    # joins nothing and only punches holes in that copper
+    shut = []
+    for z in self._call("get_items", kinds=["zone"]).get("items", []):
+        sx = z.get("sexpr", "")
+        if "keepout" not in sx and re.search(r'\(net(_name)? "?' + re.escape(name) + r'"?\)', sx):
+            continue
+        head = sx.split("(polygon")[0]
+        if "keepout" not in sx and not re.search(r'"(F|B|F&B|\*)\.Cu"', head):
+            continue      # another net's plane on an inner layer: a ground via passes through it as it should
+        try:      # the outline in full (a listing gives only the start of each item)
+            sx = (self._call("get_items", ids=[z["id"]]).get("items") or [{}])[0].get("sexpr", sx)
+        except HarnessError:
+            pass
+        m = re.search(r"\(polygon\s*\(pts((?:\s*\(xy [-\d.]+ [-\d.]+\))+)\s*\)\s*\)", sx)
+        if m:
+            shut.append([(float(x), float(y)) for x, y in re.findall(r"\(xy ([-\d.]+) ([-\d.]+)\)", m.group(1))])
+        elif z.get("bbox"):      # an outline too long to read here: its box stands in for it
+            x0, y0, x1, y1 = z["bbox"][:4]
+            shut.append([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+
+    def closed(at) -> bool:
+        for poly in shut:
+            c = False
+            for i in range(len(poly)):
+                (x0, y0), (x1, y1) = poly[i], poly[i - 1]
+                if (y0 > at[1]) != (y1 > at[1]) and at[0] < (x1 - x0) * (at[1] - y0) / (y1 - y0) + x0:
+                    c = not c
+            if c:
+                return True
+        return False
+    pts = []
+    nx = max(1, int((o[2] - o[0] - 2 * margin) // spacing))
+    ny = max(1, int((o[3] - o[1] - 2 * margin) // spacing))
+    for i in range(nx + 1):
+        for j in range(ny + 1):
+            c = (o[0] + margin + i * (o[2] - o[0] - 2 * margin) / nx, o[1] + margin + j * (o[3] - o[1] - 2 * margin) / ny)
+            reach = int(spacing / 2)      # the nearest clear spot around the grid point, within half a pitch
+            if spacing < 4:      # a fine grid stays a grid: a point that is taken is left out, not moved
+                reach = 0
+            near = sorted(((dx, dy) for dx in range(-reach, reach + 1) for dy in range(-reach, reach + 1)), key=lambda q: q[0] * q[0] + q[1] * q[1])
+            for dx, dy in near:
+                at = (_r(c[0] + dx), _r(c[1] + dy))
+                if o[0] + margin <= at[0] <= o[2] - margin and o[1] + margin <= at[1] <= o[3] - margin and _free_at(g, at, 0.6) and not closed(at) and all(abs(at[0] - q[0]) + abs(at[1] - q[1]) > spacing / 2 for q in pts):
+                    pts.append(at)
+                    break
+    ids = {}
+    for at in pts:      # one batch each, so each via's id is known and a bad one can be taken out again
+        self.via(name, at, size=size, drill=drill)
+        res = self.flush() or {}
+        new = (res.get("added") or [None])[-1]
+        if new:
+            ids[new] = at
+    removed = 0
+    if ids:
+        r = self._fresh_checks()
+        bad = set()
+        for v in r.get("violations", []):
+            if v.get("severity") != "error" or v.get("code") in ("unconnected_items",):
+                continue
+            for vid, at in ids.items():
+                if abs(v["x"] - at[0]) < 1.0 and abs(v["y"] - at[1]) < 1.0:
+                    bad.add(vid)
+        # a rules marker can sit more than a millimetre from the via it is about (KiCad marks the track side), so each
+        # new via is also measured against the copper round it
+        bad |= _too_close(self, ids, name, size)
+        for vid in bad:
+            self._edit({"op": "remove", "id": vid})
+            removed += 1
+        self.flush()
+    out = {"vias": len(ids) - removed, "tried": len(pts), "removed": removed}
+    self.project.note(f"board: {out['vias']} ground stitching vias")
+    return out
+
+
+
+# ---------------------------------------------------------------- power: pours as wide tracks, via arrays into planes
+
+_GROUNDS = re.compile(r"/?(GND|AGND|DGND|PGND|VSS)", re.I)
+
+
+def _zones_of(self) -> list:
+    """Every copper pour on the board with its net, layers and outline in full: [{"id", "net", "layers", "pts"}]."""
+    out = []
+    for z in self._call("get_items", kinds=["zone"]).get("items", []):
+        sx = z.get("sexpr", "")
+        if "keepout" in sx:
+            continue
+        try:      # a listing gives only the start of each item
+            sx = (self._call("get_items", ids=[z["id"]]).get("items") or [{}])[0].get("sexpr", sx)
+        except HarnessError:
+            pass
+        head = sx.split("(polygon")[0]
+        net = re.search(r'\(net_name "([^"]*)"\)', head) or re.search(r'\(net "([^"]+)"\)', head)
+        m = re.search(r"\(polygon\s*\(pts((?:\s*\(xy [-\d.]+ [-\d.]+\))+)\s*\)\s*\)", sx)
+        if not net or not net.group(1) or not m:
+            continue
+        ls = re.search(r'\(layers? ([^)]*)\)', head)
+        out.append({"id": z["id"], "net": net.group(1), "layers": re.findall(r'"([^"]+\.Cu)"', ls.group(1)) if ls else [],
+                    "pts": [(float(x), float(y)) for x, y in re.findall(r"\(xy ([-\d.]+) ([-\d.]+)\)", m.group(1))]})
+    return out
+
+
+def _in_poly(poly, at) -> bool:
+    c = False
+    for i in range(len(poly)):
+        (x0, y0), (x1, y1) = poly[i], poly[i - 1]
+        if (y0 > at[1]) != (y1 > at[1]) and at[0] < (x1 - x0) * (at[1] - y0) / (y1 - y0) + x0:
+            c = not c
+    return c
+
+
+def _edge_gap(poly, at) -> float:
+    best = 1e9
+    for i in range(len(poly)):
+        (x0, y0), (x1, y1) = poly[i], poly[i - 1]
+        dx, dy = x1 - x0, y1 - y0
+        t = 0.0 if not (dx or dy) else max(0.0, min(1.0, ((at[0] - x0) * dx + (at[1] - y0) * dy) / (dx * dx + dy * dy)))
+        best = min(best, math.hypot(at[0] - x0 - t * dx, at[1] - y0 - t * dy))
+    return best
+
+
+def _hull(pts) -> list:
+    pts = sorted(set(pts))
+    if len(pts) < 3:
+        return pts
+    cross = lambda o, a, b: (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lo, up = [], []
+    for q in pts:
+        while len(lo) >= 2 and cross(lo[-2], lo[-1], q) <= 0:
+            lo.pop()
+        lo.append(q)
+    for q in reversed(pts):
+        while len(up) >= 2 and cross(up[-2], up[-1], q) <= 0:
+            up.pop()
+        up.append(q)
+    return lo[:-1] + up[:-1]
+
+
+def _power_pours(self, nets: list | None = None, reach: float = 4.0, pad: float = 0.45, largest: float = 80.0) -> dict:
+    """Pours as wide tracks, the way a power stage is laid out by hand: where pads of one supply or switching net stand
+    together (a converter's switch pin and its inductor, the input capacitors at VIN, the connector and its fuse) and
+    no pad of another net stands between them, one solid pour on the top layer joins them instead of a track.  Call it
+    after placement and before routing; the router then finds those pads joined.  `nets` names the nets (by default
+    every net the plan gives a width of 0.5 mm or more, except ground and RF); pads up to `reach` mm apart share a
+    pour.  A net that already has a pour on the top layer is left alone.  Returns {net: pours made}."""
+    self.flush()
+    g = self.geometry()
+    if nets is None:
+        plan = getattr(self, "_layout", None) or self.plan()
+        r = plan.get("route") or {}
+        nets = [n for n, w in (r.get("widths") or {}).items() if w >= 0.5 and (r.get("kinds") or {}).get(n) != "rf"]
+    want = {self._net(n) for n in nets if not _GROUNDS.fullmatch(n)}
+    have = {z["net"] for z in _zones_of(self) if "F.Cu" in z["layers"]}
+    pads: dict = {}
+    every = []
+    for part in g["parts"]:
+        if part.get("side") == "back":
+            continue
+        for pd in part.get("pads") or []:
+            every.append((pd[1], pd[2], pd[3]))
+            if pd[3] in want and pd[3] not in have:
+                pads.setdefault(pd[3], []).append((pd[1], pd[2]))
+    out = {}
+    for net, pts in pads.items():
+        groups: list = []
+        for q in pts:      # pads that stand together, by single linkage
+            hit = [gr for gr in groups if any(math.hypot(q[0] - a[0], q[1] - a[1]) <= reach for a in gr)]
+            for gr in hit:
+                groups.remove(gr)
+            groups.append(sum(hit, []) + [q])
+        made = 0
+        for gr in groups:
+            if len(gr) < 2:
+                continue
+            hull = _hull([(_r(x + dx), _r(y + dy)) for x, y in gr for dx in (-pad, pad) for dy in (-pad, pad)])
+            x0, y0, x1, y1 = min(h[0] for h in hull), min(h[1] for h in hull), max(h[0] for h in hull), max(h[1] for h in hull)
+            if len(hull) < 3 or (x1 - x0) * (y1 - y0) > largest:
+                continue
+            if any(n != net and (_in_poly(hull, (x, y)) or _edge_gap(hull, (x, y)) < 0.5) for x, y, n in every):
+                continue      # another net's pad stands in it: that one stays a track
+            pp = " ".join(f"(xy {x} {y})" for x, y in hull)
+            self.add_item(f'(zone (net "{net}") (layer "F.Cu") (uuid "{_uuid.uuid4()}") (hatch edge 0.5) (priority 2) (connect_pads yes (clearance 0.2)) '
+                          f'(min_thickness 0.2) (fill (thermal_gap 0.3) (thermal_bridge_width 0.4)) (polygon (pts {pp})))')
+            made += 1
+        if made:
+            out[net] = made
+    self.flush()
+    self._geom = None
+    if out:
+        self.project.note(f"board: {sum(out.values())} power pours as wide tracks ({', '.join(out)})")
+    return out
+
+
+def _power_stitch(self, pitch: float = 1.0, most: int = 24, size: float | None = None, drill: float | None = None) -> dict:
+    """A via array wherever a supply net's pour on one layer lies over its pour on another (a top-layer pour over the
+    net's inner plane): `pitch` mm apart, at most `most` in one overlap, clear of parts and of the pours' edges.  That
+    is how current gets from a pour into its plane; one via is a bottleneck.  Call it after routing.  Ground is
+    stitch()'s job.  Returns {net: vias}."""
+    self.flush()
+    g = self.geometry()
+    zs = [z for z in _zones_of(self) if not _GROUNDS.fullmatch(z["net"]) and len(z["pts"]) >= 3]
+    width = lambda z: max(p[0] for p in z["pts"]) - min(p[0] for p in z["pts"])
+    out: dict = {}
+    ids: dict = {}
+    for i, a in enumerate(zs):
+        for b in zs[i + 1:]:
+            if a["net"] != b["net"] or not (set(a["layers"]) ^ set(b["layers"])):
+                continue
+            small, big = (a, b) if width(a) <= width(b) else (b, a)
+            x0, y0 = min(p[0] for p in small["pts"]), min(p[1] for p in small["pts"])
+            x1, y1 = max(p[0] for p in small["pts"]), max(p[1] for p in small["pts"])
+            pts = []
+            nx, ny = int((x1 - x0) // pitch), int((y1 - y0) // pitch)
+            for ix in range(nx + 1):
+                for iy in range(ny + 1):
+                    at = (_r(x0 + (x1 - x0 - nx * pitch) / 2 + ix * pitch), _r(y0 + (y1 - y0 - ny * pitch) / 2 + iy * pitch))
+                    if all(_in_poly(z["pts"], at) and _edge_gap(z["pts"], at) >= 0.5 for z in (small, big)) and _free_at(g, at, 0.3):
+                        pts.append(at)
+            if len(pts) > most:      # the middle of the overlap, as a block
+                cx, cy = sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
+                pts = sorted(pts, key=lambda p: math.hypot(p[0] - cx, p[1] - cy))[:most]
+            for at in pts:
+                if any(abs(at[0] - q[0]) < pitch * 0.9 and abs(at[1] - q[1]) < pitch * 0.9 for q, _ in ids.values()):
+                    continue
+                self.via(a["net"], at, size=size, drill=drill)
+                res = self.flush() or {}
+                new = (res.get("added") or [None])[-1]
+                if new:
+                    ids[new] = (at, a["net"])
+    bad = set()
+    if ids:
+        r = self._fresh_checks()
+        for v in r.get("violations", []):
+            if v.get("severity") != "error" or v.get("code") in ("unconnected_items",):
+                continue
+            for vid, (at, _) in ids.items():
+                if abs(v["x"] - at[0]) < 0.6 and abs(v["y"] - at[1]) < 0.6:
+                    bad.add(vid)
+        # a rules marker can sit more than a millimetre from the via it is about (KiCad marks the track side), so each
+        # new via is also measured against the copper round it
+        bad |= _too_close(self, ids, "", size)
+        for vid in bad:
+            self._edit({"op": "remove", "id": vid})
+        self.flush()
+    for vid, (_, net) in ids.items():
+        if vid not in bad:
+            out[net] = out.get(net, 0) + 1
+    self._geom = None
+    if out:
+        self.project.note(f"board: {sum(out.values())} vias from power pours into their planes")
+    return out
+
+
+
+
+def _fence(self, path, spacing: float = 1.0, net: str = "GND", offset: float = 0.0, size: float | None = None, drill: float | None = None) -> dict:
+    """A row of vias on `net` along a path you choose: `path` is a list of points [(x, y), ...] in mm and a via goes
+    every `spacing` mm along it.  With `offset` the path is a centre line (a trace, the edge of a section) and two rows
+    are placed, one each side, `offset` mm from it: the fence beside an antenna feed or around a noisy block.  A via that
+    would stand on or beside a pad of another net, or that the rules check finds too close to other copper, is left out.
+    Returns {"vias", "tried", "removed"}."""
+    self.flush()
+    pts_in = [(float(p[0]), float(p[1])) for p in path]
+    if len(pts_in) < 2:
+        raise HarnessError("Give the path as at least two points: [(x0, y0), (x1, y1), ...].")
+    if spacing <= 0:
+        raise HarnessError("spacing is the distance between vias in mm.")
+    g = self.geometry()
+    name = self._net(net)
+    rows = [0.0] if not offset else [offset, -offset]
+    pts = []
+    for side in rows:
+        carry = 0.0     # how far into the next segment the next via falls
+        for (ax, ay), (bx, by) in zip(pts_in, pts_in[1:]):
+            L = math.hypot(bx - ax, by - ay)
+            if L < 1e-6:
+                continue
+            ux, uy = (bx - ax) / L, (by - ay) / L
+            d = carry
+            while d <= L + 1e-6:
+                at = (_r(ax + ux * d - uy * side), _r(ay + uy * d + ux * side))
+                if _clear_of_pads(g, at, name, 0.9) and all(math.hypot(at[0] - q[0], at[1] - q[1]) > spacing * 0.6 for q in pts):
+                    pts.append(at)
+                d += spacing
+            carry = d - L
+    out = _vias_checked(self, name, pts, size, drill)
+    self.project.note(f"board: fence of {out['vias']} vias on {name}")
+    return out
+
+
+def _ground_pads(self, net: str = "GND", size: float | None = None, drill: float | None = None, width: float = 0.25, rounds: int = 12, max_pads: int | None = None) -> dict:
+    """Give the ground pads that reach the plane only through the pour on their own layer (review rule
+    ground.pour_only) a via beside them, joined by one short straight track; pads that share an unbroken piece of
+    pour share the via (one within 4 mm in the same piece is enough), so the board gets the vias it needs, not one a pad.  A pad on a pour hangs on that piece
+    of copper; a track routed past it, or a pour not refilled, cuts it off and leaves ratsnest lines to ground.  Each
+    via is tried in eight directions, those pointing away from the part's middle first (where its other pins' tracks
+    do not run), at 0.8 to 2.1 mm; any the rules check finds at fault is taken out again and the next spot tried.
+    route() calls it before laying signal tracks for the pads of small parts (max_pads=4), so the signals route round
+    those vias instead of filling the room; finish() calls it again after routing for every pad.
+    Returns {"vias": n, "pads": [...], "left": [...]}."""
+    name = self._net(net)
+    done: list = []
+    state: dict = {}        # pad -> index of the next spot to try
+    left: list = []
+    steps0 = [(dx, dy) for dx, dy in ((1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))]
+    dists = (0.8, 1.05, 1.35, 1.7, 2.1)
+    order: dict = {}         # pad -> its directions, outward first
+    for _ in range(rounds):
+        try:
+            self.fill()
+        except HarnessError:
+            pass
+        r = self._call("review_design", rule="ground.pour_only")
+        items = [i for f in r.get("findings", []) if f.get("rule") == "ground.pour_only" for i in f.get("items") or []]
+        pads = [m.group(1) for m in (re.match(r"^(\S+\.\S+) at ", i) for i in items) if m]
+        g = self.geometry()
+        size_of = {p["ref"]: len(p["pads"]) for p in g["parts"]}
+        left = [p for p in pads if p not in done and (max_pads is None or size_of.get(p.split(".")[0], 0) <= max_pads)]
+        if not left:
+            break
+        tried: dict = {}
+        for spec in left:
+            q = self.pad(spec)
+            # one via serves the ground pads around it through the pour: a pad close to a via laid in this round waits
+            # for the next look, which tells whether that via reaches it
+            if any(math.hypot(q["x"] - t[0][0], q["y"] - t[0][1]) <= 3.5 for t in tried.values()):
+                continue
+            if spec not in order:
+                part = next((p for p in g["parts"] if p["ref"] == spec.split(".")[0]), None)
+                ox, oy = (q["x"] - part["x"], q["y"] - part["y"]) if part else (0.0, 0.0)
+                order[spec] = sorted(steps0, key=lambda d: -((d[0] * ox + d[1] * oy) / math.hypot(*d)))
+            steps = order[spec]
+            k = state.get(spec, 0)
+            while k < len(steps) * len(dists):
+                dx, dy = steps[k % len(steps)]
+                dist = dists[k // len(steps)]
+                n = math.hypot(dx, dy)
+                at = (_r(q["x"] + dx / n * dist), _r(q["y"] + dy / n * dist))
+                k += 1
+                if _clear_of_pads(g, at, name, 0.6) and _clear_of_copper(self, at, name, 0.25 + 0.2):
+                    break
+            else:
+                state[spec] = k
+                continue
+            state[spec] = k
+            side = next((p.get("side") for p in g["parts"] if p["ref"] == spec.split(".")[0]), "front")
+            self.via(name, at, size=size, drill=drill)
+            self.track(name, [(q["x"], q["y"]), at], layer="B.Cu" if side == "back" else "F.Cu", width=width)
+            res = self.flush() or {}
+            tried[spec] = (at, (q["x"], q["y"]), list(res.get("added") or []))
+        if not tried:
+            break
+        bad = set()
+        for v in self._fresh_checks().get("violations", []):
+            if v.get("severity") != "error" or v.get("code") in ("unconnected_items", "track_right_angle"):
+                continue
+            for spec, (at, pad, _ids) in tried.items():
+                if _seg_dist((v["x"], v["y"]), pad, at) < 0.6:
+                    bad.add(spec)
+        for spec in bad:
+            for i in tried[spec][2]:
+                self._edit({"op": "remove", "id": i})
+        self.flush()
+        done += [s for s in tried if s not in bad]
+    out = {"vias": len(done), "pads": done, "left": [p for p in left if p not in done]}
+    self.project.note(f"board: {out['vias']} ground pads given their own via" + (f", {len(out['left'])} without room" if out["left"] else ""))
+    return out
+
+
+_QUIET_NET = re.compile(r"^/?(.*/)?([ADP]?GND\w*|VSS\w*|EARTH|[+-]?\d+V\d*\w*|[+-]?\d+\.\d+V\w*|VCC\w*|VDD\w*|VBUS\w*|VBAT\w*|VIN\w*|VSYS\w*|\+BATT)$", re.I)
+
+
+def _cross(a, b, c, d) -> bool:
+    """Do segments ab and cd cross (not merely touch at an end)?"""
+    def o(p, q, r):
+        v = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+        return 0 if abs(v) < 1e-9 else (1 if v > 0 else -1)
+    if min(math.hypot(a[0] - x[0], a[1] - x[1]) for x in (c, d)) < 1e-6 or min(math.hypot(b[0] - x[0], b[1] - x[1]) for x in (c, d)) < 1e-6:
+        return False
+    return o(a, b, c) * o(a, b, d) < 0 and o(c, d, a) * o(c, d, b) < 0
+
+
+def _compare_parts(self, ref: str, options: dict, rotations=(0, 90, 180, 270), at=None) -> list:
+    """Weigh other packages (or other parts) for one part by how well they would route where it sits, before choosing
+    one: the plan an engineer makes when picking a part, not after.  For each option and each rotation the pads are
+    laid where the part is (or at `at`), every signal pad gets a straight line to the nearest pad of its net on another
+    part, and the option is scored on those lines: how many cross each other (each crossing is a via or a detour),
+    how many have to run back across the part's own body, and their total length.  Ground and supply pads are left out
+    of the crossings: they drop to a plane or run wide round the part.
+
+    options: {name: {"footprint": "Lib:Footprint", "nets": {net: pad}}} with the pad each net lands on in that
+    package (read the datasheet's pin table), or {"footprint": ..., "symbol": "Lib:Symbol"} to map by pin name
+    through the part's present symbol.  Include the present package to compare against it.
+    Returns the options best first: {"option", "rotation", "crossings", "through_body", "length_mm", "score"}.
+    Example: the TPD2E2U06 in DCK (SC70: IO1 and IO2 side by side, GND opposite) against DRL (SOT-553: IO1 and IO2
+    on opposite sides): board.compare_parts("U6", {"DCK": {"footprint": "Package_TO_SOT_SMD:SOT-323_SC-70",
+    "nets": {"USB_D+": "1", "USB_D-": "2", "GND": "3"}}, "DRL": {"footprint": "Package_TO_SOT_SMD:SOT-553",
+    "nets": {"USB_D+": "3", "USB_D-": "5", "GND": "4"}}})."""
+    g = self.geometry()
+    me = next((p for p in g["parts"] if p["ref"].lower() == ref.lower()), None)
+    if not me:
+        raise HarnessError(f"There is no footprint {ref} on the board.")
+    cx, cy = (at or (me["x"], me["y"]))[:2]
+    others: dict = {}
+    for p in g["parts"]:
+        if p["ref"] == me["ref"]:
+            continue
+        for q in p["pads"]:
+            if q[3]:
+                others.setdefault(q[3], []).append((q[1], q[2], p["ref"]))
+    by_name: dict = {}
+    for name, opt in options.items():
+        nets = dict(opt.get("nets") or {})
+        if not nets and opt.get("symbol"):
+            sch_pins = {}
+            for d in self.project._open.values():
+                if hasattr(d, "sections"):
+                    for sp in d.geometry().get("parts", []):
+                        if sp["ref"] == me["ref"]:
+                            sch_pins = {pin[1]: pin[6] for pin in sp["pins"] if pin[1]}
+            lib = self.project.transport.call("get_library_part", {"id": opt["symbol"], "brief": True}).get("pins") or {}
+            nets = {sch_pins[nm]: num for num, nm in lib.items() if nm and nm in sch_pins and sch_pins[nm]}
+            if not nets:
+                raise HarnessError(f"{name}: the symbol's pins have no names to match; give nets={{net: pad}} from the datasheet's pin table.")
+        fp = self.project.transport.call("get_library_part", {"id": opt["footprint"], "kind": "footprint"})
+        pads = {str(q["number"]): (q["dx"], q["dy"]) for q in fp.get("pad_list") or []}
+        missing = [pad for pad in nets.values() if str(pad) not in pads]
+        if missing:
+            raise HarnessError(f"{name}: {opt['footprint']} has no pad {', '.join(map(str, missing))}.")
+        ext = fp.get("extent_box") or [-1, -1, 1, 1]
+        body = max(0.3, min(abs(v) for v in (pads and [max(abs(dx) for dx, _ in pads.values()), max(abs(dy) for _, dy in pads.values())] or [1])) * 0.6)
+        for rot in rotations:
+            t = math.radians(rot)
+            c, sn = math.cos(t), math.sin(t)
+            lines = []
+            length = 0.0
+            through = 0
+            for net, pad in nets.items():
+                full = next((n for n in others if n == net or n.split("/")[-1] == net.split("/")[-1]), None)
+                if not full:
+                    continue
+                dx, dy = pads[str(pad)]
+                px, py = cx + dx * c + dy * sn, cy - dx * sn + dy * c
+                dests = sorted(others[full], key=lambda q: math.hypot(q[0] - px, q[1] - py))
+                pick = dests[:1]
+                if not _QUIET_NET.match(full):      # a net that passes through: also the nearest pad on another part
+                    pick += [q for q in dests if q[2] != dests[0][2]][:1]
+                for q in pick:
+                    length += math.hypot(q[0] - px, q[1] - py)
+                    if _QUIET_NET.match(full):
+                        continue
+                    lines.append(((px, py), (q[0], q[1])))
+                    # does the line run back over the part's own body (the pad faces away from where its net goes)?
+                    if _seg_dist((cx, cy), (px, py), q) < body and math.hypot(q[0] - cx, q[1] - cy) > math.hypot(px - cx, py - cy):
+                        through += 1
+            crossings = sum(1 for i in range(len(lines)) for j in range(i + 1, len(lines)) if _cross(*lines[i], *lines[j]))
+            score = crossings * 10 + through * 4 + length * 0.2
+            row = {"option": name, "rotation": rot, "crossings": crossings, "through_body": through, "length_mm": round(length, 2), "score": round(score, 2)}
+            if name not in by_name or score < by_name[name]["score"]:
+                by_name[name] = row
+        _ = ext
+    out = sorted(by_name.values(), key=lambda r: r["score"])
+    self.project.note(f"board: {ref} packages compared, best {out[0]['option']} at {out[0]['rotation']}°" if out else f"board: {ref} no package to compare")
+    return out
+
+
+def _seg_dist(p, a, b) -> float:
+    ax, ay = a[0], a[1]
+    bx, by = b[0], b[1]
+    L2 = (bx - ax) ** 2 + (by - ay) ** 2
+    t = 0.0 if L2 < 1e-12 else max(0.0, min(1.0, ((p[0] - ax) * (bx - ax) + (p[1] - ay) * (by - ay)) / L2))
+    return math.hypot(p[0] - (ax + t * (bx - ax)), p[1] - (ay + t * (by - ay)))
+
+
+def _too_close(self, ids: dict, name: str, size) -> set:
+    """The new vias ({id: (x, y)} or {id: ((x, y), net)}) that stand nearer another net's copper than the clearance."""
+    try:
+        clr = float((self.rules() or {}).get("clearance") or 0.2)
+    except (HarnessError, TypeError, ValueError):
+        clr = 0.2
+    out = set()
+    for vid, v in ids.items():
+        at, net = (v[0], v[1]) if isinstance(v[0], (tuple, list)) else (v, name)
+        near = self.whats_at(at, 1.2)
+        own = next((q for q in near if q.get("id") == vid), None)
+        r = float((own or {}).get("size") or size or 0.5) / 2
+        if any(q.get("net") != net and q.get("id") != vid and q.get("gap_mm") is not None and q["gap_mm"] - r < clr - 1e-3 for q in near):
+            out.add(vid)
+    return out
+
+
+def _vias_checked(self, name: str, pts: list, size, drill) -> dict:
+    """Place a via at each point, then take out those the rules check finds at fault."""
+    ids = {}
+    for at in pts:      # one batch each, so each via's id is known and a bad one can be taken out again
+        self.via(name, at, size=size, drill=drill)
+        res = self.flush() or {}
+        new = (res.get("added") or [None])[-1]
+        if new:
+            ids[new] = at
+    removed = 0
+    if ids:
+        r = self._fresh_checks()
+        bad = set()
+        for v in r.get("violations", []):
+            if v.get("severity") != "error" or v.get("code") in ("unconnected_items",):
+                continue
+            for vid, at in ids.items():
+                if abs(v["x"] - at[0]) < 0.6 and abs(v["y"] - at[1]) < 0.6:
+                    bad.add(vid)
+        # a rules marker can sit more than a millimetre from the via it is about (KiCad marks the track side), so each
+        # new via is also measured against the copper round it
+        bad |= _too_close(self, ids, name, size)
+        for vid in bad:
+            self._edit({"op": "remove", "id": vid})
+            removed += 1
+        self.flush()
+    return {"vias": len(ids) - removed, "tried": len(pts), "removed": removed}
+
+
+def install(Project, Schematic, Board) -> None:
+    Schematic.review = _review
+    Board.review = _review
+    Project.review = _project_review
+    Schematic.globalize = _globalize
+    Schematic.supplies = _supplies
+    Schematic.power_flags = _power_flags
+    Schematic.test_point = _test_point
+    Schematic.bom = _bom
+    Schematic.fiducials = _fiducials
+    Board.fiducials = _board_fiducials
+    Board.mark = _mark
+    Board.stitch = _stitch
+    Board.power_pours = _power_pours
+    Board._zones_of = _zones_of
+    Board.power_stitch = _power_stitch
+    Board.ground_pads = _ground_pads
+    Board.compare_parts = _compare_parts
+    Board.fence = _fence
+    Board.silkscreen = _silkscreen
+    Board.cleanup = _cleanup
+    Board.score = _score

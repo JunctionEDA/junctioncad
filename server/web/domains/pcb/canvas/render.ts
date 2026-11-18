@@ -1,0 +1,1757 @@
+// kicad-canvas — GENERATED SOURCE MODULE (split from the former static/kicad-canvas.js; static/kicad-canvas.js is now the esbuild output of web/domains/pcb/canvas/index.ts — edit these modules, not the bundle).
+import { root } from "./env";
+import { PCB_BG, PCB_GRID, PCB_GRID_AXES, PCB_PAGE_LIMITS, PCB_SHEET, SCH, SCH_DEFAULT, SCH_Z, parseColor, pcbColor, pcbZ, rgba } from "./colors";
+import { atOf, effectsOf, flipH, kid, kids, num, pointInPoly, ptsOf, splitLines, str } from "./sexpr";
+import { isBusLabel } from "./busname";
+import { ensureFontGeom, ensureSchTheme } from "./geom";
+import { FAKE_ITALIC_SLANT, OUTLINE_EM, cssFamily, faceAvailable, fontChanged as olFontChanged, outlineLayout, type OutlineLayout } from "./outline-text";
+import { displayNetName } from "./geom-pcb";
+import { geomBox } from "./hit";
+import { documentDrawingSheet } from "./sheet";
+import { TEXT_INTERLINE, lineOffsets, textWidth, urlRunBox } from "./text";
+import { drawStrokeText, setOverbarHeight, strokeLine, strokeOrigin } from "./stroke-font";
+import { hopShapes, strokeHopShape } from "./hop-over";
+import { schFormat } from "./geom-sch";
+import type { AnyCanvas, Box, CircleGeom, Ctx2D, Doc, DrawTextG, Geom, Item, Marker, Mat, ObjectsOpt, PadGeom, PathSink, Pt, RatsLine, RectGeom, RenderOpts, TextGeom, View, ViaRingGeom } from "./types";
+
+/** drawHalo's style: the halo colour (or a function of the geometry's colour), its alpha and the extra stroke width in device px. */
+export interface HaloStyle { color: string | ((c: string) => string); alpha: number; extraPx: number; extraMm?: number; strokesOnly?: boolean }
+// ---------------------------------------------------------------- rendering
+export const HAS_PATH2D = typeof Path2D !== "undefined";
+
+export const FONT_FAMILY = '"IBM Plex Sans", "Helvetica Neue", Arial, sans-serif';
+
+export const FONT_EM = 1.4;
+   // cap height ≈ 0.72 em for these faces; KiCad's text size is the cap height
+export const FONT_CACHE = new Map<number | string, string>();
+
+/** Lazily built Path2D (mm units) for a geometry; rebuilt geometry objects start without one. */
+export function pathOf(g: Geom): Path2D | null {
+  if (g._p) return g._p;
+  if (!HAS_PATH2D) return null;
+  const p = new Path2D(); tracePath(p, g); g._p = p; return p;
+}
+
+export function tracePath(ctx: PathSink, g: Geom): void {
+  if (g.t === "line") { ctx.moveTo(g.x1, g.y1); ctx.lineTo(g.x2, g.y2); }
+  else if (g.t === "poly") { const pts = g.pts; ctx.moveTo(pts[0][0], pts[0][1]); for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]); if (g.close) ctx.closePath(); }
+  else if (g.t === "rect") ctx.rect(g.x, g.y, g.w, g.h);
+  else if (g.t === "circle") ctx.arc(g.x, g.y, g.r, 0, Math.PI * 2);
+  else if (g.t === "arc") { if (g.pie) ctx.moveTo(g.x, g.y); ctx.arc(g.x, g.y, g.r, g.a0, g.a1, g.anticlockwise); if (g.pie) ctx.closePath(); }
+  else if (g.t === "pad") tracePad(ctx, g);
+}
+
+export function tracePad(ctx: PathSink, g: PadGeom): void {
+  const c = Math.cos(-g.rot * Math.PI / 180), s = Math.sin(-g.rot * Math.PI / 180);
+  const X = (x: number, y: number) => g.x + x * c - y * s, Y = (x: number, y: number) => g.y + x * s + y * c;
+  const w = g.w, h = g.h;
+  if (g.shape === "circle") { ctx.moveTo(X(w / 2, 0), Y(w / 2, 0)); ctx.arc(g.x, g.y, Math.max(w, h) / 2, 0, Math.PI * 2); return; }
+  const r = g.shape === "oval" ? Math.min(w, h) / 2 : Math.min(g.rr || 0, w / 2, h / 2);
+  if (r <= 0) { ctx.moveTo(X(-w / 2, -h / 2), Y(-w / 2, -h / 2)); ctx.lineTo(X(w / 2, -h / 2), Y(w / 2, -h / 2)); ctx.lineTo(X(w / 2, h / 2), Y(w / 2, h / 2)); ctx.lineTo(X(-w / 2, h / 2), Y(-w / 2, h / 2)); ctx.closePath(); return; }
+  // rounded rectangle traced with arcs (works for ovals, roundrects and rotated pads alike)
+  const a = -g.rot * Math.PI / 180; const hw = w / 2 - r, hh = h / 2 - r;
+  ctx.moveTo(X(-hw, -h / 2), Y(-hw, -h / 2));
+  ctx.lineTo(X(hw, -h / 2), Y(hw, -h / 2)); ctx.arc(X(hw, -hh), Y(hw, -hh), r, a - Math.PI / 2, a, false);
+  ctx.lineTo(X(w / 2, hh), Y(w / 2, hh)); ctx.arc(X(hw, hh), Y(hw, hh), r, a, a + Math.PI / 2, false);
+  ctx.lineTo(X(-hw, h / 2), Y(-hw, h / 2)); ctx.arc(X(-hw, hh), Y(-hw, hh), r, a + Math.PI / 2, a + Math.PI, false);
+  ctx.lineTo(X(-w / 2, -hh), Y(-w / 2, -hh)); ctx.arc(X(-hw, -hh), Y(-hw, -hh), r, a + Math.PI, a + 3 * Math.PI / 2, false);
+  ctx.closePath();
+}
+
+/**
+ * view: { ppm (css px per mm at zoom 1), zoom, panX, panY (css px), x0, y0 (mm origin), dpr }
+ * opts: { hidden: Set(layer keys), grid: pitch mm (0 = off), selected: Set(item ids) }
+ *   plus KiCad's display options (all optional, default off):
+ *   showHiddenPins (schematic) — draw the pins a library symbol marks hidden, with their names and
+ *                                numbers, in the hidden-item grey (they are kept in item.hiddenGeom
+ *                                so hit boxes stay as they were);
+ *   zoneOutline    (board)     — zones as outlines with their hatch only, no copper fill;
+ *   outlinePads, outlineTracks, outlineVias (board) — KiCad's sketch display modes: the pad shapes,
+ *                                the track/arc stadium outlines and the via rings are stroked with a
+ *                                hairline instead of filled;
+ *   activeLayer    (board)     — the layer being worked on is drawn on top, with the other layers of its side
+ *                                (PCB_DRAW_PANEL_GAL::SetTopLayer); holes, pad / via names and the ratsnest stay above;
+ *   highContrast + activeLayer (board) — high-contrast mode: everything not on `activeLayer` is
+ *                                dimmed to HC_DIM alpha (holes stay visible), the active layer is
+ *                                drawn at full colour;
+ *   highlight      (both)      — Set of item ids (or null): everything else is dimmed to HL_DIM alpha
+ *                                and the set is drawn in KiCad's brightened look — LAYER_BRIGHTENED
+ *                                (magenta) on schematics, the item's own colour Brightened(0.5) on
+ *                                boards — with a translucent halo of that colour around it;
+ *   ids            (both)      — Set (or array) of item ids: only those items are drawn (export subsets);
+ *   background     (both)      — css colour under the drawing, or false for none (transparent export);
+ *                                default: the theme's sheet / board background;
+ *   frame          (both)      — false skips KiCad's drawing sheet entirely (subset exports).  Otherwise the
+ *                                sheet is drawn under the document from the built-in (kicad_wks …) description
+ *                                (web/domains/pcb/canvas/sheet.ts): the two frame rectangles on the 10 mm margins, the 2 mm
+ *                                tick band with its 50 mm ticks and A/B/C · 1/2/3 labels, the title block and its
+ *                                text (${TITLE}, ${REVISION}, ${ISSUE_DATE}, ${PAPER}, ${FILENAME}, ${SHEETPATH},
+ *                                ${COMPANY}, ${COMMENT1..4}, ${#}/${##}) resolved from the document, then the
+ *                                page outline in the page-limits grey.  Schematics use the schematic sheet colour
+ *                                (#840000), boards the board one (#C872AB), exactly as eeschema and pcbnew do;
+ *   ratsnest       (board)     — [{net, name, a: [x, y], b: [x, y]}] (mm): unrouted connections drawn like
+ *                                RATSNEST_VIEW_ITEM — LAYER_RATSNEST rgba(0,248,255,0.35), 0.5 device px
+ *                                hairlines, above copper and holes, below the user layers, markers and the
+ *                                selection; a line whose ends coincide becomes the 0.2 mm cross.  With
+ *                                netColors the line takes the net's colour;
+ *   ratsnestNets   (board)     — Set of net numbers: only those nets' lines are drawn (local ratsnest);
+ *   markers        (both)      — [{x, y, severity: "error"|"warning"|"exclusion", text}]: DRC / ERC markers as
+ *                                MARKER_BASE::ShapeToPolygon's arrow flag — the MarkerShapeCorners scaled by
+ *                                0.1625 mm / √(KiCad zoom factor) on boards (PCB_MARKER::SetZoom) and by a
+ *                                constant 0.15 mm on schematics — filled in LAYER_DRC_ERROR/WARNING/EXCLUSION
+ *                                or LAYER_ERC_ERR/WARN/EXCLUSION, on top of everything but the selection;
+ *                                board markers get the LAYER_MARKER_SHADOWS outline (background @ 0.5, one
+ *                                scale unit wide).  markerAt() / markerScale() serve hover look-ups;
+ *   netNamesMode   (board)     — pcb_display.net_names_mode under netNames: 0 none, 1 pads, 2 tracks, 3 both (default)
+ *   netNames       (board)     — net names on tracks per PCB_PAINTER::renderNetNameForSegment: glyph size
+ *                                0.55 × track width, pen width/12, centred and rotated along the segment
+ *                                (angle normalised to (−90°, 90°]), one label per viewport-width of track,
+ *                                skipped when the segment is shorter than width × characters or when the
+ *                                track is thinner than 4 mm at KiCad zoom 1 (≈ 14 px) on screen
+ *                                (PCB_TRACK::ViewGetLOD); the label is NETNAMES_LAYER_ID_START white @ 0.7,
+ *                                inverted on bright copper.  Via names per PCB_PAINTER::draw(PCB_VIA):
+ *                                size = min(via, 10 mm), text = min(1.5·size / max(chars, 3 | 6), size) × 0.75
+ *                                in LAYER_VIA_NETNAMES rgba(50,50,50,0.9), once the via is ≥ 10 mm at zoom 1
+ *                                on screen; blind / micro vias add their "top-bottom" layer pair above the
+ *                                name.  Pad numbers and pad net names are unaffected (always drawn);
+ *   netColors      (board)     — Map net number → css colour (NET_COLOR_MODE::ALL): tracks, vias, pads and
+ *                                zone fills on copper take the net's colour; netclass colours are resolved
+ *                                to nets by the caller;
+ *   zoneFill       (board)     — fill preview for zones that have no (filled_polygon …) yet: the outline
+ *                                filled in the layer colour at KiCad's zone opacity (0.6, "board.opacity.zones")
+ *                                minus a clearance ring — (connect_pads (clearance c)), 0.5 mm default —
+ *                                around other-net pads, tracks, vias and NPTH holes on the zone's layer,
+ *                                cut with destination-out on an offscreen canvas (KiCadCanvas.createCanvas);
+ *                                visual only, nothing is written to the document.  Zones that carry
+ *                                filled_polygon keep their rendering.  Not modelled: thermal reliefs,
+ *                                min_thickness insets, board-edge clearance and zone priorities;
+ *   flip           (board)     — KiCad's Flip Board View: X mirrored about the board bbox centre; flipX() /
+ *                                unflipX() map pointer coordinates and setViewTransform(ctx, view, doc)
+ *                                puts overlays into the same space.  Following PCB_PAINTER, text on
+ *                                side-specific layers (F.* / B.*) mirrors with the board (back text becomes
+ *                                readable), text on the other layers keeps its box but is re-mirrored to stay
+ *                                readable; pad labels and net names are always kept readable;
+ *   padNumbers     (board)     — default true; false hides the pad numbers (pad net names stay);
+ *   gridAxes       (both)      — GAL's grid axes (window.grid.axes_enabled, off by default): the X and Y axes
+ *                                through the document origin in the theme's grid_axes colour, grid shown or not;
+ *   gridStyle      (both)      — "dots" (default), "lines" or "crosses" (KiCad's grid.style 0 / 1 / 2); gridMinSpacing
+ *                                is the minimum spacing of drawn grid marks in px (default 10); gridLineWidth the
+ *                                mark thickness (grid.line_width, 1: gridMinorPx); gridShowMajor false is GAL's
+ *                                m_gridTick 0 (grid.show_major): no major marks, the grid thinned by 2 (gridTick);
+ *   showHiddenText (board)     — draw the hidden fp_text / properties (kept in item.hiddenGeom, tagged
+ *                                hiddenText, outside the hit boxes) at HIDDEN_TEXT_ALPHA; KiCad has no
+ *                                painter rule for this (this version dropped LAYER_HIDDEN_TEXT).
+ *   layerColors    (board)     — Map layer name → css colour: the user's colour for a layer (Appearance ▸ Layers
+ *                                swatch); geometry painted in the layer's theme colour takes it instead.  A
+ *                                colour with an alpha (the colour picker's Opacity, { / } on the active layer)
+ *                                makes the whole layer translucent, its zones included (COLOR4D::a);
+ *   objects        (board)     — { hide: Set, opacity: {…} } keyed by KiCad's Appearance ▸ Objects rows: tracks,
+ *                                vias, pads, zones, images (visibility + opacity), filledShapes (opacity),
+ *                                each multiplying the item colour's alpha (PCB_RENDER_SETTINGS::GetColor); a
+ *                                zones value replaces the ZONE_OPACITY default rather than scaling it,
+ *                                fpFront / fpBack (a footprint on that side with all its children, as
+ *                                LAYER_FOOTPRINTS_FR/BK), values, references, fpText (footprint text), anchors
+ *                                (in `show`: the 5 px LAYER_ANCHOR cross on every footprint origin) and
+ *                                lockedShadow (in `show`, with lockedIds: LAYER_LOCKED_ITEM_SHADOW halo);
+ *   itemColors     (board)     — Map item id → css colour (tracks, vias, zones) or an array of colours by pad index
+ *                                (footprints): net / netclass colours resolved per item by the caller, for boards
+ *                                whose nets are named inline rather than numbered (netColors needs net codes);
+ *   inactiveHide   (board)     — with highContrast + activeLayer: the inactive layers are not drawn at all
+ *                                (Appearance ▸ Layer Display Options ▸ Inactive layers: Hide);
+ *   gridColor      (both)      — css colour of the grid dots (LAYER_GRID swatch);
+ * Stroke styles: geometry with dashType (dash | dot | dash_dot | dash_dot_dot, from (stroke (type …))) is
+ * dashed per STROKE_PARAMS::Stroke with KiCad's ISO 128-2 ratios — dash 11 w, gap 4 w, dot 0.2 w of the drawn
+ * line width.  Knockout text (knockout on the geometry) fills its inflated box in the layer colour and
+ * cuts the glyphs out in the background colour.
+ */
+export const GRID_MIN_SPACING = 10, GRID_TICK = 10;   // "grid.min_spacing" (px), GAL::SetCoarseGrid( 10 )
+
+export const HC_DIM = 0.2, HL_DIM = 0.25, HIDDEN_TEXT_ALPHA = 0.5;
+   // HC_DIM: 1 − appearance.hicontrast_dimming_factor (0.8); HL_DIM: the schematic's dimming of items a highlight leaves out
+export const HL_FACTOR = 0.5, SELECT_FACTOR = 0.5, HC_EDGE_MIN = 0.3;
+   // RENDER_SETTINGS m_highlightFactor / m_selectFactor; PCB_RENDER_SETTINGS::GetColor's Edge_Cuts floor (dim_factor_Edge_Cuts)
+
+/** COLOR4D::Darkened(f): every channel c → c·(1−f), alpha kept */
+export const DARK_CACHE = new Map<string, string>();
+export function darkened(c: string, f: number): string {
+  const key = f + c; let v = DARK_CACHE.get(key); if (v) return v;
+  const [r, g, b, a] = parseColor(c); v = rgba(Math.round(r * (1 - f)), Math.round(g * (1 - f)), Math.round(b * (1 - f)), a);
+  if (DARK_CACHE.size < 4096) DARK_CACHE.set(key, v); return v;
+}
+/** COLOR4D::Mix: c.Mix(other, f) = other·(1−f) + c·f per channel, c's alpha kept. */
+export const MIX_CACHE = new Map<string, string>();
+export function mixColor(c: string, other: string, f: number): string {
+  const key = f + c + "|" + other; let v = MIX_CACHE.get(key); if (v) return v;
+  const [r, g, b, a] = parseColor(c), [R, G, B] = parseColor(other), m = (x: number, y: number) => Math.round(y * (1 - f) + x * f);
+  v = rgba(m(r, R), m(g, G), m(b, B), a);
+  if (MIX_CACHE.size < 4096) MIX_CACHE.set(key, v); return v;
+}
+/** An item repainted brightened (EDA_ITEM::IsBrightened): PCB_RENDER_SETTINGS::GetColor returns colour.Brightened(m_selectFactor).WithAlpha(0.8). */
+export function brightenedItemColor(c: string): string { const v = brightened(c, SELECT_FACTOR); const [r, g, b] = parseColor(v); return rgba(r, g, b, 0.8); }
+
+export const ZONE_OPACITY = 0.6;
+                                        // PCB_DISPLAY_OPTIONS::m_ZoneOpacity ("board.opacity.zones")
+export const RATSNEST_COLOR = "rgba(0,248,255,0.35)", RATSNEST_PX = 0.5, RATSNEST_CROSS = 0.2;
+   // LAYER_RATSNEST, m_RatsnestThickness, CROSS_SIZE
+export const MARKER_CORNERS = [[0, 0], [8, 1], [4, 3], [13, 8], [9, 9], [8, 13], [3, 4], [1, 8]];
+   // MARKER_BASE::MarkerShapeCorners
+export const DRC_HIGHLIGHTED = "#FF00FF";   // LAYER_DRC_HIGHLIGHTED
+export const MARKER_SCALE: { pcb: number; sch: number } = { pcb: 0.1625, sch: 0.15 };
+                 // PCB_MARKER / SCH_MARKER SCALING_FACTOR (mm)
+export const MARKER_COLORS: { pcb: Record<string, string>; sch: Record<string, string> } = {
+  pcb: { error: "rgba(215,91,107,0.8)", warning: "rgba(255,208,66,0.8)", exclusion: "rgba(255,255,255,0.8)" },   // LAYER_DRC_*
+  sch: { error: "rgba(230,9,13,0.8)", warning: "rgba(209,146,0,0.8)", exclusion: "rgba(194,194,194,0.8)" },      // LAYER_ERC_*
+};
+
+export const PX_PER_MM_ZOOM1 = 91 * 1e6 * 1e-9 / 0.0254;
+                // GAL world scale at zoom factor 1: screen DPI (ADVANCED_CFG 91) × 1 nm in inches, per mm
+export const TRACK_NETNAME_MM = 4, VIA_NETNAME_MM = 10, PAD_NETNAME_MM = 0.5;
+                 // PCB_TRACK / PCB_VIA::ViewGetLOD netname thresholds
+export const VIA_NETNAME_COLOR = "rgba(50,50,50,0.9)", TRACK_NETNAME_LIGHT = "rgba(255,255,255,0.7)", TRACK_NETNAME_DARK = "rgba(0,0,0,0.7)";
+
+export const SIDE_SPECIFIC = /^(F|B)\./;
+                                // LSET::SideSpecificMask: the front / back layers
+export const HL_CACHE = new Map<string, string>(), NETNAME_COLOR_CACHE = new Map<string, string>();
+
+/** COLOR4D::Brightened(f): every channel c → c·(1−f) + f */
+export function brightened(c: string, f: number): string { const [r, g, b, a] = parseColor(c); const k = (v: number) => Math.round(v * (1 - f) + 255 * f); return rgba(k(r), k(g), k(b), a); }
+
+/** The colour of a highlighted item: the board brightens its own colour by the highlight factor (0.5); eeschema paints LAYER_BRIGHTENED. */
+export function highlightColor(c: string, isPcb: boolean): string {
+  if (!isPcb) return SCH.brightened;
+  let v = HL_CACHE.get(c); if (!v) { v = brightened(c, 0.5); HL_CACHE.set(c, v); } return v;
+}
+
+/**
+ * The colour of a SELECTED board item: RENDER_SETTINGS::update() derives m_layerColorsSel from each layer
+ * colour, and PCB_PAINTER::getColor() paints a selected item in it -- there is no shadow or halo on a board.
+ * With m_selectFactor 0.5: factor = min(1, 0.25 + brightness^3), colour.Brightened(factor); when that changes
+ * the brightness by under 0.05 (near-white layers) fall back to Darkened(0.2) with the blue channel pushed
+ * toward 1 by `factor`.  Layers darker than 0.05 keep their colour.  Brightness is 0.299 r + 0.587 g + 0.114 b.
+ */
+export const SEL_CACHE = new Map<string, string>();
+export function selectedColor(c: string): string {
+  let v = SEL_CACHE.get(c); if (v) return v;
+  const [r, g, b, a] = parseColor(c), R = r / 255, G = g / 255, B = b / 255;
+  const bright = (x: number, y: number, z: number) => 0.299 * x + 0.587 * y + 0.114 * z, br = bright(R, G, B);
+  if (br < 0.05) v = c;
+  else {
+    const f = Math.min(1, 0.25 + br * br * br), up = (x: number) => x * (1 - f) + f;
+    let sr = up(R), sg = up(G), sb = up(B);
+    if (Math.abs(bright(sr, sg, sb) - br) < 0.05) { const d = (x: number) => x * (1 - 0.2); sr = d(R); sg = d(G); sb = B * (1 - f) + f; }
+    v = rgba(Math.round(sr * 255), Math.round(sg * 255), Math.round(sb * 255), a);
+  }
+  SEL_CACHE.set(c, v); return v;
+}
+
+/** Fills of a highlighted schematic item: background-layer fills go translucent (SCH_PAINTER: alpha 0.2), the rest take the highlight colour. */
+export function highlightFill(g: Geom): string { return g.z !== undefined && g.z < 0 ? "rgba(255,0,255,0.2)" : SCH.brightened; }
+
+/** Track net-name colour for a copper colour: NETNAMES_LAYER_ID_START, inverted when the copper's brightness is above 0.5 (PCB_RENDER_SETTINGS::LoadColors). */
+export function trackNameColor(copper: string): string {
+  let v = NETNAME_COLOR_CACHE.get(copper);
+  if (!v) { const [r, g, b] = parseColor(copper); v = (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.5 ? TRACK_NETNAME_DARK : TRACK_NETNAME_LIGHT; NETNAME_COLOR_CACHE.set(copper, v); }
+  return v;
+}
+
+/** STROKE_PARAMS::Stroke dash pattern (mm) for a drawn line width: dash 11 w, gap 4 w, dot 0.2 w (ISO 128-2 ratios 12 / 3, correction 1). */
+export const DASH_RATIOS = { dash: 12, gap: 3 };   // the schematic's dashed_lines_dash_length_ratio / gap_length_ratio (Schematic Setup > Formatting)
+export function dashPattern(type: string | null | undefined, w: number): number[] {
+  const dash = Math.max(DASH_RATIOS.dash - 1, 1) * w, gap = Math.max(DASH_RATIOS.gap + 1, 1) * w, dot = 0.2 * w;
+  if (type === "dot") return [dot, gap];
+  if (type === "dash_dot") return [dash, gap, dot, gap];
+  if (type === "dash_dot_dot") return [dash, gap, dot, gap, dot, gap];
+  return [dash, gap];
+}
+
+/** KiCad's zoom factor for a view: css px per mm over the GAL's px per mm at zoom 1. */
+export function zoomFactor(view: View): number { return (view.ppm * view.zoom) / PX_PER_MM_ZOOM1; }
+
+/** Marker shape scale (mm per corner unit): boards shrink with √zoom (PCB_MARKER::SetZoom), schematics are fixed. */
+export function markerScale(docType: string, view: View | null | undefined): number { return docType === "sch" || !view ? MARKER_SCALE[docType === "sch" ? "sch" : "pcb"] : MARKER_SCALE.pcb / Math.sqrt(Math.max(zoomFactor(view), 1e-9)); }
+
+/** The mirror axis of the flipped board view: the board bbox centre. */
+export function flipCentre(doc: { bbox?: Box | null } | null | undefined): number { const b = doc && doc.bbox; return b ? (b[0] + b[2]) / 2 : 0; }
+
+/** Document x → x as drawn in the flipped view (an involution: unflipX is the same map, exported for clarity). */
+export function flipX(doc: { bbox?: Box | null } | null | undefined, x: number): number { return 2 * flipCentre(doc) - x; }
+
+export function unflipX(doc: { bbox?: Box | null } | null | undefined, x: number): number { return 2 * flipCentre(doc) - x; }
+
+/** Canvas factory for offscreen work (zone previews, renderPng); replace KiCadCanvas.createCanvas to inject one (tests). */
+export function defaultCreateCanvas(w: number, h: number): AnyCanvas | null {
+  if (typeof OffscreenCanvas === "function") return new OffscreenCanvas(w, h);
+  if (typeof document !== "undefined" && document.createElement) { const c = document.createElement("canvas"); c.width = w; c.height = h; return c; }
+  return null;
+}
+
+export const makeCanvas = (w: number, h: number): AnyCanvas | null => ((root.KiCadCanvas && root.KiCadCanvas.createCanvas) || defaultCreateCanvas)(w, h);
+
+export let SCRATCH: AnyCanvas | null = null;
+   // offscreen canvas reused by the zone previews
+export function scratchCanvas(w: number, h: number): AnyCanvas | null {
+  if (!SCRATCH) { SCRATCH = makeCanvas(w, h); if (!SCRATCH) return null; }
+  if (SCRATCH.width !== w || SCRATCH.height !== h) { SCRATCH.width = w; SCRATCH.height = h; }
+  return SCRATCH;
+}
+
+export const TOP_Z = 100000, TOP_CACHE = new Map<string, number>();
+   // draw-order offset of the layers brought to the top with the active layer
+/** A copper layer's depth in the stack: F.Cu 0, In1.Cu 1 …, B.Cu last. */
+const cuDepth = (l: string) => l === "F.Cu" ? 0 : l === "B.Cu" ? 1e6 : (+(/^In(\d+)\.Cu$/.exec(l) || [0, NaN])[1]);
+/** Whether a via drilled between `pair` (its two outer copper layers) reaches copper layer `cu`. */
+export function viaSpans(pair: string[], cu: string) {
+  const a = cuDepth(pair[0]), b = cuDepth(pair[pair.length - 1]), c = cuDepth(cu);
+  if (isNaN(a) || isNaN(b) || isNaN(c)) return true;
+  return c >= Math.min(a, b) && c <= Math.max(a, b);
+}
+export const BUCKETS = new Map<number, Geom[]>(), NAME_BUCKETS = new Map<number, Geom[]>(), SEL_BUCKETS = new Map<number, Geom[]>();
+   // z → geometry, reused frame to frame (cleared, never reallocated)
+export const ZS: number[] = [];
+
+export function bucket(map: Map<number, Geom[]>, z: number): Geom[] { let arr = map.get(z); if (!arr) { arr = []; map.set(z, arr); } return arr; }
+
+/**
+ * The board's object colours from the user's colour theme (Appearance > Objects swatches): ratsnest, drcWarnings,
+ * drcErrors, drcExclusions, anchors, boardArea, drawingSheet, grid.  Set for each render; missing keys keep the defaults.
+ */
+let OC: Record<string, string | undefined> = {};
+export function render(doc: Doc, ctx: Ctx2D, view: View, opts?: RenderOpts | null): void {
+  OC = (opts && opts.objectColors) || {};
+  ensureSchTheme(doc);   // geometry built under another schematic colour theme is rebuilt first
+  ensureFontGeom(doc);   // and text set in a face that has arrived since is laid out with its metrics
+  opts = opts || {}; const hidden = opts.hidden || new Set();
+  const isPcb = doc.type === "pcb";
+  setOverbarHeight(isPcb ? 1.23 : schFormat.overbarHeight);   // the board's KIFONT::METRICS are the defaults
+  const hops = isPcb ? null : hopShapes(doc);                  // Formatting > Hop-over size
+  const showHiddenPins = !!opts.showHiddenPins && doc.type === "sch", zoneOutline = isPcb && !!opts.zoneOutline;
+  // hidden fields: pcbnew's hidden texts (showHiddenText), eeschema's own appearance.show_hidden_fields (LAYER_HIDDEN,
+  // showHiddenFields) — two separate settings, as in KiCad
+  const showHiddenText = isPcb ? !!opts.showHiddenText : !!opts.showHiddenFields, padNumbers = opts.padNumbers !== false;
+  // eeschema's View-menu options: mark_sim_exclusions and show_directive_labels (both on by default)
+  const noSimMarks = !isPcb && opts.markSimExclusions === false, noDirectives = !isPcb && opts.showDirectiveLabels === false;
+  const sketchPads = isPcb && !!opts.outlinePads, sketchTracks = isPcb && !!opts.outlineTracks, sketchVias = isPcb && !!opts.outlineVias;
+  // PCB_PAINTER with m_sketchGraphics / m_sketchText: board and footprint graphic shapes, and texts, drawn as outlines
+  const sketchGfx = isPcb && !!opts.sketchGraphics, sketchTxt = isPcb && !!opts.sketchText;
+  const sketched: Set<Geom> | null = sketchGfx || sketchTxt ? new Set() : null;
+  const hcLayer = isPcb && opts.highContrast && opts.activeLayer ? String(opts.activeLayer) : null;
+  const hl = opts.highlight && opts.highlight.size ? opts.highlight : null;
+  const hlGeoms = hl ? new Set<Geom>() : null;   // geometry of the highlighted items
+  // a net highlight names single pads as "footprintId#padIndex" (PCB_PAINTER brightens by netcode, so the
+  // footprint's other pads, its mask / paste openings of other pads and its silk stay dark)
+  let hlPadFps: Set<string> | null = null;
+  if (hl) for (const k of hl) { const i = typeof k === "string" ? k.indexOf("#") : -1; if (i > 0) (hlPadFps || (hlPadFps = new Set())).add(k.slice(0, i)); }
+  // the schematic names single pins ("symbolId#pin:<number>", a sheet's "sheetId#pin:<name>") and the fields a
+  // highlighted power symbol brightens ("symbolId#field:Value")
+  const subHl = (it: { id: string }, g: Geom) => hl!.has(isPcb ? it.id + "#" + g.padIndex : g.pinNo !== undefined ? it.id + "#pin:" + g.pinNo : g.field ? it.id + "#field:" + g.field : "");
+  const selPcb = isPcb && opts.selected && opts.selected.size ? opts.selected : null;   // board selection: repainted, not haloed
+  const selGeoms = selPcb ? new Set<Geom>() : null;
+  const rollId = !isPcb && opts.rollover ? opts.rollover : null;
+  const rollGeoms = rollId ? new Set<Geom>() : null;
+  let selPadFps: Set<string> | null = null;   // a pad selected on its own ("footprintId#padIndex"): only that pad is repainted
+  if (selPcb) for (const k of selPcb) { const i = typeof k === "string" ? k.indexOf("#") : -1; if (i > 0) (selPadFps || (selPadFps = new Set())).add(k.slice(0, i)); }
+  const hlColor = (c: string) => highlightColor(c, isPcb);
+  const ids = opts.ids ? (opts.ids instanceof Set ? opts.ids : new Set(opts.ids)) : null;
+  const skip = opts.skip && opts.skip.size ? opts.skip : null;   // items a peer is dragging: drawn as ghosts elsewhere
+  const netColors = isPcb && opts.netColors && opts.netColors.size ? opts.netColors : null;
+  const netNames = isPcb && opts.netNames !== false,   // pcbnew default: net names on pads and tracks ("pcb_display.net_names_mode" 3)
+   // pcb_display.net_names_mode (PCB_PAINTER): pads at 1 and 3, tracks at 2 and above, vias at anything but 0
+   nnMode = opts.netNamesMode === undefined ? 3 : opts.netNamesMode,
+   padNetNames = netNames && (nnMode === 1 || nnMode === 3), trackNetNames = netNames && nnMode >= 2, viaNetNames = netNames && nnMode !== 0,
+   zoneFill = isPcb && !!opts.zoneFill, flip = isPcb && !!opts.flip;
+  const rats = isPcb && opts.ratsnest && opts.ratsnest.length ? opts.ratsnest : null, ratsNets = opts.ratsnestNets || null;
+  // eeschema's show_erc_errors / show_erc_warnings (on by default) and show_erc_exclusions (off) filter the markers
+  let markers = opts.markers && opts.markers.length ? opts.markers : null;
+  if (markers && !isPcb) {
+    const ok = (m: Marker) => m.severity === "exclusion" ? opts.showErcExclusions === true : m.severity === "warning" ? opts.showErcWarnings !== false : opts.showErcErrors !== false;
+    if (!markers.every(ok)) { markers = markers.filter(ok); if (!markers.length) markers = null; }
+  }
+  const layerColors = isPcb && opts.layerColors && opts.layerColors.size ? opts.layerColors : null;
+  const obj = isPcb && opts.objects ? opts.objects : null, objHide = obj && obj.hide && obj.hide.size ? obj.hide : null, objAlpha = obj && obj.opacity ? obj.opacity : null;
+  const hcHide = !!opts.inactiveHide;
+  const hcCu = hcLayer ? (/\.Cu$/.test(hcLayer) ? hcLayer : /^F\./.test(hcLayer) ? "F.Cu" : /^B\./.test(hcLayer) ? "B.Cu" : null) : null;
+  // PCB_RENDER_SETTINGS::m_hiContrastFactor = 1 − hicontrast_dimming_factor: an inactive layer's colour is mixed with the
+  // background at that factor (Edge.Cuts at 0.3 at least, and still drawn in the Hide mode)
+  const hcF = typeof opts.hcDimming === "number" && opts.hcDimming >= 0 && opts.hcDimming <= 1 ? 1 - opts.hcDimming : HC_DIM;
+  const hcEdgeF = Math.max(hcF, HC_EDGE_MIN);
+  const brightIds = isPcb && opts.brightened && opts.brightened.size ? opts.brightened : null;
+  const brightGeoms = brightIds ? new Set<Geom>() : null;
+  // PCB_RENDER_SETTINGS::GetColor in group edit mode: what is outside the entered group (and not selected) fades to
+  // the Outside Group opacity
+  const entered = isPcb && opts.enteredGroup && opts.enteredGroup.size ? opts.enteredGroup : null;
+  const outsideOp = entered ? (typeof opts.outsideGroupOpacity === "number" ? opts.outsideGroupOpacity : obj && obj.opacity && typeof obj.opacity.outsideGroup === "number" ? obj.opacity.outsideGroup : 0.2) : 1;
+  const outsideGeoms = entered && outsideOp < 1 ? new Set<Geom>() : null;
+  // PCB_RENDER_SETTINGS::GetColor: a zone's colour alpha times m_zoneOpacity ("board.opacity.zones", 0.6 by default);
+  // the Appearance ▸ Objects ▸ Zones slider sets it outright
+  const zoneA = objAlpha && typeof objAlpha.zones === "number" ? Math.max(0, Math.min(1, objAlpha.zones)) : ZONE_OPACITY;
+  // ... except a teardrop area, which takes m_trackOpacity (and no zone opacity)
+  const trackA = objAlpha && typeof objAlpha.tracks === "number" ? Math.max(0, Math.min(1, objAlpha.tracks)) : 1;
+  // PCB_RENDER_SETTINGS::LoadColors: a board layer colour is drawn with an alpha of 0.2 at least ("if the alpha
+  // channel is too small, the layer is not visible"); the stored colour keeps what the user set
+  const layerDraw = layerColors ? new Map<string, string>() : null;
+  if (layerColors) for (const [k, c] of layerColors) layerDraw!.set(k, minLayerAlpha(c));
+  const itemColors = isPcb && opts.itemColors && opts.itemColors.size ? opts.itemColors : null, tint = itemColors ? new Map<Geom, string>() : null;
+  const W = ctx.canvas.width, H = ctx.canvas.height, dpr = view.dpr || 1;
+  const s = view.ppm * view.zoom * dpr;                 // device px per mm
+  const sCss = view.ppm * view.zoom;                    // css px per mm (KiCad's LOD rules work in logical pixels)
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  // region: [x0, y0, x1, y1] device px — repaint only that part of the canvas (the editor's pan strips); the
+  // pixels drawn there are the full render's, the rest of the canvas is left alone
+  const region = opts.region || null;
+  if (region) { ctx.save(); ctx.beginPath(); ctx.rect(region[0], region[1], region[2] - region[0], region[3] - region[1]); ctx.clip(); }
+  const bg = opts.background === undefined ? (doc.type === "sch" ? SCH.bg : PCB_BG) : opts.background;
+  if (bg) { ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H); } else if (!opts.overlay && typeof ctx.clearRect === "function") ctx.clearRect(0, 0, W, H);
+  const tx = view.panX * dpr - view.x0 * s, ty = view.panY * dpr - view.y0 * s;
+  // base transform (document mm → device px); the flipped view mirrors X about the board centre
+  const cx = flip ? flipCentre(doc) : 0;
+  const A = flip ? -s : s, E = flip ? tx + 2 * cx * s : tx;
+  ctx.setTransform(A, 0, 0, s, E, ty);
+  const dx0 = -E / A, dx1 = (W - E) / A;
+  const fx0 = Math.min(dx0, dx1), fx1 = Math.max(dx0, dx1), fy0 = -ty / s, fy1 = fy0 + H / s;   // visible mm rect
+  // the rect geometry is culled against: the visible one, or the repainted region (plus a margin for strokes
+  // and labels that reach into it from outside)
+  let vx0 = fx0, vx1 = fx1, vy0 = fy0, vy1 = fy1;
+  if (region) {
+    const m = 48, rx0 = (region[0] - m - E) / A, rx1 = (region[2] + m - E) / A;
+    vx0 = Math.max(fx0, Math.min(rx0, rx1)); vx1 = Math.min(fx1, Math.max(rx0, rx1));
+    vy0 = Math.max(fy0, (region[1] - m - ty) / s); vy1 = Math.min(fy1, (region[3] + m - ty) / s);
+  }
+  // grid: GAL::DrawGrid.  The pitch is multiplied by the coarse tick (10; 2 with Show major grid off) until grid
+  // marks are more than grid.min_spacing (10 px; 20 for small crosses) apart; every 10th row / column of the drawn
+  // grid is major (none with Show major grid off): twice the dot size, line width or cross size.  Styles: "dots" (KiCad's default), "lines", "crosses".
+  // the background grid is the last, unbounded source of drawGridSources: the grid items' coverage masks it out
+  const gridClaims = isPcb && opts.subgrids !== false && opts.grid! > 0 ? gridItemList(doc).filter((g) => !(opts.selected && opts.selected.has(g.id!))) : [];
+  if (gridClaims.length) { ctx.save(); clipOutsideGrids(ctx, gridClaims, [vx0, vy0, vx1, vy1]); }
+  if (opts.grid! > 0) {   // undefined > 0 is false: no grid
+    const style = opts.gridStyle === "lines" || opts.gridStyle === "crosses" ? opts.gridStyle : "dots";
+    const minSpacing = (opts.gridMinSpacing! > 0 ? opts.gridMinSpacing! : GRID_MIN_SPACING) * (style === "crosses" ? 2 : 1) / sCss;
+    // GAL::updatedGalDisplayOptions: m_gridTick is 10, or 0 with Show major grid off, and AutoSparsePitch then thins by 2
+    const tick = gridTick(opts), pitch = autoSparsePitch(opts.grid!, tick, minSpacing);
+    const go = opts.gridOrigin || [0, 0], gx = go[0], gy = go[1];   // BOARD_DESIGN_SETTINGS::m_GridOrigin: the grid is laid out from it
+    const i0 = Math.floor((vx0 - gx) / pitch), i1 = Math.ceil((vx1 - gx) / pitch), j0 = Math.floor((vy0 - gy) / pitch), j1 = Math.ceil((vy1 - gy) / pitch);
+    const px1 = gridMinorPx(opts, dpr) / s;   // GAL::gridMinorLineWidth
+    const isMajor = (n: number): boolean => tick > 0 && n % tick === 0;
+    const gridColor = opts.gridColor || (isPcb ? OC.grid || PCB_GRID : SCH.grid);
+    if ((Math.ceil((fx1 - gx) / pitch) - Math.floor((fx0 - gx) / pitch)) * (Math.ceil((fy1 - gy) / pitch) - Math.floor((fy0 - gy) / pitch)) < 400000) {   // the whole view's count, region or not
+      if (style === "dots") {
+        ctx.fillStyle = gridColor; ctx.beginPath();
+        for (let i = i0; i <= i1; i++) {
+          const wdt = isMajor(i) ? 2 * px1 : px1, x = (i * pitch + gx) - wdt / 2;
+          for (let j = j0; j <= j1; j++) { const hgt = isMajor(j) ? 2 * px1 : px1; ctx.rect(x, (j * pitch + gy) - hgt / 2, wdt, hgt); }
+        }
+        ctx.fill();
+      } else if (style === "lines") {
+        ctx.strokeStyle = gridColor; ctx.lineCap = "butt";
+        for (const major of [false, true]) {
+          ctx.lineWidth = major ? 2 * px1 : px1; ctx.beginPath();
+          for (let i = i0; i <= i1; i++) if ((isMajor(i)) === major) { ctx.moveTo((i * pitch + gx), vy0); ctx.lineTo((i * pitch + gx), vy1); }
+          for (let j = j0; j <= j1; j++) if ((isMajor(j)) === major) { ctx.moveTo(vx0, (j * pitch + gy)); ctx.lineTo(vx1, (j * pitch + gy)); }
+          ctx.stroke();
+        }
+      } else {
+        ctx.strokeStyle = gridColor; ctx.lineCap = "butt";
+        for (const major of [false, true]) {
+          const wdt = major ? 2 * px1 : px1, len = 2 * wdt; ctx.lineWidth = wdt; ctx.beginPath();
+          for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) {
+            if ((isMajor(i) && isMajor(j)) !== major) continue;
+            const x = (i * pitch + gx), y = (j * pitch + gy); ctx.moveTo(x - len, y); ctx.lineTo(x + len, y); ctx.moveTo(x, y - len); ctx.lineTo(x, y + len);
+          }
+          ctx.stroke();
+        }
+      }
+    }
+  }
+  if (gridClaims.length) ctx.restore();
+  // GAL::DrawGrid draws the axes before it looks at the grid's visibility: one grid line wide, through 0,0
+  if (opts.gridAxes) {
+    const px1 = Math.max(1, dpr) / s;
+    ctx.strokeStyle = opts.gridAxesColor || (isPcb ? PCB_GRID_AXES : SCH.gridAxes); ctx.lineWidth = px1; ctx.lineCap = "butt"; ctx.beginPath();
+    if (vy0 <= 0 && vy1 >= 0) { ctx.moveTo(vx0, 0); ctx.lineTo(vx1, 0); }
+    if (vx0 <= 0 && vx1 >= 0) { ctx.moveTo(0, vy0); ctx.lineTo(0, vy1); }
+    ctx.stroke();
+  }
+  // PCB_GRID_ITEMs (LAYER_SUBGRIDS): the custom routing / placement grids, over the background grid and its axes
+  if (isPcb && opts.subgrids !== false) drawGridItems(ctx, doc, opts, s, dpr, sCss, [vx0, vy0, vx1, vy1], bg || PCB_BG);
+  // the drawing sheet (frame, tick band, title block) and, above it, the page outline.  Under the
+  // flipped board view KiCad mirrors the sheet back about the page — "Draw the title block normally
+  // even if the view is flipped" (ds_proxy_view_item.cpp:114-128) — so it is drawn unflipped here.
+  if (opts.frame !== false && !(doc as { fpEditor?: boolean }).fpEditor) {   // the Footprint Editor has no drawing sheet
+    if (flip) ctx.setTransform(s, 0, 0, s, tx, ty);
+    drawDrawingSheet(ctx, doc, s, Math.max(1, dpr) / s, opts.pageLimits !== false);
+    if (flip) ctx.setTransform(A, 0, 0, s, E, ty);
+  }
+  // LAYER_BOARD_OUTLINE_AREA (Board Area Shadow, off by default): the board outline filled, under the board items
+  if (isPcb && opts.boardArea && opts.boardArea.length) {
+    ctx.save(); ctx.globalAlpha = 1; ctx.fillStyle = OC.boardArea || BOARD_AREA_COLOR; ctx.beginPath();
+    for (const loop of opts.boardArea) { if (loop.length < 3) continue; ctx.moveTo(loop[0][0], loop[0][1]); for (let i = 1; i < loop.length; i++) ctx.lineTo(loop[i][0], loop[i][1]); ctx.closePath(); }
+    ctx.fill("evenodd"); ctx.restore();
+  }
+  // collect visible geometry into the z buckets (arrays reused across frames)
+  for (const arr of BUCKETS.values()) arr.length = 0;
+  for (const arr of NAME_BUCKETS.values()) arr.length = 0;
+  const obstacles: Geom[] | null = zoneFill ? [] : null, previews: Geom[] | null = zoneFill ? [] : null;
+  const copperZ = isPcb ? (doc.copper.length ? doc.copper : ["F.Cu", "B.Cu"]) : null;
+  // PCB_DRAW_PANEL_GAL::SetTopLayer: the active layer is brought to the top — a copper layer together with its
+  // zone / pad / via / netname layers, and with it every layer of its side (F.* or B.*); the holes, the pad and
+  // via names and the ratsnest are always on top.  A non-copper active layer goes above those too.  The layers
+  // keep their order among themselves (VIEW::TOP_LAYER_MODIFIER), so this is one offset per layer.
+  const act = isPcb && opts.activeLayer ? String(opts.activeLayer) : null;
+  const actSide = act ? (act.indexOf("F.") === 0 ? "F." : act.indexOf("B.") === 0 ? "B." : null) : null, actCu = !!act && /\.Cu$/.test(act);
+  const zHoles0 = isPcb ? pcbZ("holes") : 0;
+  TOP_CACHE.clear();
+  const topOf = (layer: string) => {
+    if (!act) return 0;
+    let v = TOP_CACHE.get(layer);
+    if (v === undefined) { v = layer === "holes" ? TOP_Z : layer === act ? (actCu ? TOP_Z : 2 * TOP_Z) : actSide && layer && layer.indexOf(actSide) === 0 ? TOP_Z : 0; TOP_CACHE.set(layer, v); }
+    return v;
+  };
+  const zOf = (g: Geom) => { const z = g.z === undefined ? 0 : g.z; return isPcb ? z + topOf(z >= zHoles0 && z < zHoles0 + 10 ? "holes" : g.layer) : z; };
+  const zHoles = zHoles0 + topOf("holes"), zRats = zHoles + 2, zViaName = zHoles + 1.5;
+  // the schematic selection: SCH_SELECTION_TOOL::highlight hides a selected item from its own layers and draws it
+  // from the selection VIEW_GROUP (LAYER_SELECT_OVERLAY), over every unselected item; so its geometry is bucketed
+  // apart and drawn after the rest, its selection shadow first.  "id#pin:N" / "id#field:Name" lift that part alone.
+  const schSel: string[] | null = !isPcb && opts.selected && opts.selected.size ? (skip ? [...opts.selected].filter((id) => !skip.has(id)) : [...opts.selected]) as string[] : null;
+  let selWhole: Set<string> | null = null, selParts: Map<string, Set<string>> | null = null;
+  if (schSel) {
+    selWhole = new Set();
+    for (const k of schSel) {
+      const i = typeof k === "string" ? k.indexOf("#") : -1;
+      if (i < 0) { selWhole.add(k); continue; }
+      const id = k.slice(0, i), sub = k.slice(i + 1); if (!sub.startsWith("pin:") && !sub.startsWith("field:")) continue;
+      let set = (selParts || (selParts = new Map<string, Set<string>>())).get(id); if (!set) selParts.set(id, set = new Set<string>()); set.add(sub);
+    }
+  }
+  for (const arr of SEL_BUCKETS.values()) arr.length = 0;
+  // SCH_PAINTER::draw( SCH_TEXT ): a label with a bus connection (HasBusConnection) takes the bus colour
+  const busLabels = isPcb ? null : busConnectedLabels(doc);
+  let schTint: Map<Geom, string> | null = null;
+  const cullM = 4 * Math.max(1, dpr) / s + 0.1; const cx0 = vx0 - cullM, cx1 = vx1 + cullM, cy0 = vy0 - cullM, cy1 = vy1 + cullM;   // per-geometry cull rect: the view plus 4 px
+  for (const it of doc.items.values()) {
+    if ((ids && !ids.has(it.id)) || (skip && skip.has(it.id))) continue;
+    const b = it.bbox; if (b && (b[2] < vx0 || b[0] > vx1 || b[3] < vy0 || b[1] > vy1)) continue;
+    const isHl = hl ? hl.has(it.id) : false;
+    const lift = selWhole ? selWhole.has(it.id) : false, liftParts = selParts ? selParts.get(it.id) || null : null;
+    if (noDirectives && it.kind === "directive_label" && !lift) continue;   // SCH_PAINTER: unless it is selected
+    const busTint = busLabels && busLabels.has(it.id);
+    const padHl = !isHl && hlPadFps && hlPadFps.has(it.id) ? it.id + "#" : null;   // highlighted pads of this footprint
+    const isSel = selPcb ? selPcb.has(it.id) : false;
+    const padSel = !isSel && selPadFps && selPadFps.has(it.id) ? it.id + "#" : null;
+    const itemTint = itemColors ? itemColors.get(it.id) : null;
+    const isFp = objHide && it.kind === "footprint";
+    if (isFp && objHide.has(it.layer && /^B\./.test(it.layer) ? "fpBack" : "fpFront")) continue;
+    // an item that only partly shows (a long connector, a zone's hatch, a big footprint when zoomed in) is
+    // culled geometry by geometry; the boxes are cached on the geometry records (rebuilt with the item)
+    // PCB_VIA::ViewGetLOD: in high contrast a blind / buried / micro via whose drill does not span the active copper
+    // layer (a front / back technical layer standing for F.Cu / B.Cu) is not drawn at all
+    if (hcCu && it.kind === "via" && it.geom.length && it.geom[0].viaLayers && it.geom[0].viaType !== "through" && !viaSpans(it.geom[0].viaLayers, hcCu)) continue;
+    const partial = !zoneFill && b && it.geom.length > 6 && (b[0] < cx0 || b[2] > cx1 || b[1] < cy0 || b[3] > cy1);
+    for (const g of it.geom) {
+      if (partial && g.t !== "image") {
+        const bb = g._bb === undefined ? (g._bb = geomBox(g)) : g._bb;
+        if (bb && (bb[2] < cx0 || bb[0] > cx1 || bb[3] < cy0 || bb[1] > cy1)) continue;
+      }
+      if (g.padText) {
+        // PAD::ViewGetLOD (netname layer): the pad must be flashed on a visible layer (the high-contrast one in
+        // that mode) and its smaller side at least 0.5 mm at zoom 1; pad net names follow the net-names option
+        if (g.padNum ? !padNumbers : !padNetNames) continue;
+        if ((g as TextGeom).padMin! * sCss < PAD_NETNAME_MM * PX_PER_MM_ZOOM1) continue;   // pad labels are text records with both set
+        const pl = (g as TextGeom).padLayers!; let vis = false;
+        if (hcLayer) vis = pl.indexOf(hcLayer) >= 0; else for (let i = 0; i < pl.length; i++) if (!hidden.has(pl[i])) { vis = true; break; }
+        if (!vis) continue;
+      } else {
+        if (hidden.has(g.layer) || (zoneOutline && g.zoneFill)) continue;
+        if (hcHide && hcLayer && g.layer !== hcLayer && g.layer !== "holes" && g.layer !== "Edge.Cuts") continue;   // inactive layers: Hide (Edge.Cuts is mixed, not hidden)
+      }
+      if (noSimMarks && g.simMarker) continue;
+      if (sketched && !g.hole && !g.zoneFill && !g.track && !g.via && !g.pad && g.padIndex === undefined && !g.padText && g.t !== "image" && (it.kind === "footprint" || it.kind === "dimension" || /^gr_|^fp_/.test(it.kind))) {
+        // a dimension's text follows m_DisplayGraphicsFill like its lines (PCB_PAINTER::draw( PCB_DIMENSION_BASE ))
+        if (g.dim ? sketchGfx : g.t === "text" ? sketchTxt : sketchGfx && it.kind !== "gr_text" && it.kind !== "gr_text_box") sketched.add(g);
+      }
+      if (busTint && busPinTint(it, g)) (schTint || (schTint = new Map())).set(g, SCH.bus);
+      if (objHide) {
+        const oc = objectClass(g);
+        if (oc && objHide.has(oc)) continue;
+        if (isFp && g.t === "text" && !g.pad && (objHide.has("fpText") || (g.field === "Reference" && objHide.has("references")) || (g.field === "Value" && objHide.has("values")))) continue;
+      }
+      const z = zOf(g);
+      bucket(lift || (liftParts && liftParts.has(g.pinNo !== undefined ? "pin:" + g.pinNo : g.field ? "field:" + g.field : "")) ? SEL_BUCKETS : BUCKETS, z).push(g);
+      if (itemTint && !g.hole && (g.track || g.via || g.zoneFill || (g.pad && g.t !== "text"))) { const tc = typeof itemTint === "string" ? itemTint : itemTint[g.padIndex!]; if (tc) tint!.set(g, tc); }
+      if (isHl || (padHl && (isPcb ? g.padIndex !== undefined : true) && subHl(it, g))) hlGeoms!.add(g);
+      // a pad ("footprintId#padIndex") or a footprint field ("footprintId#field:Name") selected on its own: that part alone
+      if (isSel || (padSel && (g.padIndex !== undefined ? selPcb!.has(padSel + g.padIndex) : g.field !== undefined && g.t === "text" && selPcb!.has(padSel + "field:" + g.field)))) selGeoms!.add(g);
+      if (brightIds && brightIds.has(it.id)) brightGeoms!.add(g);
+      if (outsideGeoms && !isSel && !entered!.has(it.id)) outsideGeoms.add(g);
+      if (rollId === it.id && g.t === "text" && (!opts.rolloverGeom || opts.rolloverGeom === g)) rollGeoms!.add(g);
+      if (netNames && g.net! > 0) {
+        if (g.track && !sketchTracks) { if (trackNetNames) bucket(NAME_BUCKETS, pcbZ(g.layer) + 3.5 + topOf(g.layer)).push(g); }
+        else if (g.viaLabel) { if (viaNetNames) bucket(NAME_BUCKETS, zViaName).push(g); }
+      }
+      if (zoneFill) {
+        if (g.zoneUnfilled) previews!.push(g);
+        else if (g.track || (g.via && !g.hole && (g.viaType !== "through" || g.viaLabel)) || g.npth || (g.pad && !g.hole && g.t !== "text")) obstacles!.push(g);   // a through via cuts every layer once (its label ring stands for it)
+      }
+    }
+    if (it.hiddenGeom && (showHiddenPins || showHiddenText)) for (const g of it.hiddenGeom) {
+      if (hidden.has(g.layer) || (g.hiddenText ? !showHiddenText : !showHiddenPins)) continue;
+      const z = zOf(g);
+      bucket(lift || (liftParts && liftParts.has(g.pinNo !== undefined ? "pin:" + g.pinNo : g.field ? "field:" + g.field : "")) ? SEL_BUCKETS : BUCKETS, z).push(g);
+      if (isHl || (padHl && !isPcb && subHl(it, g))) hlGeoms!.add(g);
+    }
+  }
+  ZS.length = 0;
+  for (const [z, arr] of BUCKETS) if (arr.length) ZS.push(z);
+  for (const [z, arr] of NAME_BUCKETS) if (arr.length && !BUCKETS.has(z)) ZS.push(z);
+  if (rats) ZS.push(zRats);
+  if (previews && previews.length) { previews.sort((a, b) => zOf(a) - zOf(b)); for (const g of previews) { const z = zOf(g) - 1.5 - 0.01; if (ZS.indexOf(z) < 0) ZS.push(z); } }
+  ZS.sort((a, b) => a - b);
+  const minW = Math.max(1, dpr) / s;
+  ctx.lineJoin = "round"; ctx.lineCap = "round";
+  let curStroke: string | null = null, curFill: string | null = null, curWidth = -1, curAlpha = -1, curCap = "round";
+  // a record without a colour leaves the style as the context takes it (the assignment is ignored), as it always has
+  const setStroke = (c: string | null | undefined) => { if (c !== curStroke) { ctx.strokeStyle = c as string; curStroke = c as string; } };
+  const setFill = (c: string | null | undefined) => { if (c !== curFill) { ctx.fillStyle = c as string; curFill = c as string; } };
+  const setWidth = (w: number) => { if (w !== curWidth) { ctx.lineWidth = w; curWidth = w; } };
+  const setAlpha = (a: number) => { if (a !== curAlpha) { ctx.globalAlpha = a; curAlpha = a; } };
+  const setCap = (c: string) => { if (c !== curCap) { ctx.lineCap = c as CanvasLineCap; curCap = c; } };
+  const rec = !!(ctx as unknown as { __plot?: boolean }).__plot;   // a plot recorder (plot-rec.ts) reads paths, not Path2D objects
+  const strokeG = (g: Geom) => { const p = rec ? null : pathOf(g); if (p) ctx.stroke(p); else { ctx.beginPath(); tracePath(ctx, g); ctx.stroke(); } };
+  const fillG = (g: Geom) => { const p = rec ? null : pathOf(g); if (p) ctx.fill(p); else { ctx.beginPath(); tracePath(ctx, g); ctx.fill(); } };
+  const base = [A, 0, 0, s, E, ty]; const viewRect = [fx0, fy0, fx1, fy1];
+  const dirty = () => { curStroke = curFill = null; curWidth = -1; curCap = "round"; curAlpha = -1; };
+  let ratsDone = !rats, previewIdx = 0;
+  // an unfilled zone's preview takes the colour rules of the fills (net highlight darkening, high-contrast mix)
+  const previewXf = (pg: Geom): ((c: string) => string) | null => {
+    const dark = !!hl && !hlGeoms!.has(pg), lit = !!hl && hlGeoms!.has(pg), dim = !!hcLayer && pg.layer !== hcLayer && !lit && !(selGeoms && selGeoms.has(pg));
+    if (!dark && !lit && !dim) return null;
+    return (c: string) => { let v = lit ? hlColor(c) : dark ? darkened(c, 1 - HL_FACTOR) : c; if (dim) v = mixColor(v, bg || PCB_BG, hcF); return v; };
+  };
+  // selection: eeschema draws a selected item's shadow (LAYER_SELECTION_SHADOWS) under it, so the strokes stay on
+  // top and only a glow shows around them; pcbnew repaints the item in its selected colour instead (drawOne)
+  const anchors = schSel ? fieldAnchors(doc, schSel, hidden, opts.dangling, opts.moving) : null;
+  // one geometry record; `lifted`: part of the schematic selection, whose background fills (symbol body, sheet,
+  // filled shape / text box backgrounds) getRenderColor draws WithAlpha( 0.5 )
+  const drawOne = (g: Geom, lifted: boolean): void => {
+    let alpha = g.alpha === undefined ? 1 : g.alpha;
+    if (lifted && (g.z || 0) < 0 && ((g.noStroke && g.fill) || g.noShadow)) alpha *= 0.5;
+    const gSel = !!selGeoms && selGeoms.has(g), gHl = !!hlGeoms && hlGeoms.has(g), gBright = !!brightGeoms && brightGeoms.has(g) && !g.hole;
+    // PCB_RENDER_SETTINGS::GetColor: high contrast leaves selected and net-highlighted items alone; an image cannot be mixed, its alpha drops
+    const hcDim = !!hcLayer && g.layer !== hcLayer && g.layer !== "holes" && !g.padText && !gSel && !gHl && !gBright;
+    if (hcDim && g.t === "image") alpha *= hcF;
+    if (g.zoneFill) alpha *= g.teardrop ? trackA : zoneA;   // PCB_RENDER_SETTINGS::GetColor: color.a *= m_zoneOpacity (m_trackOpacity for a teardrop)
+    if (g.hiddenText && isPcb) alpha *= HIDDEN_TEXT_ALPHA;
+    if (outsideGeoms && outsideGeoms.has(g) && !gSel) alpha *= outsideOp;
+    let color = g.color, fill = g.fill;
+    if (objAlpha && !g.zoneFill) { const oc = g.teardrop ? "tracks" : objectClass(g) || (fill && g.t !== "text" && !g.hole ? "filledShapes" : null); const oa = oc ? objAlpha[oc] : undefined; if (oa !== undefined && oa < 1) alpha *= oa; }
+    if (layerDraw && !g.hole) { const lc = layerDraw.get(g.layer); if (lc) { const def = pcbColor(g.layer); if (color === def) color = lc; if (fill === def) fill = lc; } }
+    if (netColors && g.net! > 0 && (g.track || g.via || g.pad || g.zoneFill) && !g.hole && copperZ!.indexOf(g.layer) >= 0) { const nc = netColors.get(g.net!); if (nc) { color = nc; if (fill) fill = nc; } }
+    if (tint) { const tc = tint.get(g); if (tc && copperZ!.indexOf(g.layer) >= 0) { color = tc; if (fill) fill = tc; } }
+    if (schTint) { const tc = schTint.get(g); if (tc) color = tc; }   // a label on a bus: LAYER_BUS
+    if (gBright) {
+      // a brightened item (Clarify Selection hover, the delete tool's target): Brightened(0.5) at alpha 0.8, nothing else applies
+      color = brightenedItemColor(color!); if (fill) fill = brightenedItemColor(fill); alpha = 1;
+    } else {
+      // board selection: the item repainted in its layer's selected colour (PCB_PAINTER::getColor), holes untouched
+      if (gSel && !g.hole) { color = selectedColor(color!); if (fill) fill = selectedColor(fill); }
+      if (hl) {
+        if (gHl) { color = hlColor(color!); if (fill) fill = isPcb ? hlColor(fill) : highlightFill(g); }
+        // the board darkens what the highlight leaves out toward black (m_layerColorsDark, Darkened(1 − 0.5)), opaque;
+        // a selected item keeps its selection colour; an image cannot be darkened, so it fades instead (the schematic
+        // dims nothing)
+        else if (isPcb) { if (g.t === "image") alpha *= HL_FACTOR; else if (!gSel) { color = darkened(color!, 1 - HL_FACTOR); if (fill) fill = darkened(fill, 1 - HL_FACTOR); } }
+      }
+      if (hcDim && g.t !== "image") { const f = g.layer === "Edge.Cuts" ? hcEdgeF : hcF, bgc = bg || PCB_BG; color = mixColor(color!, bgc, f); if (fill) fill = mixColor(fill, bgc, f); }
+    }
+    setAlpha(alpha);
+    const t = g.t;
+    if (t === "text") {
+      // SCH_PAINTER: a rolled-over text with a link definition is drawn whole in LAYER_HOVERED, underlined
+      const roll = rollGeoms !== null && rollGeoms.has(g), run = roll && opts.rolloverRun ? opts.rolloverRun : null;
+      if (roll && !run) color = SCH.hovered;
+      drawText(ctx, sketched && sketched.has(g) ? Object.assign({}, g, { w: minW }) : g, s, doc.type, minW, color, base, flip, bg || PCB_BG);   // sketch text: the strokes as hairlines
+      if (roll && !run) drawUnderline(ctx, g, color!, minW, base);
+      else if (run && base) drawRunHover(ctx, g, run, s, doc.type, minW, base, bg || PCB_BG);
+      curStroke = curFill = null; curWidth = -1; curCap = "round"; return;
+    }
+    if (t === "image") {
+      const e = g.entry;
+      // PCB_PAINTER: translate to the centre, rotate by -orientation, the opacity as the alpha
+      const turned = !!g.rot, faded = g.opacity != null && g.opacity < 1;
+      if (turned || faded) ctx.save();
+      if (faded) ctx.globalAlpha *= g.opacity!;
+      if (turned) { const cx = g.x + g.w / 2, cy = g.y + g.h / 2; ctx.translate(cx, cy); ctx.rotate(-g.rot! * Math.PI / 180); ctx.translate(-cx, -cy); }
+      if (e && e.loaded && !e.failed && e.img && typeof ctx.drawImage === "function") {
+        // the decoded pixel size wins over the header estimate, keeping the centre
+        const w = e.w > 0 ? e.w * g.pxMm * g.scale : g.w, h = e.h > 0 ? e.h * g.pxMm * g.scale : g.h;
+        ctx.drawImage(e.img, g.x + (g.w - w) / 2, g.y + (g.h - h) / 2, w, h);
+      } else {
+        // not decoded (yet): KiCad has no placeholder, so a dashed hairline frame with a cross marks the bitmap's footprint
+        setStroke(color); setWidth(minW); setCap("butt"); ctx.setLineDash([0.6, 0.4]);
+        ctx.strokeRect(g.x, g.y, g.w, g.h);
+        ctx.beginPath(); ctx.moveTo(g.x, g.y); ctx.lineTo(g.x + g.w, g.y + g.h); ctx.moveTo(g.x + g.w, g.y); ctx.lineTo(g.x, g.y + g.h); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      if (turned || faded) ctx.restore();
+      return;
+    }
+    // LAYER_VIA_HOLEWALLS under the hole; PCB_PAINTER underpaints it filled in the outline mode too
+    // (only via holes, which are circles, carry wallR)
+    if (g.wallR && ((g.wallR - (g as CircleGeom).r) * s > 0.35)) { setFill(g.wallColor!); ctx.beginPath(); ctx.arc((g as CircleGeom).x, (g as CircleGeom).y, g.wallR, 0, Math.PI * 2); ctx.fill(); }
+    if ((sketchPads && g.pad) || (sketchVias && g.via)) {   // sketch mode: the shape's outline in a hairline, nothing filled
+      if (t === "poly" && g.pts.length < 2) return;
+      setStroke(color); setWidth(minW); setCap("butt"); strokeG(g); return;
+    }
+    if (sketchTracks && g.track) { setStroke(color); setWidth(minW); setCap("butt"); ctx.beginPath(); traceTrackOutline(ctx, g); ctx.stroke(); return; }
+    if (sketched && sketched.has(g)) {
+      // PCB_PAINTER::draw( PCB_SHAPE ) with outline_mode: the outline of the stroke at its thickness, unfilled, in the
+      // outline width — DrawSegment( a, b, thickness ) per rectangle side, DrawSegmentChain( outline, thickness ) for a
+      // polygon or curve, DrawArcSegment for an arc, two circles at r -/+ thickness / 2 for any circle.  A dimension
+      // draws its lines and arrows with DrawLine / DrawCircle in the outline width (hairlines)
+      setStroke(color); setWidth(minW); setCap("butt");
+      if (g.dim) { if (t === "poly" && g.pts.length < 2) return; strokeG(g); return; }
+      ctx.beginPath();
+      if (t === "line" || t === "arc") traceTrackOutline(ctx, g);
+      else if (t === "circle") { const c = g as CircleGeom, hw = (g.w || 0) / 2; if (hw > 0) { ctx.moveTo(c.x + Math.max(0, c.r - hw), c.y); ctx.arc(c.x, c.y, Math.max(0, c.r - hw), 0, Math.PI * 2); } ctx.moveTo(c.x + c.r + hw, c.y); ctx.arc(c.x, c.y, c.r + hw, 0, Math.PI * 2); }
+      else if (t === "rect") { const w = g.wd || 0, x0 = g.x, y0 = g.y, x1 = g.x + g.w, y1 = g.y + g.h; traceSegChain(ctx, [[x0, y0], [x1, y0], [x1, y1], [x0, y1]], true, w); }
+      else if (t === "poly") { if (g.pts.length < 2) return; traceSegChain(ctx, g.pts, !!g.close, g.w || 0); }
+      else tracePath(ctx, g);
+      ctx.stroke(); return;
+    }
+    if (t === "rect") {
+      if (fill) { setFill(fill); ctx.fillRect(g.x, g.y, g.w, g.h); }
+      if (!g.noStroke) {
+        setStroke(color); const lw = Math.max(g.wd || 0, minW); setWidth(lw);
+        if (g.dash) ctx.setLineDash(dashPattern(g.dashType, lw));
+        ctx.strokeRect(g.x, g.y, g.w, g.h);
+        if (g.dash) ctx.setLineDash([]);
+      }
+      return;
+    }
+    if (t === "poly" && g.pts.length < 2) return;
+    if (fill) { setFill(fill); fillG(g); }
+    if (g.noStroke) return;
+    if (t === "line" || t === "arc" || (t === "poly" && (g.w > 0 || !fill)) || (t === "circle" && (g.w > 0 || !fill)) || (t === "pad" && !fill)) {
+      setStroke(color); const lw = Math.max(g.w, minW); setWidth(lw); setCap(g.cap || (t === "poly" || t === "line" ? "round" : "butt"));
+      const hop = hops && t === "poly" ? hops.get(g) : undefined;
+      if (hop) { strokeHopShape(ctx, hop, g.dash ? dashPattern(g.dashType, lw) : null); return; }   // the runs dashed, the hop arcs solid
+      if (g.dash) ctx.setLineDash(dashPattern(g.dashType, lw));
+      strokeG(g);
+      if (g.dash) ctx.setLineDash([]);
+    }
+  };
+  for (const z of ZS) {
+    // overlay passes that sit at this depth
+    if (!ratsDone && zRats <= z) { drawRatsnest(ctx, rats!, ratsNets, netColors, s, dpr, viewRect, opts.ratsnestThickness); ratsDone = true; dirty(); }
+    if (previews) while (previewIdx < previews.length && zOf(previews[previewIdx]) - 1.5 - 0.01 <= z) { const pg = previews[previewIdx++]; drawZonePreview(ctx, pg, obstacles!, base, W, H, minW, netColors, (pg.teardrop ? trackA : zoneA) / ZONE_OPACITY, previewXf(pg)); dirty(); }
+    const arr = BUCKETS.get(z);
+    if (arr) for (const g of arr) drawOne(g, false);
+    const names = NAME_BUCKETS.get(z);
+    if (names && names.length) {
+      for (const g of names) {
+        if (hcLayer && g.layer !== hcLayer) continue;   // PCB_TRACK::ViewGetLOD: no names on dimmed tracks
+        // the netname layers darken with the rest of a net highlight (GetColor's m_layerColorsDark)
+        const dark = !!hl && !hlGeoms!.has(g);
+        setAlpha(1);
+        if (g.track) drawTrackName(ctx, g, doc, s, sCss, viewRect, base, flip, dark); else drawViaName(ctx, g as ViaRingGeom, doc, s, sCss, base, flip, dark);   // the via rings that carry the label
+      }
+      dirty();
+    }
+  }
+  if (!ratsDone) { drawRatsnest(ctx, rats!, ratsNets, netColors, s, dpr, viewRect, opts.ratsnestThickness); }
+  if (previews) while (previewIdx < previews.length) { const pg = previews[previewIdx++]; drawZonePreview(ctx, pg, obstacles!, base, W, H, minW, netColors, (pg.teardrop ? trackA : zoneA) / ZONE_OPACITY, previewXf(pg)); }
+  ctx.globalAlpha = 1;
+  if (obj && obj.show) drawObjectOverlays(ctx, doc, obj, opts, s, dpr, hidden, [vx0, vy0, vx1, vy1]);
+  if (selPcb) drawUmbilicals(ctx, doc, selPcb, s, dpr);
+  // the Footprint Editor's footprint sits at the origin: its anchor is the LAYER_ANCHOR cross there
+  if ((doc as { fpEditor?: boolean }).fpEditor && !(obj && obj.hide && obj.hide.has("anchors"))) {
+    const a = 5 * Math.max(1, dpr) / s;
+    ctx.save(); ctx.globalAlpha = 1; ctx.setLineDash([]); ctx.lineCap = "butt"; ctx.strokeStyle = OC.anchors || ANCHOR_COLOR; ctx.lineWidth = Math.max(1, dpr) / s; ctx.beginPath();
+    ctx.moveTo(-a, 0); ctx.lineTo(a, 0); ctx.moveTo(0, -a); ctx.lineTo(0, a); ctx.stroke(); ctx.restore();
+  }
+  // highlight: the brightened items get a translucent halo of the highlight colour (the schematic's LAYER_SELECTION_SHADOWS pass for brightened items)
+  // (pcbnew draws no halo: a highlighted board item is only brightened)
+  if (hl && !isPcb) drawHalo(ctx, doc, skip ? new Set([...hl].filter((id) => !skip.has(id))) : hl, s, dpr, hidden, { color: hlColor, alpha: 0.15, extraPx: SCH_HIGHLIGHT_THICKNESS, strokesOnly: true });   // skipped items (drawn elsewhere) get none
+  if (schSel) {
+    // the selection VIEW_GROUP, over everything else, its layers in SCH_LAYER_ORDER: the backgrounds (bitmaps,
+    // shape / symbol / sheet / note fills), then LAYER_SELECTION_SHADOWS, then the items' strokes, then their anchors
+    const sz: number[] = []; for (const [z, arr] of SEL_BUCKETS) if (arr.length) sz.push(z);
+    sz.sort((a, b) => a - b);
+    const bgZ = (z: number) => z === SCH_Z.bitmap || z === SCH_Z.sheetBg || z === SCH_Z.notesBg || z === SCH_Z.deviceBg;
+    ctx.setTransform(A, 0, 0, s, E, ty); dirty();
+    for (const z of sz) if (bgZ(z)) for (const g of SEL_BUCKETS.get(z)!) drawOne(g, true);
+    ctx.globalAlpha = 1; ctx.setTransform(A, 0, 0, s, E, ty);
+    drawSelectionHalo(ctx, doc, schSel, s, dpr, hidden);
+    drawLineEndShadows(ctx, doc, schSel, s, dpr);
+    if (anchors) drawFieldAnchors(ctx, anchors, s, dpr, true);
+    ctx.setTransform(A, 0, 0, s, E, ty); dirty();
+    for (const z of sz) if (!bgZ(z)) for (const g of SEL_BUCKETS.get(z)!) drawOne(g, true);
+    ctx.globalAlpha = 1; ctx.setTransform(A, 0, 0, s, E, ty);
+    if (anchors) drawFieldAnchors(ctx, anchors, s, dpr, false);   // LAYER_SCHEMATIC_ANCHOR, over the items
+  }
+  // DRC / ERC markers: above everything but the selection (GAL_LAYER_ORDER: LAYER_SELECT_OVERLAY, then LAYER_DRC_*)
+  if (markers) drawMarkers(ctx, markers, doc.type, markerScale(doc.type, view), bg || (isPcb ? PCB_BG : SCH.bg), isPcb ? 0 : SCH_SELECTION_THICKNESS * Math.max(1, dpr) / s + SCH_SELECTION_THICKNESS * MIL);
+  if (region) ctx.restore();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+
+/**
+ * The labels SCH_PAINTER draws in the bus colour: aText->HasBusConnection(), and a label's SCH_CONNECTION is built
+ * from its own name (CONNECTION_GRAPH: ConfigureFromLabel( GetNameForDriver )), so a local, global or hierarchical
+ * label whose text is a bus vector or group (SCH_CONNECTION::IsBusLabel), wherever it sits, and a sheet holding a pin
+ * with a bus name (its pin geometry is tinted, see busPinTint).  Cached while the label and sheet geometry is
+ * unchanged.
+ */
+const BUS_LABELS = new WeakMap<object, { key: unknown[]; ids: Set<string> }>();
+export function busConnectedLabels(doc: Doc): Set<string> | null {
+  const labels: Item[] = [];
+  for (const it of doc.items.values()) if (it.kind === "label" || it.kind === "global_label" || it.kind === "hierarchical_label" || it.kind === "sheet") labels.push(it);
+  if (!labels.length) return null;
+  const key: unknown[] = []; for (const it of labels) key.push(it.geom);
+  const hit = BUS_LABELS.get(doc);
+  if (hit && hit.key.length === key.length && hit.key.every((k, i) => k === key[i])) return hit.ids;
+  const ids = new Set<string>();
+  for (const lb of labels) {
+    if (lb.kind === "sheet") { if (kids(lb.node, "pin").some((pin) => isBusLabel(str(pin[1])))) ids.add(lb.id); }
+    else if (isBusLabel(str(lb.node[1]))) ids.add(lb.id);
+  }
+  BUS_LABELS.set(doc, { key, ids });
+  return ids;
+}
+/** Is this geometry of a bus-tinted item drawn in the bus colour: a label's own shape and text, or a bus-named sheet pin. */
+export function busPinTint(it: Item, g: Geom): boolean {
+  // getRenderColor( LAYER_BUS ): a label's own text colour still wins over the bus colour
+  if (it.kind === "sheet") {
+    if (!(typeof g.pinNo === "string" && g.layer === "Sheets" && isBusLabel(g.pinNo))) return false;
+    const pin = kids(it.node, "pin").find((p) => str(p[1]) === g.pinNo); return !(pin && effectsOf(pin).color);
+  }
+  return g.layer === "Labels" && !effectsOf(it.node).color;
+}
+
+/** A layer colour as PCB_RENDER_SETTINGS::LoadColors draws it: an alpha below 0.2 is raised to 0.2. */
+export function minLayerAlpha(c: string): string {
+  const m = /^rgba\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*\)$/i.exec(c);
+  if (m) return +m[4] < 0.2 ? `rgba(${m[1]},${m[2]},${m[3]},0.2)` : c;
+  const h = /^#([0-9a-f]{6})([0-9a-f]{2})$/i.exec(c);
+  return h && parseInt(h[2], 16) < 51 ? "#" + h[1] + "33" : c;
+}
+
+/** Which Appearance ▸ Objects row a geometry belongs to (null: governed by its layer alone). */
+export function objectClass(g: Geom): string | null {
+  return g.track ? "tracks" : g.via ? "vias" : g.pad ? "pads" : (g.zoneFill || g.zoneOutline || g.zoneUnfilled) ? "zones" : g.t === "image" ? "images" : (g as { point?: boolean }).point ? "points" : null;
+}
+
+export const ANCHOR_COLOR = "#FF26E2", LOCKED_SHADOW_COLOR = "rgba(255,38,226,0.5)", BOARD_AREA_COLOR = "rgba(100,100,100,0.35)";
+   // LAYER_ANCHOR, LAYER_LOCKED_ITEM_SHADOW (builtin_color_themes.h)
+/** The overlay object layers: the locked-item shadow (under the anchors) and the footprint anchors — PCB_PAINTER::draw(FOOTPRINT, LAYER_ANCHOR): a 5 px cross, 1 px pen. */
+export function drawObjectOverlays(ctx: Ctx2D, doc: Doc, obj: ObjectsOpt, opts: RenderOpts, s: number, dpr: number, hidden: Set<string> | null, vr: number[]): void {
+  const show = obj.show!, hide = obj.hide || new Set<string>();   // called only when obj.show is set
+  if (show.has("lockedShadow") && opts.lockedIds && opts.lockedIds.size) drawLockedShadow(ctx, doc, opts.lockedIds, opts, hidden, vr);
+  if (show.has("viaStitching")) drawViaStitching(ctx, doc, opts, s, dpr, vr);
+  if (show.has("anchors")) {
+    const a = 5 * Math.max(1, dpr) / s;
+    ctx.save(); ctx.globalAlpha = 1; ctx.setLineDash([]); ctx.lineCap = "butt"; ctx.strokeStyle = OC.anchors || ANCHOR_COLOR; ctx.lineWidth = Math.max(1, dpr) / s; ctx.beginPath();
+    for (const it of doc.items.values()) {
+      if (it.kind !== "footprint" || it.x === undefined) continue;
+      if (hide.has(it.layer && /^B\./.test(it.layer) ? "fpBack" : "fpFront")) continue;
+      // a footprint's anchor: x and y are set together by buildFootprintGeom
+      if (it.x < vr[0] - a || it.x > vr[2] + a || it.y! < vr[1] - a || it.y! > vr[3] + a) continue;
+      ctx.moveTo(it.x - a, it.y!); ctx.lineTo(it.x + a, it.y!); ctx.moveTo(it.x, it.y! - a); ctx.lineTo(it.x, it.y! + a);
+    }
+    ctx.stroke(); ctx.restore();
+  }
+}
+
+/**
+ * The selected footprint texts as umbilical lines, [text position, footprint anchor] (PCB_PAINTER::draw( PCB_TEXT ):
+ * a selected text whose parent is a footprint).  On a board the keys are "footprintId#field:Name"; in the Footprint
+ * Editor a field or text is an item of its own and its footprint's anchor is the origin.
+ */
+export function umbilicalLines(doc: Doc, selected: Iterable<string>): [Pt, Pt][] {
+  const out: [Pt, Pt][] = []; const fpEd = !!(doc as { fpEditor?: boolean }).fpEditor;
+  for (const k of selected) {
+    if (typeof k !== "string") continue;
+    const i = k.indexOf("#field:");
+    if (i < 0) {
+      if (!fpEd) continue;
+      // any PCB_TEXT with a parent footprint (pcb_painter.cpp draw( PCB_TEXT ): fp_parent && IsSelected), fields and user texts
+      const it = doc.items.get(k); if (!it) continue;
+      if (it.kind === "property" && it.x !== undefined && it.y !== undefined) { out.push([[it.x, it.y], [0, 0]]); continue; }
+      if (it.kind === "gr_text") { const at = kid(it.node, "at"); if (at) out.push([[num(at[1]), num(at[2])], [0, 0]]); }
+      continue;
+    }
+    const it = doc.items.get(k.slice(0, i)); if (!it || it.kind !== "footprint" || it.x === undefined || it.y === undefined) continue;
+    const name = k.slice(i + 7); const g = it.geom.find((q) => q.t === "text" && q.field === name && (q as TextGeom).textPos) as TextGeom | undefined;
+    if (g) out.push([g.textPos!, [it.x, it.y]]);
+  }
+  return out;
+}
+/** The umbilical lines in LAYER_ANCHOR at m_outlineWidth (1 IU: the thinnest line, one device pixel). */
+function drawUmbilicals(ctx: Ctx2D, doc: Doc, selected: Set<string>, s: number, dpr: number): void {
+  const lines = umbilicalLines(doc, selected); if (!lines.length) return;
+  ctx.save(); ctx.globalAlpha = 1; ctx.setLineDash([]); ctx.lineCap = "butt"; ctx.strokeStyle = OC.anchors || ANCHOR_COLOR; ctx.lineWidth = Math.max(1, dpr) / s; ctx.beginPath();
+  for (const [a, b] of lines) { ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); }
+  ctx.stroke(); ctx.restore();
+}
+
+/** A PCB_GRID_ITEM as GRID_GEOMETRY: (grid_item xy|polar (at x y) (extent …) (spacing …) (angle deg) (priority n) (tick_interval n) …). */
+export interface GridItemGeom { kind: "xy" | "polar"; origin: Pt; pitch: Pt; extent: Pt; orientation: number; priority: number; tick: number; id?: string }
+export function gridItemGeom(node: readonly unknown[]): GridItemGeom | null {
+  if (str(node[0]) !== "grid_item") return null;
+  const kind = str(node[1]) === "polar" ? "polar" : "xy", pair = (k: string): Pt => { const n = kid(node, k); return n ? [num(n[1]), num(n[2])] : [0, 0]; };
+  const deg = Math.PI / 180, ext = pair("extent"), sp = pair("spacing");
+  const pr = kid(node, "priority"), tk = kid(node, "tick_interval"), an = kid(node, "angle");
+  return { kind, origin: pair("at"), orientation: an ? num(an[1]) * deg : 0, priority: Math.max(1, pr ? num(pr[1], 1) : 1), tick: tk ? num(tk[1]) : 0,
+    // polar: (extent rMax phiMaxDeg) (spacing dr dPhiDeg); the angles in radians as GRID_GEOMETRY keeps them
+    extent: kind === "polar" ? [ext[0], ext[1] * deg] : ext, pitch: kind === "polar" ? [sp[0], sp[1] * deg] : sp };
+}
+/** GRID_GEOMETRY::Area and TakesPrecedenceOver: higher priority first, then the smaller area. */
+export function gridItemArea(g: GridItemGeom): number { return g.kind === "polar" ? 0.5 * g.extent[0] * g.extent[0] * g.extent[1] : 4 * g.extent[0] * g.extent[1]; }
+export function gridTakesPrecedence(a: GridItemGeom, b: GridItemGeom): boolean { return a.priority !== b.priority ? a.priority > b.priority : gridItemArea(a) < gridItemArea(b); }
+/** AutoSparsePitch: multiply the pitch by the major tick (2 without one) until marks are more than `threshold` apart. */
+export function autoSparsePitch(pitch: number, tick: number, threshold: number): number { const m = tick > 1 ? tick : 2; let p = pitch, guard = 0; while (p > 0 && p <= threshold && guard++ < 40) p *= m; return p; }
+/** LAYER_SUBGRIDS (builtin_color_themes.h: 194, 194, 0); GRID_DIM_ALPHA, GRID_EDGE_DARKEN, GRID_SELECTED_BRIGHTEN. */
+export const SUBGRID_COLOR = "#C2C200", GRID_DIM_ALPHA = 0.4, GRID_EDGE_DARKEN = 0.75, GRID_SELECTED_BRIGHTEN = 0.5;
+/**
+ * GAL::drawGridSources for the board's grid items: lowest precedence first, the selected ones last.  Each clears its
+ * coverage with the background (a selected one only washes it at GRID_DIM_ALPHA), draws its lattice in the display
+ * grid's style (thinned out as the main grid is: gridLattice), and outlines its coverage one pixel wide in its colour
+ * Darkened( 0.75 ).  A selected grid is Brightened( 0.5 ).
+ */
+/** GAL_DISPLAY_OPTIONS::m_gridLineWidth (Preferences > Display Options > Grid thickness, 0.5..10 px) */
+function gridLineWidth(opts: RenderOpts): number { const w = +(opts.gridLineWidth ?? 1); return w > 0 && w <= 10 ? w : 1; }
+/**
+ * A minor grid mark's width in device pixels: GAL keeps m_gridLineWidth = scaleFactor * line_width + 0.25 and
+ * gridMinorLineWidth takes at least 1 of it, which the shaders round to whole pixels (a major mark is twice that).
+ */
+export function gridMinorPx(opts: RenderOpts, dpr: number): number { return Math.max(1, Math.round(Math.max(1, dpr) * gridLineWidth(opts) + 0.25)); }
+/** GAL's m_gridTick: every 10th line major, or 0 (no major lines, the grid thinned by 2) with Show major grid off. */
+export function gridTick(opts: RenderOpts): number { return opts.gridShowMajor === false ? 0 : GRID_TICK; }
+function drawGridItems(ctx: Ctx2D, doc: Doc, opts: RenderOpts, s: number, dpr: number, sCss: number, vr: number[], bg: string): void {
+  const list = gridItemList(doc);
+  if (!list.length) return;
+  const claims: GridItemGeom[] = [];
+  const sel = opts.selected || null, isSel = (g: GridItemGeom) => !!sel && sel.has(g.id!);
+  const order = [...list.filter((g) => !isSel(g)), ...list.filter(isSel)];   // precedence order: the first drawn wins, selected ones last
+  const style = opts.gridStyle === "lines" || opts.gridStyle === "crosses" ? opts.gridStyle : "dots";
+  const threshold = (opts.gridMinSpacing! > 0 ? opts.gridMinSpacing! : GRID_MIN_SPACING) * (style === "crosses" ? 2 : 1) / sCss;
+  const px1 = gridMinorPx(opts, dpr) / s, base = opts.gridItemColor || SUBGRID_COLOR;
+  ctx.save(); ctx.setLineDash([]); ctx.lineCap = "butt";
+  for (const g of order) {
+    const hi = isSel(g), color = hi ? brightened(base, GRID_SELECTED_BRIGHTEN) : base;
+    // GAL::gridLattice: lattice.tick = aSrc.tick > 0 ? aSrc.tick : m_gridTick (a grid item's own tick keeps its majors)
+    const tick = g.tick > 0 ? g.tick : gridTick(opts), major = (i: number) => tick > 0 && i % tick === 0;
+    // the lattice (gridLattice): both cartesian axes thin by one factor; polar radius and angle each on their own
+    let dx: number, dy: number;
+    if (g.kind === "polar") { dx = autoSparsePitch(g.pitch[0], tick, threshold); dy = g.extent[0] > 0 ? autoSparsePitch(g.pitch[1], tick, threshold / g.extent[0]) : g.pitch[1]; }
+    else { const mp = Math.min(g.pitch[0], g.pitch[1]), k = autoSparsePitch(mp, tick, threshold) / mp; dx = g.pitch[0] * k; dy = g.pitch[1] * k; }
+    ctx.save();
+    if (!hi) clipOutsideGrids(ctx, claims, vr);
+    ctx.translate(g.origin[0], g.origin[1]); ctx.rotate(-g.orientation);
+    const coverage = () => { ctx.beginPath(); gridCoverageSubpath(ctx, g, true); };
+    // drawGridSources' stencil: a grid draws only where no grid before it claimed the area (its outline too), and then
+    // claims its own coverage without painting it, so the axes and whatever lies under stay; a selected grid ignores
+    // the claims and washes its coverage with the background at GRID_DIM_ALPHA instead
+    if (hi) { ctx.globalAlpha = GRID_DIM_ALPHA; ctx.fillStyle = bg; coverage(); ctx.fill(); ctx.globalAlpha = 1; }
+    ctx.strokeStyle = color; ctx.fillStyle = color;
+    const dot = (x: number, y: number, mx: boolean, my: boolean) => { const w = mx ? 2 * px1 : px1, h = my ? 2 * px1 : px1; ctx.rect(x - w / 2, y - h / 2, w, h); };
+    const cross = (x: number, y: number, mj: boolean, ang: number) => { const w = mj ? 2 * px1 : px1, len = 2 * w, c = Math.cos(ang) * len, sn = Math.sin(ang) * len; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(x - c, y - sn); ctx.lineTo(x + c, y + sn); ctx.moveTo(x + sn, y - c); ctx.lineTo(x - sn, y + c); ctx.stroke(); };
+    let count = 0; const LIMIT = 200000;
+    if (g.kind === "polar" && g.extent[0] > 0 && g.extent[1] > 0) {
+      const rMax = g.extent[0], phiMax = g.extent[1];
+      if (style === "lines") {
+        let ri = 1; for (let r = dx; r <= rMax + 1e-6 && count++ < LIMIT; r += dx, ri++) { ctx.lineWidth = major(ri) ? 2 * px1 : px1; ctx.beginPath(); ctx.arc(0, 0, r, 0, phiMax); ctx.stroke(); }
+        let pi = 0; for (let ph = 0; ph <= phiMax + 1e-6 && count++ < LIMIT; ph += dy, pi++) { ctx.lineWidth = major(pi) ? 2 * px1 : px1; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(rMax * Math.cos(ph), rMax * Math.sin(ph)); ctx.stroke(); }
+      } else {
+        if (style === "dots") ctx.beginPath();
+        let ri = 0; for (let r = 0; r <= rMax + 1e-6; r += dx, ri++) { let pi = 0; for (let ph = 0; ph <= phiMax + 1e-6 && count++ < LIMIT; ph += dy, pi++) { const x = r * Math.cos(ph), y = r * Math.sin(ph); if (style === "dots") dot(x, y, major(ri), major(pi)); else cross(x, y, major(ri) && major(pi), ph); } }
+        if (style === "dots") ctx.fill();
+      }
+    } else if (g.kind === "xy") {
+      // the visible part, in the grid's own frame (gridScreenBBox), one pitch of bleed, clipped to the extent
+      const co = Math.cos(g.orientation), so = Math.sin(g.orientation);
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const [wx, wy] of [[vr[0], vr[1]], [vr[2], vr[1]], [vr[0], vr[3]], [vr[2], vr[3]]]) { const ox = wx - g.origin[0], oy = wy - g.origin[1], lx = co * ox - so * oy, ly = so * ox + co * oy; x0 = Math.min(x0, lx); x1 = Math.max(x1, lx); y0 = Math.min(y0, ly); y1 = Math.max(y1, ly); }
+      x0 = Math.max(x0 - dx, -g.extent[0]); x1 = Math.min(x1 + dx, g.extent[0]); y0 = Math.max(y0 - dy, -g.extent[1]); y1 = Math.min(y1 + dy, g.extent[1]);
+      const ix0 = Math.max(Math.floor(x0 / dx), -Math.trunc(g.extent[0] / dx)), ix1 = Math.min(Math.ceil(x1 / dx), Math.trunc(g.extent[0] / dx));
+      const iy0 = Math.max(Math.floor(y0 / dy), -Math.trunc(g.extent[1] / dy)), iy1 = Math.min(Math.ceil(y1 / dy), Math.trunc(g.extent[1] / dy));
+      if (x1 >= x0 && y1 >= y0 && (ix1 - ix0 + 1) * (iy1 - iy0 + 1) < 400000) {
+        if (style === "lines") {
+          for (const mj of [false, true]) {
+            ctx.lineWidth = mj ? 2 * px1 : px1; ctx.beginPath();
+            for (let i = ix0; i <= ix1; i++) if (major(i) === mj) { ctx.moveTo(i * dx, y0); ctx.lineTo(i * dx, y1); }
+            for (let j = iy0; j <= iy1; j++) if (major(j) === mj) { ctx.moveTo(x0, j * dy); ctx.lineTo(x1, j * dy); }
+            ctx.stroke();
+          }
+        } else if (style === "dots") { ctx.beginPath(); for (let i = ix0; i <= ix1; i++) for (let j = iy0; j <= iy1; j++) dot(i * dx, j * dy, major(i), major(j)); ctx.fill(); }
+        else for (let i = ix0; i <= ix1; i++) for (let j = iy0; j <= iy1; j++) cross(i * dx, j * dy, major(i) && major(j), 0);
+      }
+    }
+    // the coverage outline, so a grid too sparse to draw still reads as an area
+    ctx.strokeStyle = darkened(color, GRID_EDGE_DARKEN); ctx.lineWidth = px1; coverage(); ctx.stroke();
+    ctx.restore();
+    if (!hi) claims.push(g);
+  }
+  ctx.restore();
+}
+/** A grid item's coverage (drawGridCoverageShape) added to the current path, in its own frame. */
+function gridCoverageSubpath(ctx: Ctx2D, g: GridItemGeom, inFrame = false): void {
+  if (!inFrame) { ctx.save(); ctx.translate(g.origin[0], g.origin[1]); ctx.rotate(-g.orientation); }
+  if (g.kind === "xy") ctx.rect(-g.extent[0], -g.extent[1], 2 * g.extent[0], 2 * g.extent[1]);
+  else if (g.extent[0] > 0 && g.extent[1] >= 2 * Math.PI - 1e-6) ctx.arc(0, 0, g.extent[0], 0, 2 * Math.PI);
+  else if (g.extent[0] > 0 && g.extent[1] > 0) { const n = Math.max(16, Math.floor(g.extent[1] / (Math.PI / 16))); ctx.moveTo(0, 0); for (let i = 0; i <= n; i++) { const a = g.extent[1] * i / n; ctx.lineTo(g.extent[0] * Math.cos(a), g.extent[0] * Math.sin(a)); } ctx.closePath(); }
+  if (!inFrame) ctx.restore();
+}
+/** The stencil test of drawGridSources on a 2D canvas: clip to outside each claimed coverage (the clips intersect). */
+function clipOutsideGrids(ctx: Ctx2D, claims: GridItemGeom[], vr: number[]): void {
+  if (!claims.length || typeof ctx.clip !== "function") return;
+  const m = Math.max(vr[2] - vr[0], vr[3] - vr[1]) + 1;
+  for (const c of claims) { ctx.beginPath(); ctx.rect(vr[0] - m, vr[1] - m, vr[2] - vr[0] + 2 * m, vr[3] - vr[1] + 2 * m); gridCoverageSubpath(ctx, c); ctx.clip("evenodd"); }
+}
+/** The board's grid items in precedence order (gridTakesPrecedence), with zero-pitch ones left out. */
+function gridItemList(doc: Doc): GridItemGeom[] {
+  const list: GridItemGeom[] = [];
+  for (const it of doc.items.values()) { if (it.kind !== "grid_item") continue; const g = gridItemGeom(it.node); if (g && g.pitch[0] > 0 && g.pitch[1] > 0) { g.id = it.id; list.push(g); } }
+  list.sort((a, b) => (gridTakesPrecedence(a, b) ? -1 : gridTakesPrecedence(b, a) ? 1 : 0));
+  return list;
+}
+
+/** LAYER_VIA_STITCHING (builtin_color_themes.h: 77, 204, 178). */
+export const VIA_STITCHING_COLOR = "#4DCCB2";
+/** A via stitching generator's zone outline ((generated (type via_stitch) … (outline (pts (xy …) …)))), or null. */
+export function viaStitchOutline(node: readonly unknown[]): Pt[] | null {
+  const t = kid(node, "type"); if (!t || str(t[1]) !== "via_stitch") return null;
+  const o = kid(node, "outline"), pts = o && kid(o, "pts"); if (!pts) return null;
+  const out = kids(pts, "xy").map((q) => [num(q[1]), num(q[2])]);
+  return out.length > 1 ? out : null;
+}
+/**
+ * PCB_VIA_STITCH::ViewDraw's "sewing pattern": a hairline tick every 2 mm along each edge of the outline, 0.5 mm long,
+ * on the side of the vertex centroid.  Edges shorter than 1 IU are skipped.
+ */
+export function viaStitchTicks(pts: Pt[]): [Pt, Pt][] {
+  const n = pts.length, out: [Pt, Pt][] = []; if (n < 2) return out;
+  let cx = 0, cy = 0; for (const p of pts) { cx += p[0]; cy += p[1]; } cx /= n; cy /= n;
+  const SP = 2, LEN = 0.5;
+  for (let i = 0; i < n; i++) {
+    const p1 = pts[i], p2 = pts[(i + 1) % n], ex = p2[0] - p1[0], ey = p2[1] - p1[1], L = Math.hypot(ex, ey);
+    if (L < 1e-6) continue;
+    const dx = ex / L, dy = ey / L, mx = (p1[0] + p2[0]) / 2, my = (p1[1] + p2[1]) / 2;
+    let px = -dy, py = dx; if (px * (cx - mx) + py * (cy - my) < 0) { px = -px; py = -py; }
+    for (let t = SP; t < L - 1e-9; t += SP) { const bx = p1[0] + dx * t, by = p1[1] + dy * t; out.push([[bx, by], [bx + px * LEN, by + py * LEN]]); }
+  }
+  return out;
+}
+/** The via stitching generators' outlines: a 0.1 mm closed line and the hairline ticks, selected ones brightened. */
+function drawViaStitching(ctx: Ctx2D, doc: Doc, opts: RenderOpts, s: number, dpr: number, vr: number[]): void {
+  const sel = opts.selected;
+  for (const it of doc.items.values()) {
+    if (it.kind !== "generated") continue;
+    const pts = viaStitchOutline(it.node); if (!pts) continue;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity; for (const p of pts) { x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); }
+    if (x1 < vr[0] || x0 > vr[2] || y1 < vr[1] || y0 > vr[3]) continue;
+    const color = sel && sel.has(it.id) ? selectedColor(VIA_STITCHING_COLOR) : VIA_STITCHING_COLOR;
+    ctx.save(); ctx.globalAlpha = 1; ctx.setLineDash([]); ctx.strokeStyle = color; ctx.lineCap = "round"; ctx.lineJoin = "round";
+    ctx.lineWidth = Math.max(0.1, Math.max(1, dpr) / s); ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]); for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]); ctx.closePath(); ctx.stroke();
+    ctx.lineWidth = Math.max(1, dpr) / s; ctx.beginPath(); for (const [a, b] of viaStitchTicks(pts)) { ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); } ctx.stroke();
+    ctx.restore();
+  }
+}
+
+export const LOCKED_SHADOW_ALPHA = 0.5, DEFAULT_SILK_LINE_WIDTH = 0.1;
+/** PCB_PAINTER m_lockedShadowMargin: four F.SilkS default line widths (mm). */
+export function lockedShadowMargin(silkLineWidth?: number | null): number { return 4 * (silkLineWidth && silkLineWidth > 0 ? silkLineWidth : DEFAULT_SILK_LINE_WIDTH); }
+
+/** A footprint's box without its text (FOOTPRINT::GetBoundingBox( false )), from its drawn geometry. */
+export function footprintBodyBox(it: { geom: Geom[]; bbox?: Box | null }): Box | null {
+  let b: number[] | null = null;
+  for (const g of it.geom) {
+    if (g.t === "text" || g.padText) continue;
+    const bb = g._bb === undefined ? (g._bb = geomBox(g)) : g._bb; if (!bb) continue;
+    if (!b) b = [bb[0], bb[1], bb[2], bb[3]]; else { b[0] = Math.min(b[0], bb[0]); b[1] = Math.min(b[1], bb[1]); b[2] = Math.max(b[2], bb[2]); b[3] = Math.max(b[3], bb[3]); }
+  }
+  return (b as Box | null) || it.bbox || null;
+}
+
+/**
+ * LAYER_LOCKED_ITEM_SHADOW (PCB_PAINTER): in board units, margin = 4 × the silk line width.  A track is drawn
+ * margin wider, a via gets a ring of that width around it, a pad and a shape are grown by half of it, a text's
+ * glyphs are stroked margin wider, and a locked footprint fills its body box plus a margin-wide rounded border.
+ * Tracks and text on layers the high-contrast mode dims, and anything on a hidden layer, have no shadow.  The
+ * shapes are painted opaque on a scratch canvas and composited once at the layer colour's alpha (0.5), so
+ * overlapping shadows (segment joints, pads inside a footprint) read as one.
+ */
+export function drawLockedShadow(ctx: Ctx2D, doc: Doc, ids: Set<string>, opts: RenderOpts, hidden: Set<string> | null, vr: number[]): void {
+  const margin = lockedShadowMargin(opts.silkLineWidth);
+  const hc = opts.highContrast && opts.activeLayer ? String(opts.activeLayer) : null;
+  const m = typeof (ctx as CanvasRenderingContext2D).getTransform === "function" ? (ctx as CanvasRenderingContext2D).getTransform() : null;
+  const base: Mat | null = m ? [m.a, m.b, m.c, m.d, m.e, m.f] as unknown as Mat : null;
+  const W = ctx.canvas.width, H = ctx.canvas.height;
+  const off = base && !(ctx as unknown as { __plot?: boolean }).__plot ? scratchCanvas(W, H) : null, octx = off ? off.getContext("2d") as Ctx2D | null : null;
+  const t: Ctx2D = octx || ctx;
+  t.save();
+  if (octx) { octx.setTransform(1, 0, 0, 1, 0, 0); octx.clearRect(0, 0, W, H); octx.setTransform(base![0], base![1], base![2], base![3], base![4], base![5]); octx.globalAlpha = 1; }
+  else t.globalAlpha = LOCKED_SHADOW_ALPHA;
+  const color = "#FF26E2";
+  t.fillStyle = color; t.strokeStyle = color; t.lineJoin = "round"; t.lineCap = "round"; t.setLineDash([]);
+  const fpHide = opts.objects && opts.objects.hide;
+  for (const id of ids) {
+    const it = doc.items.get(id); if (!it) continue;
+    const b = it.bbox; if (b && (b[2] < vr[0] - margin || b[0] > vr[2] + margin || b[3] < vr[1] - margin || b[1] > vr[3] + margin)) continue;
+    if (it.kind === "footprint") {
+      if (fpHide && fpHide.has(it.layer && /^B\./.test(it.layer) ? "fpBack" : "fpFront")) continue;
+      const fb = footprintBodyBox(it); if (!fb) continue;
+      // DrawRectangle + four DrawSegments of width margin: the box grown by margin / 2 with round corners
+      t.lineWidth = margin; t.beginPath(); t.rect(fb[0], fb[1], fb[2] - fb[0], fb[3] - fb[1]); t.fill(); t.stroke();
+      // its pads have their own shadow (PAD::ViewGetLayers: a pad of a locked footprint is locked)
+      for (const g of it.geom) if (g.pad && !g.hole && g.t !== "text" && !(hidden && hidden.has(g.layer))) shadowGeom(t, g, margin, base);
+      continue;
+    }
+    for (const g of it.geom) {
+      if (g.hole || (hidden && hidden.has(g.layer))) continue;
+      if (hc && g.layer !== hc && (g.track || g.t === "text")) continue;   // PCB_TRACK / PCB_TEXT::ViewGetLOD
+      shadowGeom(t, g, margin, base);
+    }
+  }
+  t.restore();
+  if (octx) { ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = LOCKED_SHADOW_ALPHA; ctx.drawImage(off as CanvasImageSource, 0, 0); ctx.restore(); }
+}
+
+/** One geometry's locked shadow, painted in the context's current colour. */
+function shadowGeom(t: Ctx2D, g: Geom, margin: number, base: Mat | null): void {
+  if (g.zoneFill || g.zoneUnfilled || g.t === "image") return;
+  if (g.t === "text") {
+    if (!base) return;
+    const tg = g as unknown as DrawTextG; const pen = tg.w > 0 ? tg.w : tg.size / 8;
+    t.save(); drawTextStroke(t, Object.assign({}, tg, { w: pen + margin, knockout: false }) as DrawTextG, pen + margin, t.strokeStyle as string, base, false); t.restore();
+    return;
+  }
+  if (g.via && g.t === "circle") { t.lineWidth = margin; t.beginPath(); t.arc(g.x, g.y, g.r + margin / 2, 0, Math.PI * 2); t.stroke(); return; }   // a ring around the via
+  if (g.t === "rect") { t.lineWidth = (g.wd || 0) + margin; if (g.fill) t.fillRect(g.x, g.y, g.w, g.h); t.strokeRect(g.x, g.y, g.w, g.h); return; }
+  if (g.t === "poly" && (!g.pts || g.pts.length < 2)) return;
+  const filled = !!g.fill || g.t === "pad" || (g.pad && g.t === "circle");
+  t.lineWidth = (filled && g.pad ? 0 : g.w || 0) + margin;
+  const p = pathOf(g);
+  if (filled) { if (p) t.fill(p); else { t.beginPath(); tracePath(t, g); t.fill(); } }
+  if (p) t.stroke(p); else { t.beginPath(); tracePath(t, g); t.stroke(); }
+}
+
+/** RATSNEST_VIEW_ITEM::ViewDraw: hairlines in LAYER_RATSNEST (or the net colour), a cross where both ends coincide. */
+export function drawRatsnest(ctx: Ctx2D, lines: RatsLine[], nets: Set<number> | null, netColors: Map<number, string> | null, s: number, dpr: number, vr: number[], thickness?: number): void {
+  ctx.save(); ctx.globalAlpha = 1; ctx.setLineDash([]); ctx.lineCap = "butt"; ctx.lineWidth = (thickness && thickness > 0 ? thickness : RATSNEST_PX) * Math.max(1, dpr) / s;
+  let cur: string | null = null; const c = RATSNEST_CROSS;
+  const flush = () => { if (cur !== null) ctx.stroke(); };
+  for (const l of lines) {
+    if (nets && !nets.has(l.net)) continue;
+    const a = l.a, b = l.b; if (!a || !b) continue;
+    if (Math.max(a[0], b[0]) < vr[0] - c || Math.min(a[0], b[0]) > vr[2] + c || Math.max(a[1], b[1]) < vr[1] - c || Math.min(a[1], b[1]) > vr[3] + c) continue;
+    const color = (netColors && netColors.get(l.net)) || OC.ratsnest || RATSNEST_COLOR;
+    if (color !== cur) { flush(); ctx.strokeStyle = color; ctx.beginPath(); cur = color; }
+    if (a[0] === b[0] && a[1] === b[1]) { ctx.moveTo(a[0] - c, a[1] - c); ctx.lineTo(a[0] + c, a[1] + c); ctx.moveTo(a[0] - c, a[1] + c); ctx.lineTo(a[0] + c, a[1] - c); }
+    else { ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); }
+  }
+  flush(); ctx.restore();
+}
+
+/** MARKER_BASE::ShapeToPolygon at a position: the corners × scale (mm), closed. */
+export function markerPolygon(m: { x: number; y: number }, scale: number): number[][] { return MARKER_CORNERS.map(([px, py]) => [m.x + px * scale, m.y + py * scale]); }
+
+/**
+ * `selShadowW`: a schematic marker that is selected also gets SCH_PAINTER::draw( SCH_MARKER )'s LAYER_SELECTION_SHADOWS
+ * pass first, its polygon stroked in the selection colour at the shadow width (mm).
+ */
+export function drawMarkers(ctx: Ctx2D, markers: (Marker | null)[], docType: string, scale: number, bg: string, selShadowW = 0): void {
+  const colors = docType === "sch" ? MARKER_COLORS.sch
+    : { error: OC.drcErrors || MARKER_COLORS.pcb.error, warning: OC.drcWarnings || MARKER_COLORS.pcb.warning, exclusion: OC.drcExclusions || MARKER_COLORS.pcb.exclusion } as Record<string, string>;
+  const [br, bgc, bb] = parseColor(bg); const shadow = rgba(br, bgc, bb, 0.5);   // LAYER_MARKER_SHADOWS = background @ 0.5
+  ctx.save(); ctx.globalAlpha = 1; ctx.setLineDash([]); ctx.lineJoin = "round";
+  for (const m of markers) {
+    if (!m || !isFinite(m.x) || !isFinite(m.y)) continue;
+    ctx.beginPath();
+    for (let i = 0; i < MARKER_CORNERS.length; i++) { const px = m.x + MARKER_CORNERS[i][0] * scale, py = m.y + MARKER_CORNERS[i][1] * scale; if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py); }
+    ctx.closePath();
+    if (docType !== "sch") { ctx.strokeStyle = shadow; ctx.lineWidth = scale; ctx.stroke(); }
+    else if (m.selected && selShadowW > 0) { ctx.strokeStyle = SCH.selection; ctx.lineWidth = selShadowW; ctx.stroke(); }
+    // a selected or brightened board marker takes LAYER_DRC_HIGHLIGHTED (PCB_RENDER_SETTINGS::GetColor)
+    ctx.fillStyle = docType !== "sch" && (m.selected || m.brightened) ? DRC_HIGHLIGHTED : colors[m.severity as string] || colors.error; ctx.fill();
+  }
+  ctx.restore();
+}
+
+/** The first marker whose flag (at `scale` mm per unit, default the board's base scale) covers (x, y) within tolMm, or null. */
+export function markerAt(markers: (Marker | null)[] | null | undefined, x: number, y: number, tolMm?: number, scale?: number): Marker | null {
+  if (!markers) return null; tolMm = tolMm || 0; scale = scale || MARKER_SCALE.pcb;
+  for (const m of markers) {
+    if (!m || !isFinite(m.x) || !isFinite(m.y)) continue;
+    const x0 = m.x - tolMm, y0 = m.y - tolMm, x1 = m.x + 13 * scale + tolMm, y1 = m.y + 13 * scale + tolMm;
+    if (x < x0 || x > x1 || y < y0 || y > y1) continue;
+    if (tolMm > 0 || pointInPoly(markerPolygon(m, scale), x, y)) return m;
+  }
+  return null;
+}
+
+/** One net-name label: KiCad's glyph size is the cap height here too; the label is always kept readable (re-mirrored under flip). */
+export function drawLabel(ctx: Ctx2D, x: number, y: number, text: string, size: number, rot: number, color: string, pen: number, base: Mat, flip: boolean, sizeX?: number): void {
+  if (textMode() === "stroke") {
+    // GAL::BitmapText falls back to the stroke font: centred both ways, un-mirrored under the flipped view
+    drawStrokeText(ctx, base, { x, y, text, size, sizeX, rot, mirror: !!flip, h: "center", v: "middle", pen }, color, 1 / Math.abs(base[0]));
+    return;
+  }
+  const a = -(rot || 0) * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a); const mx = flip ? -1 : 1;
+  ctx.setTransform(base[0] * c * mx, base[3] * sn * mx, -base[0] * sn, base[3] * c, base[0] * x + base[4], base[3] * y + base[5]);
+  let font = FONT_CACHE.get(size); if (!font) { font = `${size * FONT_EM}px ${FONT_FAMILY}`; if (FONT_CACHE.size < 512) FONT_CACHE.set(size, font); }
+  ctx.font = font; ctx.textAlign = "center"; ctx.textBaseline = "alphabetic"; ctx.fillStyle = color;
+  ctx.fillText(text, 0, size / 2);
+  ctx.setTransform(base[0], base[1], base[2], base[3], base[4], base[5]);
+}
+
+/** PCB_PAINTER::renderNetNameForSegment for a track segment / arc geometry. */
+export function drawTrackName(ctx: Ctx2D, g: Geom, doc: Doc, s: number, sCss: number, vr: number[], base: Mat, flip: boolean, dark?: boolean): void {
+  const name = displayNetName(doc.nets.get(g.net!)); if (!name) return;
+  const width = g.w || 0; if (width * sCss < TRACK_NETNAME_MM * PX_PER_MM_ZOOM1) return;   // ViewGetLOD: 4 mm at zoom 1
+  const chars = name.length; const size = width * 0.55, pen = width / 12; let color = trackNameColor(g.color!); if (dark) color = darkened(color, 1 - HL_FACTOR);
+  const vw = vr[2] - vr[0], vh = vr[3] - vr[1];
+  if (g.t === "line") {
+    const dx = g.x2 - g.x1, dy = g.y2 - g.y1; const len = Math.hypot(dx, dy); if (len < width * chars || len < 1e-9) return;
+    let rot: number, n: number;
+    if (dy === 0) { rot = 0; n = Math.max(1, Math.round(len / vw)); }
+    else if (dx === 0) { rot = 90; n = Math.max(1, Math.round(len / vh)); }
+    else { rot = -Math.atan2(dy, dx) * 180 / Math.PI; while (rot > 90) rot -= 180; while (rot <= -90) rot += 180; n = Math.max(1, Math.round(len / (Math.SQRT2 * Math.min(vw, vh)))); }
+    for (let i = 1; i <= n; i++) {
+      const x = g.x1 + dx * i / (n + 1), y = g.y1 + dy * i / (n + 1);
+      if (x < vr[0] || x > vr[2] || y < vr[1] || y > vr[3]) continue;
+      drawLabel(ctx, x, y, name, size, rot, color, pen, base, flip);
+    }
+  } else if (g.t === "arc") {
+    let sweep = g.a1 - g.a0; if (!g.anticlockwise && sweep < 0) sweep += 2 * Math.PI; if (g.anticlockwise && sweep > 0) sweep -= 2 * Math.PI;
+    if (Math.abs(sweep) * g.r < width * chars) return;
+    const am = g.a0 + sweep / 2; const x = g.x + g.r * Math.cos(am), y = g.y + g.r * Math.sin(am);
+    if (x < vr[0] || x > vr[2] || y < vr[1] || y > vr[3]) return;
+    let rot = -(am * 180 / Math.PI + 90); while (rot > 90) rot -= 180; while (rot <= -90) rot += 180;   // tangent at the mid point
+    drawLabel(ctx, x, y, name, size, rot, color, pen, base, flip);
+  }
+}
+
+/** PCB_PAINTER::draw(PCB_VIA) netname layer: the net name (and the layer pair of blind / micro vias) centred on the via. */
+export function drawViaName(ctx: Ctx2D, g: ViaRingGeom, doc: Doc, s: number, sCss: number, base: Mat, flip: boolean, dark?: boolean): void {
+  const vc = dark ? darkened(VIA_NETNAME_COLOR, 1 - HL_FACTOR) : VIA_NETNAME_COLOR;
+  const name = displayNetName(doc.nets.get(g.net!)); const showLayers = g.viaType && g.viaType !== "through";
+  if (!name && !showLayers) return;
+  if (g.viaSize * sCss < VIA_NETNAME_MM * PX_PER_MM_ZOOM1) return;   // ViewGetLOD: 10 mm at zoom 1
+  const size = Math.min(g.viaSize, 10);
+  let tsize = Math.min(1.5 * size / Math.max(name.length, showLayers ? 6 : 3), size) * 0.75;
+  const both = showLayers && !!name; const dy = both ? tsize * 1.3 / 2 : 0;
+  if (name) drawLabel(ctx, g.x, g.y + dy, name, tsize, 0, vc, tsize / 10, base, flip);
+  if (showLayers) {
+    const copper = doc.copper.length ? doc.copper : ["F.Cu", "B.Cu"];
+    const idx = (l: string) => { const i = copper.indexOf(l); return i < 0 ? 1 : i + 1; };
+    drawLabel(ctx, g.x, g.y - (both ? dy + tsize * 0.15 : 0), idx(g.viaLayers[0]) + "-" + idx(g.viaLayers[1]), tsize, 0, vc, tsize / 10, base, flip);
+  }
+}
+
+/**
+ * Fill preview of one unfilled zone outline: the polygon at the zone opacity minus a clearance ring around
+ * every other-net obstacle on its layer (pads: the shape inflated by the clearance; tracks: width + 2·clearance;
+ * vias / NPTH holes: radius + clearance), cut with destination-out on the scratch canvas, then composited.
+ */
+export function drawZonePreview(ctx: Ctx2D, g: Geom, obstacles: Geom[], base: Mat, W: number, H: number, minW: number, netColors: Map<number, string> | null, alphaMul?: number, colorXf?: ((c: string) => string) | null): void {
+  if (!g.pts || g.pts.length < 3) return;
+  const layer = g.layer, net = g.net, c = g.zoneClearance || 0; const alpha = ZONE_OPACITY * (alphaMul === undefined ? 1 : alphaMul);
+  let color = (netColors && net! > 0 && netColors.get(net!)) || g.color; if (colorXf && color) color = colorXf(color);
+  const off = scratchCanvas(W, H); const octx = off ? off.getContext("2d") : null;
+  const target: Ctx2D = octx || ctx;
+  if (octx) { octx.setTransform(1, 0, 0, 1, 0, 0); octx.clearRect(0, 0, W, H); octx.setTransform(base[0], base[1], base[2], base[3], base[4], base[5]); octx.globalAlpha = 1; }
+  else { ctx.save(); ctx.globalAlpha = alpha; }   // no offscreen canvas (headless): the rings cut through to the page — a degraded fallback
+  target.setLineDash([]); target.lineJoin = "round"; target.lineCap = "round";
+  target.fillStyle = color as string; target.beginPath(); tracePath(target, g); target.fill();
+  target.globalCompositeOperation = "destination-out"; target.fillStyle = "#000"; target.strokeStyle = "#000";
+  for (const o of obstacles) {
+    if (o.net === net && !(o.npth)) continue;
+    const onLayer = o.layer === layer || (o.via && o.viaType === "through") || o.npth;
+    if (!onLayer) continue;
+    if (o.track) { target.lineWidth = (o.w || 0) + 2 * c; target.beginPath(); tracePath(target, o); target.stroke(); continue; }
+    if (o.via && o.t === "circle") { target.beginPath(); target.arc(o.x, o.y, o.r + c, 0, Math.PI * 2); target.fill(); continue; }
+    if (o.t === "poly" && o.pts.length < 2) continue;
+    target.beginPath(); tracePath(target, o); target.fill(); if (c > 0) { target.lineWidth = 2 * c; target.stroke(); }
+  }
+  target.globalCompositeOperation = "source-over";
+  if (octx) { ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = alpha; ctx.drawImage(off as CanvasImageSource, 0, 0); ctx.restore(); }
+  else ctx.restore();
+}
+
+/**
+ * GAL::DrawSegmentChain( chain, width ) in the outline mode: each segment's own stadium outline (DrawSegment), and a
+ * zero width as the bare chain.
+ */
+export function traceSegChain(ctx: PathSink, pts: ArrayLike<number>[] | number[][], closed: boolean, width: number): void {
+  const n = pts.length; if (n < 2) return;
+  if (!(width > 0)) { ctx.moveTo(pts[0][0], pts[0][1]); for (let i = 1; i < n; i++) ctx.lineTo(pts[i][0], pts[i][1]); if (closed) ctx.closePath(); return; }
+  const seg = { t: "line", x1: 0, y1: 0, x2: 0, y2: 0, w: width } as unknown as Geom & { x1: number; y1: number; x2: number; y2: number };
+  const last = closed ? n : n - 1;
+  for (let i = 0; i < last; i++) { const a = pts[i], b = pts[(i + 1) % n]; seg.x1 = a[0]; seg.y1 = a[1]; seg.x2 = b[0]; seg.y2 = b[1]; traceTrackOutline(ctx, seg); }
+}
+
+/** Outline of a track segment (stadium) or track arc (band with round caps) for the sketch display mode. */
+export function traceTrackOutline(ctx: PathSink, g: Geom): void {
+  const hw = (g.w || 0) / 2;
+  if (g.t === "line") {
+    const dx = g.x2 - g.x1, dy = g.y2 - g.y1, L = Math.hypot(dx, dy);
+    if (L < 1e-9 || hw <= 0) { ctx.moveTo(g.x1 + hw, g.y1); ctx.arc(g.x1, g.y1, Math.max(hw, 1e-6), 0, Math.PI * 2); return; }
+    const ang = Math.atan2(dy, dx), nx = -dy / L * hw, ny = dx / L * hw;
+    ctx.moveTo(g.x1 + nx, g.y1 + ny); ctx.lineTo(g.x2 + nx, g.y2 + ny);
+    ctx.arc(g.x2, g.y2, hw, ang + Math.PI / 2, ang - Math.PI / 2, true);
+    ctx.lineTo(g.x1 - nx, g.y1 - ny);
+    ctx.arc(g.x1, g.y1, hw, ang - Math.PI / 2, ang + Math.PI / 2, true);
+    ctx.closePath();
+  } else if (g.t === "arc") {
+    const acw = !!g.anticlockwise, p0 = [g.x + g.r * Math.cos(g.a0), g.y + g.r * Math.sin(g.a0)], p1 = [g.x + g.r * Math.cos(g.a1), g.y + g.r * Math.sin(g.a1)];
+    ctx.moveTo(g.x + (g.r + hw) * Math.cos(g.a0), g.y + (g.r + hw) * Math.sin(g.a0));
+    ctx.arc(g.x, g.y, g.r + hw, g.a0, g.a1, acw);
+    ctx.arc(p1[0], p1[1], hw, g.a1, g.a1 + Math.PI, acw);
+    if (g.r - hw > 1e-9) ctx.arc(g.x, g.y, g.r - hw, g.a1, g.a0, !acw); else ctx.lineTo(g.x, g.y);
+    ctx.arc(p0[0], p0[1], hw, g.a0 + Math.PI, g.a0, acw);
+    ctx.closePath();
+  } else tracePath(ctx, g);
+}
+
+/**
+ * LAYER_SELECTION_SHADOWS in KiCad's default schematic theme (builtin_color_themes.h): a lighter blue on macOS,
+ * which "looks better with a lighter shadow", (.4, .7, 1.0) elsewhere, both at 0.8.
+ */
+export const SCH_SELECTION_SHADOW = SCH_DEFAULT.selection;   // KiCad Default's; the live theme's is SCH.selection
+/** eeschema's selection.thickness / highlight_thickness (EESCHEMA_SETTINGS: 3 and 2). */
+export const SCH_SELECTION_THICKNESS = 3, SCH_HIGHLIGHT_THICKNESS = 2;
+const MIL = 0.0254;
+/**
+ * KiCad's selection shadow (SCH_PAINTER, aLayer == LAYER_SELECTION_SHADOWS): every stroke of the item, pins and
+ * the glyphs of its text redrawn wider in the shadow colour, under the item itself.  getShadowWidth() adds
+ * `thickness` pixels plus `thickness` mils to each stroke; shapes are not filled (selection.fill_shapes is off).
+ * Canvas in document space; `under` is the caller's promise that the item is drawn over it afterwards.
+ */
+export function drawSelectionHalo(ctx: Ctx2D, doc: Doc, ids: Iterable<string>, s: number, dpr: number, hidden?: Set<string> | null, thickness = SCH_SELECTION_THICKNESS): void {
+  drawHalo(ctx, doc, ids, s, dpr, hidden, { color: SCH.selection, alpha: 1, extraPx: thickness, extraMm: thickness * MIL, strokesOnly: true });
+}
+
+/**
+ * SCH_PAINTER::draw( SCH_LINE ) on the shadow pass: a selected line end that is not itself selected (STARTPOINT /
+ * ENDPOINT, a click near one end or a box grabbing one end) gets drawDanglingIndicator's small square, half-size the
+ * shadowed line width / 2 plus UNSELECTED_END_SIZE / 2 (2 mils), stroked at the shadow width in the shadow colour
+ * Invert()ed and Brightened( 0.3 ).  The selection names a partly selected line "id#end:0" (start) / "id#end:1" (end);
+ * a line selected whole has both ends selected and no squares.
+ */
+export function drawLineEndShadows(ctx: Ctx2D, doc: Doc, keys: Iterable<string>, s: number, dpr: number, thickness = SCH_SELECTION_THICKNESS): void {
+  const ends = new Map<string, Set<number>>();
+  for (const k of keys) { const m = typeof k === "string" ? /^(.*)#end:([01])$/.exec(k) : null; if (m) { let e = ends.get(m[1]); if (!e) ends.set(m[1], e = new Set()); e.add(+m[2]); } }
+  if (!ends.size) return;
+  const shadowW = thickness * Math.max(1, dpr) / s + thickness * MIL;
+  const c = parseColor(SCH.selection);
+  const inv = c ? [255 - c[0], 255 - c[1], 255 - c[2]].map((v) => Math.round(v + (255 - v) * 0.3)) : [184, 130, 77];
+  ctx.save(); ctx.globalAlpha = 1; ctx.setLineDash([]); ctx.lineJoin = "miter"; ctx.strokeStyle = `rgba(${inv[0]},${inv[1]},${inv[2]},${c ? c[3] : 0.8})`; ctx.lineWidth = shadowW;
+  for (const [id, sel] of ends) {
+    const it = doc.items.get(id); if (!it || (it.kind !== "wire" && it.kind !== "bus" && it.kind !== "polyline")) continue;
+    const g = it.geom.find((x) => x.t === "poly" || x.t === "line"); if (!g) continue;
+    const pts = g.t === "poly" ? (g as { pts: number[][] }).pts : [[(g as { x1: number }).x1, (g as { y1: number }).y1], [(g as { x2: number }).x2, (g as { y2: number }).y2]];
+    if (!pts || pts.length < 2) continue;
+    const r = ((g.w || 0) + shadowW) / 2 + 2 * MIL;
+    for (const i of [0, 1]) { if (sel.has(i)) continue; const p = i ? pts[pts.length - 1] : pts[0]; ctx.strokeRect(p[0] - r, p[1] - r, 2 * r, 2 * r); }
+  }
+  ctx.restore();
+}
+
+/**
+ * SCH_PAINTER::draw( SCH_TEXTBOX ) on LAYER_SELECTION_SHADOWS: the whole box filled in the shadow colour, the glyphs
+ * without a shadow; a table draws each of its cells that way.  The boxes of a schematic text box / table, or null.
+ */
+export function shadowBoxes(it: { kind: string; node: SNode }): number[][] | null {
+  const kidOf = (n: SNode, k: string) => (n as unknown[]).find((c) => Array.isArray(c) && c[0] === k) as SNode | undefined;
+  const box = (n: SNode): number[] | null => {
+    const a = kidOf(n, "at") || kidOf(n, "start"), sz = kidOf(n, "size"), e = kidOf(n, "end"); if (!a) return null;
+    const x = +(a[1] as number), y = +(a[2] as number);
+    const x2 = sz ? x + +(sz[1] as number) : e ? +(e[1] as number) : x, y2 = sz ? y + +(sz[2] as number) : e ? +(e[2] as number) : y;
+    return [Math.min(x, x2), Math.min(y, y2), Math.max(x, x2), Math.max(y, y2)];
+  };
+  if (it.kind === "text_box") { const b = box(it.node); return b ? [b] : null; }
+  if (it.kind !== "table") return null;
+  const cells = kidOf(it.node, "cells"); if (!cells) return null;
+  const out: number[][] = [];
+  for (const c of (cells as unknown[]).slice(1)) {
+    if (!Array.isArray(c) || c[0] !== "table_cell") continue;
+    const sp = kidOf(c as SNode, "span"); if (sp && (+(sp[1] as number) <= 0 || +(sp[2] as number) <= 0)) continue;   // covered by a merged cell
+    const b = box(c as SNode); if (b) out.push(b);
+  }
+  return out.length ? out : null;
+}
+
+/**
+ * The anchors of the selected fields: a selected symbol selects its fields (SCH_SELECTION_TOOL::highlight runs
+ * SetSelected on the children), and SCH_PAINTER draws a selected field's anchor (drawAnchor) at its position.
+ */
+export function fieldAnchors(doc: Doc, keys: Iterable<string>, hidden?: Set<string> | null, dangling?: Set<string> | null, moving?: Set<string> | null): number[][] | null {
+  const out: number[][] = [];
+  for (const key of keys) {
+    const cut = typeof key === "string" ? key.indexOf("#") : -1, id = cut > 0 ? key.slice(0, cut) : key, sub = cut > 0 ? key.slice(cut + 1) : null;
+    const it = doc.items.get(id); if (!it) continue;
+    if (moving && moving.has(id)) continue;          // "parentMoving": no anchors while the item itself moves
+    if (moving && moving.has(key)) continue;         // a field moving on its own shows its umbilical line instead
+    const only = sub && sub.startsWith("field:") ? sub.slice(6) : null;
+    if (sub && !only) continue;                       // a selected pin has no field anchors
+    // SCH_PAINTER::draw( SCH_TEXT ): a selected text always shows its anchor, a local label only when it is not
+    // dangling (global, hierarchical and directive labels and sheet pins never do)
+    if (!only && (it.kind === "text" || (it.kind === "label" && !(dangling && dangling.has(id))))) {
+      const a = (it.node as unknown[]).find((c) => Array.isArray(c) && c[0] === "at") as unknown[] | undefined;
+      if (a) out.push([+(a[1] as number), +(a[2] as number)]);
+    }
+    if (!only && it.kind !== "symbol" && it.kind !== "label") continue;
+    const seen = new Set<string>();
+    for (const g of it.geom) {
+      if (g.t !== "text" || !g.field || seen.has(g.field) || (only && g.field !== only)) continue;
+      if (hidden && hidden.has(g.layer)) continue;
+      seen.add(g.field); out.push([g.x, g.y]);
+    }
+  }
+  return out.length ? out : null;
+}
+/**
+ * SCH_PAINTER::drawAnchor: a cross of TEXT_ANCHOR_SIZE (8 mils) radius plus 8/25 px, in LAYER_SCHEMATIC_ANCHOR
+ * blue at the dangling-indicator pen (default pen / 3); its shadow pass draws it in the selection shadow colour
+ * at the shadow width.
+ */
+export function drawFieldAnchors(ctx: Ctx2D, pts: number[][], s: number, dpr: number, shadow: boolean): void {
+  const px = dpr / s, r = 8 * MIL + (8 / 25) * px;
+  ctx.save(); ctx.globalAlpha = 1; ctx.setLineDash([]); ctx.lineCap = "round";
+  ctx.strokeStyle = shadow ? SCH.selection : SCH_ANCHOR_COLOR;
+  ctx.lineWidth = shadow ? SCH_SELECTION_THICKNESS * px + SCH_SELECTION_THICKNESS * MIL : Math.max(0.1524 / 3, px);
+  ctx.beginPath();
+  for (const [x, y] of pts) { ctx.moveTo(x - r, y); ctx.lineTo(x + r, y); ctx.moveTo(x, y - r); ctx.lineTo(x, y + r); }
+  ctx.stroke(); ctx.restore();
+}
+export const SCH_ANCHOR_COLOR = "#0000FF";   // LAYER_SCHEMATIC_ANCHOR
+
+/**
+ * A translucent halo around every geom of the given item ids: style = { color: css colour or (geomColour) → css colour,
+ * alpha, extraPx: width added to each stroke, in device px }.  Every id in the set gets its halo.
+ */
+export function drawHalo(ctx: Ctx2D, doc: Doc, ids: Iterable<string>, s: number, dpr: number, hidden: Set<string> | null | undefined, style: HaloStyle): void {
+  const minW = Math.max(1, dpr) / s, extra = style.extraPx * dpr / s + (style.extraMm || 0);
+  const colorFn = typeof style.color === "function" ? style.color : () => style.color as string;
+  const strokesOnly = !!style.strokesOnly;
+  const m = typeof (ctx as CanvasRenderingContext2D).getTransform === "function" ? (ctx as CanvasRenderingContext2D).getTransform() : null;
+  const base: Mat | null = m ? [m.a, m.b, m.c, m.d, m.e, m.f] as unknown as Mat : null;
+  ctx.save();
+  ctx.globalAlpha = style.alpha; ctx.lineJoin = "round"; ctx.lineCap = "round"; ctx.setLineDash([]);
+  const hops = doc.type === "sch" ? hopShapes(doc) : null;   // a hopping wire's shadow follows its hops (the same shape on every layer)
+  for (const key of ids) {
+    // "itemId#pin:N" / "itemId#field:Name" (schematic) and "footprintId#padIndex" (board) halo that part alone
+    const cut = typeof key === "string" ? key.indexOf("#") : -1, id = cut > 0 ? key.slice(0, cut) : key, sub = cut > 0 ? key.slice(cut + 1) : null;
+    const it = doc.items.get(id); if (!it || (sub !== null && doc.type === "pcb")) continue;   // a board pad brightens without a halo
+    if (strokesOnly && sub === null && doc.type === "sch") {
+      const boxes = shadowBoxes(it);
+      if (boxes) { ctx.fillStyle = colorFn(SCH.notes); for (const b of boxes) ctx.fillRect(b[0], b[1], b[2] - b[0], b[3] - b[1]); continue; }
+    }
+    for (const g of it.geom) {
+      if (hidden && hidden.has(g.layer)) continue;
+      if (sub !== null && (sub !== (g.pinNo !== undefined ? "pin:" + g.pinNo : g.field ? "field:" + g.field : ""))) continue;
+      if (strokesOnly && ((g as { noStroke?: boolean }).noStroke || g.noShadow)) continue;   // a sheet / body background fill, hatch lines: no stroke to shadow
+      const halo = colorFn(g.color as string); ctx.strokeStyle = halo; ctx.fillStyle = halo;
+      if (g.t === "text") {
+        // an outline face: the shadow follows the glyphs as they are drawn (same face, size, place and lines)
+        const OL = g.face && faceAvailable(g.face) && !(g as DrawTextG).knockout ? outlineLayout(g as unknown as DrawTextG) : null;
+        if (OL) { ctx.save(); drawOutlineText(ctx, g as unknown as DrawTextG, OL, halo, base, strokesOnly ? extra : extra + minW); ctx.restore(); continue; }
+        if (strokesOnly && base && HAS_PATH2D) {
+          // the glyphs themselves, each stroke widened (SCH_PAINTER draws shadow text with m_StrokeWidth + shadowWidth)
+          const tg = g as unknown as DrawTextG; const pen = tg.w > 0 ? tg.w : tg.size / 8;
+          ctx.save(); drawTextStroke(ctx, Object.assign({}, tg, { w: pen + extra, knockout: false, layoutW: tg.layoutW !== undefined ? tg.layoutW : pen }) as DrawTextG, minW + extra, halo, base, false); ctx.restore();
+          continue;
+        }
+        const w = typeof textWidth === "function" ? textWidth(g.text || "", g.size, g.w || 0.1524) : (g.text || "").length * g.size * 0.75;
+        const h = g.size * 1.35;
+        ctx.save(); ctx.translate(g.x, g.y); if (g.rot) ctx.rotate(-g.rot * Math.PI / 180); if (g.mirror) ctx.scale(-1, 1);
+        const x0 = g.h === "left" ? 0 : g.h === "right" ? -w : -w / 2, y0 = g.v === "top" ? 0 : g.v === "bottom" ? -h : -h / 2;
+        ctx.fillRect(x0 - extra / 2, y0 - extra / 4, w + extra, h + extra / 2); ctx.restore();
+        continue;
+      }
+      if (g.t === "image" && g.rot) { const cx = g.x + g.w / 2, cy = g.y + g.h / 2; ctx.save(); ctx.translate(cx, cy); ctx.rotate(-g.rot * Math.PI / 180); ctx.lineWidth = minW + extra; ctx.strokeRect(-g.w / 2, -g.h / 2, g.w, g.h); ctx.restore(); continue; }
+      if (g.t === "rect" || g.t === "image") { ctx.lineWidth = Math.max((g as RectGeom).wd || 0, minW) + extra; ctx.strokeRect(g.x, g.y, g.w, g.h); continue; }
+      if (g.t === "poly" && (!g.pts || g.pts.length < 2)) continue;
+      ctx.lineWidth = Math.max(g.w || 0, minW) + extra;
+      const hop = hops && g.t === "poly" ? hops.get(g) : undefined;
+      if (hop) { strokeHopShape(ctx, hop, null); continue; }
+      const p = (ctx as unknown as { __plot?: boolean }).__plot ? null : pathOf(g);
+      // strokes only: a shape filled in its own outline colour (a junction dot, a FILLED_SHAPE) keeps its fill
+      const fillIt = strokesOnly ? !!g.fill && g.fill === g.color : (g.fill || g.t === "pad" || g.t === "circle");
+      if (fillIt) { if (p) ctx.fill(p); else { ctx.beginPath(); tracePath(ctx, g); ctx.fill(); } }
+      if (p) ctx.stroke(p); else { ctx.beginPath(); tracePath(ctx, g); ctx.stroke(); }
+    }
+  }
+  ctx.restore();
+}
+
+export { cssFamily, faceAvailable, setFontData, fontData, allFontData } from "./outline-text";
+export type { FontBytes } from "./outline-text";
+
+const WANTED = new Set<string>();
+/**
+ * Tell the app that text in this face (and style) is about to be drawn: KiCadCanvas.onFontWanted(face, bold, italic),
+ * once per style.  The editor fetches the font from the project and calls fontChanged when it is on the page.
+ */
+export function wantFace(face: string, bold: boolean, italic: boolean): void {
+  const k = face + "|" + (bold ? "b" : "") + "|" + (italic ? "i" : "");
+  if (WANTED.has(k) || /^kicad font$/i.test(face)) return;
+  const cb = root.KiCadCanvas && root.KiCadCanvas.onFontWanted;
+  if (typeof cb !== "function") return;
+  WANTED.add(k);
+  try { cb(face, bold, italic); } catch (e) { /* the app's concern */ }
+}
+/** A font arrived on (or left) the page: look again whether the face can be drawn.  No face: every face. */
+export function fontChanged(face?: string): void {
+  olFontChanged(face);
+  if (face === undefined) WANTED.clear();
+}
+
+/** Text shorter than this on screen (device px of glyph height) is not drawn. */
+export const MIN_TEXT_PX = 2;
+
+/**
+ * Which text painter runs: "stroke" — KiCad's own stroke font (web/domains/pcb/canvas/stroke-font.ts), the default wherever
+ * Path2D exists — or "native", the canvas font fallback (headless contexts).  KiCadCanvas.textMode forces one.
+ */
+export function textMode(): "stroke" | "native" {
+  const m = root.KiCadCanvas && root.KiCadCanvas.textMode;
+  return m === "stroke" || m === "native" ? m : (HAS_PATH2D ? "stroke" : "native");
+}
+
+/**
+ * One text geometry in KiCad's stroke font.  The glyphs, the advance widths, ~{overbar} / _{sub} / ^{super}
+ * runs, the italic tilt and the anchor fudges are the ones FONT::Draw uses, so text lands where eeschema and
+ * pcbnew put it.  Under the flipped board view, text that is not side-specific — and every pad label — is
+ * re-mirrored with its justification swapped so it stays readable inside the same (mirrored) box.
+ */
+export function drawTextStroke(ctx: Ctx2D, g: DrawTextG, minW: number, color: string, base: Mat, flip: boolean, bgColor?: string | null): void {
+  let mirror = !!g.mirror, h = g.h;
+  if (flip && (g.padText || !SIDE_SPECIFIC.test(g.layer || ""))) { mirror = !mirror; h = flipH(h); }
+  const pen = g.w > 0 ? g.w : g.size / 8;
+  const text = g.raw || g.text || "";
+  const spec = { x: g.x, y: g.y, text, size: g.size, sizeX: g.sizeX, rot: g.rot || 0, mirror, h, v: g.v, pen, italic: !!g.italic, dy: 0 };
+  if (g.knockout) {
+    // PCB_TEXT knockout: the text box, inflated by GetKnockoutTextMargin, in the layer colour; the glyphs cut out in the background colour
+    const sx = g.sizeX! > 0 ? g.sizeX! : g.size, line = strokeLine(text, !!g.italic);
+    const lay = g.layoutW !== undefined ? g.layoutW : pen; const [ox, oy] = strokeOrigin(line.advance, h, g.v, lay / sx, lay / g.size); const m = Math.max(pen / 2, g.size / 9);
+    const a = -(g.rot || 0) * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a), mx = mirror ? -1 : 1;
+    ctx.setTransform(base[0] * c * mx, base[3] * sn * mx, -base[0] * sn, base[3] * c, base[0] * g.x + base[4], base[3] * g.y + base[5]);
+    // the glyph cell: capitals span 20/21 above the layout baseline and 1/21 below it (FONT_OFFSET)
+    ctx.fillStyle = color; ctx.fillRect(ox * sx - m, (oy - 20 / 21) * g.size - m, line.width * sx + 2 * m, g.size + 2 * m);
+    drawStrokeText(ctx, base, Object.assign(spec, { layoutPen: lay }), bgColor || PCB_BG, minW);
+    return;
+  }
+  // the glyphs sit where the item's own pen places them (a widened shadow pen must not shift the layout)
+  if (g.layoutW !== undefined) (spec as { layoutPen?: number }).layoutPen = g.layoutW;
+  if (g.multiline && text.indexOf("\n") >= 0) {
+    // a drawing-sheet field carrying a \n: lines an interline apart, the block placed per EDA_TEXT::GetLinePositions
+    const lines = splitLines(text), step = g.size * TEXT_INTERLINE, offs = lineOffsets(lines.length, g.v);
+    for (let i = 0; i < lines.length; i++) { spec.text = lines[i]; spec.dy = offs[i] * step; drawStrokeText(ctx, base, spec, color, minW); }
+    return;
+  }
+  drawStrokeText(ctx, base, spec, color, minW);
+}
+
+/**
+ * FONT::drawMarkup with a mouse position: the url node under it is drawn again in LAYER_HOVERED (clipped to its own
+ * glyph box) and underlined from the node's start to its end, the bar trimmed 0.1·size at each end.
+ */
+export function drawRunHover(ctx: Ctx2D, g: DrawTextG, run: { start: number; end: number }, s: number, docType: string, minW: number, base: Mat, bg: string): void {
+  const b = urlRunBox(g, run.start, run.end); if (!(b.x1 > b.x0)) return;
+  const a = -(g.rot || 0) * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a), mx = g.mirror ? -1 : 1;
+  const local = () => ctx.setTransform(base[0] * c * mx, base[3] * sn * mx, -base[0] * sn, base[3] * c, base[0] * g.x + base[4], base[3] * g.y + base[5]);
+  ctx.save(); local();
+  ctx.beginPath(); ctx.rect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0); ctx.clip();
+  ctx.setTransform(base[0], base[1], base[2], base[3], base[4], base[5]);
+  drawText(ctx, g, s, docType, minW, SCH.hovered, base, false, bg);
+  ctx.restore();
+  local();
+  const trim = 0.1 * g.size, y = b.base + 0.16 * g.size;
+  ctx.strokeStyle = SCH.hovered; ctx.lineWidth = Math.max(g.w || g.size / 8, minW); ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(b.x0 + trim, y); ctx.lineTo(b.x1 - trim, y); ctx.stroke();
+  ctx.setTransform(base[0], base[1], base[2], base[3], base[4], base[5]);
+}
+
+/**
+ * FONT::drawSingleLineText's underline: a bar 0.16·size under the baseline (METRICS::m_UnderlineOffset), trimmed
+ * 0.1·size at each end so its round caps do not overhang, in the text's own pen.
+ */
+export function drawUnderline(ctx: Ctx2D, g: DrawTextG, color: string, minW: number, base: Mat): void {
+  const lines = g.multiline && g.text.indexOf("\n") >= 0 ? splitLines(g.text) : [g.text];
+  const a = -(g.rot || 0) * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a), mx = g.mirror ? -1 : 1;
+  ctx.setTransform(base[0] * c * mx, base[3] * sn * mx, -base[0] * sn, base[3] * c, base[0] * g.x + base[4], base[3] * g.y + base[5]);
+  const base0 = g.v === "top" ? g.size : g.v === "bottom" ? 0 : g.size / 2;
+  const step = g.size * TEXT_INTERLINE, offs = lineOffsets(lines.length, g.v);
+  ctx.strokeStyle = color; ctx.lineWidth = Math.max(g.w || g.size / 8, minW); ctx.lineCap = "round"; ctx.beginPath();
+  for (let i = 0; i < lines.length; i++) {
+    const w = textWidth(lines[i], g.size, g.w || 0); if (!w) continue;
+    const x0 = g.h === "left" ? 0 : g.h === "right" ? -w : -w / 2, y = base0 + offs[i] * step + 0.16 * g.size, trim = 0.1 * g.size;
+    ctx.moveTo(x0 + trim, y); ctx.lineTo(x0 + w - trim, y);
+  }
+  ctx.stroke();
+  ctx.setTransform(base[0], base[1], base[2], base[3], base[4], base[5]);
+}
+
+/**
+ * One text run: KiCad's size is the cap height; the baseline sits size/2 below a "middle" anchor.  The text's
+ * local frame (anchor, rotation, mirror) is composed with `base` (the document → device matrix) into a single
+ * setTransform.  Under the flipped board view, text that is not side-specific — and every pad label — is
+ * re-mirrored with its justification swapped so it stays readable inside the same (mirrored) box.
+ */
+export function drawText(ctx: Ctx2D, g: DrawTextG, s: number, docType: string, minW: number, colorOverride: string | null | undefined, base: Mat | null, flip: boolean, bgColor?: string | null): void {
+  const px = g.size * s; if (px < (g.minPx || MIN_TEXT_PX)) return;
+  const color = (colorOverride || g.color) as string;
+  if (g.face) wantFace(g.face, !!g.bold, !!g.italic);
+  const outline = !!g.face && faceAvailable(g.face);
+  if (outline && !g.knockout && !g.padText) {
+    // an outline face, laid out as KiCad's OUTLINE_FONT places it (outline-text.ts)
+    const flipIt = flip && !SIDE_SPECIFIC.test(g.layer || "");
+    const L = outlineLayout(flipIt ? Object.assign({}, g, { mirror: !g.mirror, h: flipH(g.h) }) : g);
+    if (L) { drawOutlineText(ctx, g, L, color, base, 0); return; }
+  }
+  if (!outline && textMode() === "stroke") {
+    let b = base;
+    if (!b && typeof ctx.getTransform === "function") { const m = ctx.getTransform(); b = [m.a, m.b, m.c, m.d, m.e, m.f]; }
+    if (b) { drawTextStroke(ctx, g, minW, color, b, flip, bgColor); return; }
+  }
+  const a = -(g.rot || 0) * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a);
+  let mx = g.mirror ? -1 : 1, h = g.h;
+  if (flip && (g.padText || !SIDE_SPECIFIC.test(g.layer || ""))) { mx = -mx; h = flipH(h); }
+  if (base) ctx.setTransform(base[0] * c * mx, base[3] * sn * mx, -base[0] * sn, base[3] * c, base[0] * g.x + base[4], base[3] * g.y + base[5]);
+  else { ctx.save(); ctx.translate(g.x, g.y); if (a) ctx.rotate(a); if (mx < 0) ctx.scale(-1, 1); }
+  // KiCad's bold/italic are a thicker and a sheared stroke font; with a real face the equivalent is
+  // the face's own weight and slant.  Only geometry that asks for them (the drawing sheet) is affected.
+  // An outline font (effects (font (face "…"))) is drawn in that face: KiCad's FONT::GetFont by name.
+  const key = outline ? `${g.size}|${g.bold ? "b" : ""}${g.italic ? "i" : ""}|${g.face}` : g.bold || g.italic ? `${g.size}|${g.bold ? "b" : ""}${g.italic ? "i" : ""}` : g.size;
+  let font = FONT_CACHE.get(key);
+  if (!font) { font = `${g.italic ? "italic " : ""}${g.bold ? (outline ? "bold " : "600 ") : ""}${g.size * FONT_EM}px ${outline ? cssFamily(g.face!) + ", " : ""}${FONT_FAMILY}`; if (FONT_CACHE.size < 512) FONT_CACHE.set(key, font); }
+  ctx.font = font;
+  ctx.textAlign = h as CanvasTextAlign; ctx.textBaseline = "alphabetic";
+  const base0 = g.v === "top" ? g.size : g.v === "bottom" ? 0 : g.size / 2;
+  if (g.knockout) {
+    // PCB_TEXT knockout: the text box, inflated by GetKnockoutTextMargin, in the layer colour; the glyphs cut out in the background colour
+    const w = textWidth(g.text || "", g.size, g.w || 0), m = Math.max((g.w || 0) / 2, g.size / 9);
+    const x0 = h === "left" ? 0 : h === "right" ? -w : -w / 2;
+    ctx.fillStyle = color; ctx.fillRect(x0 - m, base0 - g.size - m, w + 2 * m, g.size + 2 * m);
+    ctx.fillStyle = bgColor || PCB_BG; ctx.fillText(g.text, 0, base0);
+    if (base) ctx.setTransform(base[0], base[1], base[2], base[3], base[4], base[5]); else ctx.restore();
+    return;
+  }
+  ctx.fillStyle = color;
+  if (g.padText) { ctx.fillText(g.text, 0, base0); if (base) ctx.setTransform(base[0], base[1], base[2], base[3], base[4], base[5]); else ctx.restore(); return; }
+  // stroke-font thickness beyond a filled face's own stem (~0.13·size) reads as bold; text that
+  // already carries the bold flag gets its weight from the face instead of a second stroke pass
+  const extra = g.bold || outline ? 0 : g.w - 0.13 * g.size;
+  const boldPass = extra > 0.01 && docType === "pcb";
+  if (boldPass) { ctx.lineWidth = extra; ctx.strokeStyle = color; ctx.lineJoin = "round"; }
+  // A drawing-sheet field carrying a \n is a multiline run: KiCad lays the lines out an interline
+  // apart and centres the block on the anchor (EDA_TEXT::GetLinePositions, common/eda_text.cpp:937-978).
+  const lines = g.multiline && g.text.indexOf("\n") >= 0 ? splitLines(g.text) : null;
+  if (lines) {
+    const step = g.size * TEXT_INTERLINE, offs = lineOffsets(lines.length, g.v);
+    for (let i = 0; i < lines.length; i++) { const y = base0 + offs[i] * step; if (boldPass) ctx.strokeText(lines[i], 0, y); ctx.fillText(lines[i], 0, y); }
+  } else {
+    if (boldPass) ctx.strokeText(g.text, 0, base0);
+    ctx.fillText(g.text, 0, base0);
+  }
+  if (g.bars && ctx.measureText) {
+    // overbar: KiCad draws it 1.23·size above the baseline with the text pen
+    const total = ctx.measureText(g.text).width; const shift = h === "center" ? -total / 2 : h === "right" ? -total : 0;
+    const y = base0 - g.size * (docType === "pcb" ? 1.23 : schFormat.overbarHeight); ctx.lineWidth = Math.max(g.w || g.size / 8, minW); ctx.strokeStyle = color; ctx.beginPath();
+    for (const [i0, i1] of g.bars) { const x0 = shift + ctx.measureText(g.text.slice(0, i0)).width, x1 = shift + ctx.measureText(g.text.slice(0, i1)).width; ctx.moveTo(x0, y); ctx.lineTo(x1, y); }
+    ctx.stroke();
+  }
+  if (base) ctx.setTransform(base[0], base[1], base[2], base[3], base[4], base[5]); else ctx.restore();
+}
+
+/**
+ * One line of an outline-font text where outlineLayout puts it: the face drawn at a 100 px em scaled to the text (so
+ * the browser's hinting at tiny sizes cannot move the glyphs off the advances the layout measured), an upright-only
+ * family slanted 12 degrees about the baseline as OUTLINE_FONT does, overbars 1.23 heights above the baseline.
+ * `halo` > 0 draws the selection shadow instead: the same glyphs filled and their outlines stroked that wide
+ * (SCH_PAINTER drawText / drawCache with a shadow width: every outline glyph polygon drawn with the shadow pen).
+ */
+export function drawOutlineText(ctx: Ctx2D, g: DrawTextG, L: OutlineLayout, color: string, base: Mat | null, halo: number): void {
+  const a = -L.rot * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a), mx = L.mirror ? -1 : 1;
+  if (base) ctx.setTransform(base[0] * c * mx, base[3] * sn * mx, -base[0] * sn, base[3] * c, base[0] * L.ox + base[4], base[3] * L.oy + base[5]);
+  else { ctx.save(); ctx.translate(L.ox, L.oy); if (a) ctx.rotate(a); if (mx < 0) ctx.scale(-1, 1); }
+  ctx.fillStyle = color; ctx.strokeStyle = color; ctx.lineJoin = "round"; ctx.lineCap = "round";
+  if (g.bars && g.bars.length) {
+    // FONT::drawMarkup's overbar: a pen-wide bar over the run, a tenth of the width short at each end
+    const y = L.baseline - L.size * OUTLINE_OVERBAR;
+    ctx.lineWidth = Math.max(g.w || L.size / 8, 0) + halo; ctx.beginPath();
+    for (const [i0, i1] of g.bars) {
+      const x0 = L.x + L.metrics.advance(L.text.slice(0, i0)) * L.emX, x1 = L.x + L.metrics.advance(L.text.slice(0, i1)) * L.emX;
+      if (x1 > x0) { ctx.moveTo(x0 + 0.1 * L.sizeX, y); ctx.lineTo(x1 - 0.1 * L.sizeX, y); }
+    }
+    ctx.stroke();
+  }
+  ctx.transform(L.emX / 100, 0, 0, L.em / 100, L.x, L.baseline);
+  if (L.metrics.slant) ctx.transform(1, 0, -FAKE_ITALIC_SLANT, 1, 0, 0);
+  ctx.font = L.metrics.css.replace("1px", "100px");
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  if (halo > 0) { ctx.lineWidth = halo * 100 / L.em; ctx.strokeText(L.text, 0, 0); }
+  ctx.fillText(L.text, 0, 0);
+  if (base) ctx.setTransform(base[0], base[1], base[2], base[3], base[4], base[5]); else ctx.restore();
+}
+/** METRICS::m_OverbarHeight: an outline font's overbar sits this many text heights above the baseline. */
+export const OUTLINE_OVERBAR = 1.23;
+
+/**
+ * KiCad's drawing sheet under the document: the frame rectangles, the 50 mm tick band with its
+ * A/B/C · 1/2/3 labels and the title block, from web/domains/pcb/canvas/sheet.ts's reading of the built-in
+ * (kicad_wks …) description — then DS_PAINTER::DrawBorder's page outline on top of it.
+ *
+ * Every stroke is the description's own width (0.15 mm for the built-in sheet; DS_RENDER_SETTINGS
+ * carries a default pen of 0, so KiCad's max() never raises it), floored at one device pixel so it
+ * does not disappear when zoomed out.  The page outline is KiCad's hairline in the lighter
+ * page-limits colour — the bug this replaces painted that rectangle in the sheet's dark red and
+ * drew nothing else.  Colours: eeschema LAYER_SCHEMATIC_DRAWINGSHEET / _PAGE_LIMITS, pcbnew
+ * LAYER_DRAWINGSHEET / LAYER_PAGE_LIMITS (ds_proxy_view_item.cpp:130-148, sch_view.cpp:137-138).
+ */
+export function drawDrawingSheet(ctx: Ctx2D, doc: Doc, s: number, minW: number, pageLimits = true): void {
+  const isPcb = doc.type === "pcb";
+  const ink = isPcb ? OC.drawingSheet || PCB_SHEET : SCH.frame;
+  const items = documentDrawingSheet(doc);
+  ctx.strokeStyle = ink; ctx.fillStyle = ink; ctx.lineCap = "butt"; ctx.lineJoin = "miter";
+  let width = -1;
+  const setWidth = (w: number) => { const lw = Math.max(w, minW); if (lw !== width) { width = lw; ctx.lineWidth = lw; } };
+  ctx.beginPath();
+  let open = false;
+  for (const it of items) {
+    if (it.t === "line" || it.t === "rect") {
+      const w = Math.max(it.t === "line" ? it.w : it.lw, minW);
+      if (open && w !== width) { ctx.stroke(); ctx.beginPath(); open = false; }
+      setWidth(w);
+      if (it.t === "line") { ctx.moveTo(it.x1, it.y1); ctx.lineTo(it.x2, it.y2); }
+      else ctx.rect(it.x, it.y, it.w, it.h);
+      open = true;
+    }
+  }
+  if (open) ctx.stroke();
+  for (const it of items) {
+    if (it.t !== "text") continue;
+    drawText(ctx, { t: "text", x: it.x, y: it.y, text: it.text, size: it.size, w: it.w, color: it.color || ink,
+      rot: it.rot, h: it.h, v: it.v, bold: it.bold, italic: it.italic, multiline: it.multiline, minPx: 3 }, s, doc.type, minW, null, null, false, null);
+  }
+  // DS_PAINTER::DrawBorder (ds_painter.cpp:383-396): the paper outline, last, in the page-limits colour (not plotted)
+  if ((ctx as unknown as { __plot?: boolean }).__plot || !pageLimits) return;   // DS_PROXY_VIEW_ITEM::ViewDraw: settings->GetShowPageLimits()
+  ctx.strokeStyle = isPcb ? PCB_PAGE_LIMITS : SCH.pageLimits;
+  ctx.lineWidth = minW;
+  ctx.strokeRect(0, 0, doc.page[0], doc.page[1]);
+}
+
+
+/** Put the canvas into document space (mm) for a given view — for tool overlays; pass the document as `flipDoc` to match the flipped board view. */
+export function setViewTransform(ctx: Ctx2D, view: View, flipDoc?: { bbox?: Box | null } | null): number {
+  const dpr = view.dpr || 1, s = view.ppm * view.zoom * dpr;
+  const tx = view.panX * dpr - view.x0 * s, ty = view.panY * dpr - view.y0 * s;
+  if (flipDoc) ctx.setTransform(-s, 0, 0, s, tx + 2 * flipCentre(flipDoc) * s, ty); else ctx.setTransform(s, 0, 0, s, tx, ty);
+  return s;
+}
+
+export function drawPad(ctx: Ctx2D, g: PadGeom, minW: number): void {
+  ctx.beginPath(); tracePad(ctx, g);
+  if (g.fill) { ctx.fillStyle = g.fill; ctx.fill(); }
+  if (!g.fill || g.w === 0.1) { ctx.strokeStyle = g.color as string; ctx.lineWidth = Math.max(0.05, minW); ctx.stroke(); }
+}

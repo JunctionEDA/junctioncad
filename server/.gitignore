@@ -1,0 +1,9 @@
+target
+.env
+node_modules
+libs-cache
+render-cache
+static/dist/pyodide
+# written by scripts/gen-cad-registry.mjs (npm run gen:cad) from the files in the domains' folders
+web/domains/mechanical/generated
+web/domains/assembly/generated

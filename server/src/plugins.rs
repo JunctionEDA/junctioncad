@@ -1,0 +1,701 @@
+//! Web editor plugins (web/domains/pcb/plugins): the per-account store and the example plugins (server/plugins/examples).
+//!
+//! The server's part is deliberately small.  A plugin is code that runs in a sandbox in the
+//! browser of the person who installed it (web/domains/pcb/plugins/sandbox.ts) and reaches the design
+//! only through that person's own editor, so nothing a plugin does arrives here except as
+//! the ordinary collaboration ops the editor sends for any edit — with that person's role
+//! deciding, as always, whether they are accepted.  What is kept here is the copy: the
+//! manifest, the plugin's text files, what the person granted, and whether it is enabled.
+//!
+//! The server never fetches a plugin from an address.  The browser does that and uploads
+//! the result, so this endpoint cannot be used to make the server request arbitrary URLs.
+
+use axum::extract::{Path, State};
+use axum::Json;
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+use sqlx::Row;
+
+use crate::auth::AuthUser;
+use crate::error::{AppError, AppResult};
+use crate::lenient_json::LenientJson;
+use crate::AppState;
+
+const MAX_PLUGINS: i64 = 60;
+const MAX_FILES: usize = 40;
+const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: usize = 128 * 1024;
+
+/// The example plugins (server/plugins/examples/<folder>), the worked examples the developer guide points at.  They
+/// used to be listed in the Plugin Manager as "Built in"; now they live in the repository only.  The server still knows
+/// them so that copies installed back then, and projects that recommend one, keep working, and so that nobody can
+/// publish under their identifiers.
+const CATALOG: &[(&str, &[(&str, &str)])] = &[
+    (include_str!("../plugins/examples/bom-export/plugin.json"), &[("main.js", include_str!("../plugins/examples/bom-export/main.js"))]),
+    (include_str!("../plugins/examples/design-stats/plugin.json"), &[
+        ("main.js", include_str!("../plugins/examples/design-stats/main.js")),
+        ("panel.html", include_str!("../plugins/examples/design-stats/panel.html")),
+    ]),
+    (include_str!("../plugins/examples/snap-to-grid/plugin.json"), &[("main.js", include_str!("../plugins/examples/snap-to-grid/main.js"))]),
+    (include_str!("../plugins/examples/field-lint/plugin.json"), &[("main.js", include_str!("../plugins/examples/field-lint/main.js"))]),
+    (include_str!("../plugins/examples/placement-import/plugin.json"), &[("main.js", include_str!("../plugins/examples/placement-import/main.js"))]),
+];
+
+fn bad(msg: impl Into<String>) -> AppError {
+    AppError::BadRequest(msg.into())
+}
+
+/// KiCad's plugin identifier rule (api/schemas/api.v1.schema.json).
+fn valid_identifier(id: &str) -> bool {
+    let b = id.as_bytes();
+    b.len() >= 2
+        && b.len() <= 100
+        && b[0].is_ascii_alphabetic()
+        && b[b.len() - 1].is_ascii_alphanumeric()
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+}
+
+fn valid_path(p: &str) -> bool {
+    !p.is_empty()
+        && p.len() <= 120
+        && !p.starts_with('/')
+        && !p.starts_with('.')
+        && !p.contains("..")
+        && !p.contains("//")
+        && p.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'/'))
+}
+
+const PERMISSIONS: &[&str] = &["design:read", "design:write", "view", "files:import", "files:export", "assistant", "network"];
+
+fn valid_permission(p: &str) -> bool {
+    if let Some(host) = p.strip_prefix("network:") {
+        return !host.is_empty()
+            && host.len() <= 255
+            && host.contains('.')
+            && host.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'-' | b'.' | b'*' | b':'));
+    }
+    PERMISSIONS.contains(&p)
+}
+
+/// The checks that matter for what is stored and later handed to a browser.  The browser
+/// validates the manifest in full before it asks (web/domains/pcb/plugins/types.ts); this is the part
+/// that must hold even for a request that did not come from our page.
+fn check(identifier: &str, manifest: &Value, files: &Map<String, Value>, granted: &[String]) -> AppResult<()> {
+    if !valid_identifier(identifier) {
+        return Err(bad("the plugin identifier is malformed"));
+    }
+    let m = manifest.as_object().ok_or_else(|| bad("manifest must be an object"))?;
+    if m.get("identifier").and_then(Value::as_str) != Some(identifier) {
+        return Err(bad("the manifest's identifier does not match the address"));
+    }
+    if m.get("name").and_then(Value::as_str).map(|s| s.is_empty() || s.len() > 200).unwrap_or(true) {
+        return Err(bad("the manifest needs a name"));
+    }
+    let runtime = m.get("runtime").and_then(Value::as_object).ok_or_else(|| bad("the manifest needs a runtime"))?;
+    // "kicad-python" is one of KiCad's own Python plugins, run by the Python runtime in the same
+    // sandbox (pcm.rs): larger, many files, and no entry point of its own.
+    let python = is_python(manifest);
+    if !python && runtime.get("type").and_then(Value::as_str) != Some("web") {
+        return Err(bad("only plugins with the \"web\" or \"kicad-python\" runtime are installed here; exec plugins belong to the desktop app"));
+    }
+    if serde_json::to_string(manifest).map(|s| s.len()).unwrap_or(usize::MAX) > MAX_MANIFEST_BYTES {
+        return Err(bad("the manifest is too large"));
+    }
+    let (max_files, max_bytes) = if python { (crate::pcm::MAX_PY_FILES, crate::pcm::MAX_PY_BYTES) } else { (MAX_FILES, MAX_FILE_BYTES) };
+    if files.len() > max_files {
+        return Err(bad(format!("a plugin holds at most {max_files} files")));
+    }
+    let mut total = 0usize;
+    for (path, body) in files {
+        if !(if python { crate::pcm::valid_py_path(path) } else { valid_path(path) }) {
+            return Err(bad(format!("\"{path}\" is not an acceptable file name")));
+        }
+        total += body.as_str().ok_or_else(|| bad("plugin files are text"))?.len();
+    }
+    if total > max_bytes {
+        return Err(bad(format!("the plugin is larger than {} MB", max_bytes / (1024 * 1024))));
+    }
+    if python {
+        if !files.keys().any(|k| k.starts_with("plugins/")) {
+            return Err(bad("a KiCad Python plugin keeps its code under plugins/"));
+        }
+    } else {
+        let entry = runtime.get("entrypoint").and_then(Value::as_str).ok_or_else(|| bad("runtime.entrypoint is required"))?;
+        if !files.contains_key(entry) {
+            return Err(bad("the entry point named in the manifest is missing"));
+        }
+    }
+    // What is granted can only be something the manifest asks for: a client cannot hand a
+    // plugin more than its own description (and therefore the consent screen) showed.
+    let asked: Vec<&str> = m.get("permissions").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    for p in granted {
+        if !valid_permission(p) {
+            return Err(bad(format!("unknown permission \"{p}\"")));
+        }
+        if !asked.contains(&p.as_str()) {
+            return Err(bad(format!("\"{p}\" is not a permission this plugin asks for")));
+        }
+        // Network access exists only for KiCad's official Python plugins, towards the addresses their packages name (pcm.rs).
+        if p == "network" && !python {
+            return Err(bad("\"network\" is only available to KiCad's official Python plugins"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a manifest is one of KiCad's Python plugins (run by the Python runtime, pcm.rs).
+pub fn is_python(manifest: &Value) -> bool {
+    manifest.pointer("/runtime/type").and_then(Value::as_str) == Some("kicad-python")
+}
+
+fn row_json(r: &sqlx::postgres::PgRow) -> Value {
+    // A Python plugin's files run to megabytes; they are fetched when it starts (`plugin_files`), not with every list.
+    let manifest = r.get::<Value, _>("manifest");
+    let files = if is_python(&manifest) { json!({}) } else { r.get::<Value, _>("files") };
+    json!({
+        "identifier": r.get::<String, _>("identifier"),
+        "manifest": manifest,
+        "files": files,
+        "granted": r.get::<Value, _>("granted"),
+        "enabled": r.get::<bool, _>("enabled"),
+        "source": r.get::<String, _>("source"),
+        "withdrawn": r.get::<Option<String>, _>("withdrawn"),
+        "installedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("installed_at"),
+        "updatedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    })
+}
+
+/// `GET /api/plugins` — the signed-in person's plugins, with their files.
+pub async fn list(State(state): State<AppState>, AuthUser(user): AuthUser) -> AppResult<Json<Value>> {
+    let rows = sqlx::query("SELECT identifier, manifest, files, granted, enabled, source, withdrawn, installed_at, updated_at FROM plugins WHERE user_id = $1 ORDER BY installed_at, identifier")
+        .bind(user.id)
+        .fetch_all(&state.pool)
+        .await?;
+    Ok(Json(json!({ "plugins": rows.iter().map(row_json).collect::<Vec<_>>(), "admin": is_admin(&user.login) })))
+}
+
+/// `GET /api/plugins/{identifier}/files` — the files of one installed plugin.
+pub async fn plugin_files(State(state): State<AppState>, AuthUser(user): AuthUser, Path(identifier): Path<String>) -> AppResult<Json<Value>> {
+    let files: Option<Value> = sqlx::query_scalar("SELECT files FROM plugins WHERE user_id = $1 AND identifier = $2").bind(user.id).bind(&identifier).fetch_optional(&state.pool).await?;
+    Ok(Json(json!({ "files": files.ok_or(AppError::NotFound)? })))
+}
+
+#[derive(Deserialize)]
+pub struct InstallRequest {
+    manifest: Value,
+    files: Map<String, Value>,
+    #[serde(default)]
+    granted: Vec<String>,
+    #[serde(default)]
+    source: String,
+}
+
+/// `PUT /api/plugins/{identifier}` — install a plugin, or replace the installed copy.
+pub async fn install(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(identifier): Path<String>,
+    LenientJson(req): LenientJson<InstallRequest>,
+) -> AppResult<Json<Value>> {
+    check(&identifier, &req.manifest, &req.files, &req.granted)?;
+    let source: String = req.source.chars().filter(|c| !c.is_control()).take(500).collect();
+    let have: i64 = sqlx::query_scalar("SELECT count(*) FROM plugins WHERE user_id = $1 AND identifier <> $2")
+        .bind(user.id)
+        .bind(&identifier)
+        .fetch_one(&state.pool)
+        .await?;
+    if have >= MAX_PLUGINS {
+        return Err(bad(format!("an account holds at most {MAX_PLUGINS} plugins; uninstall one first")));
+    }
+    sqlx::query(
+        "INSERT INTO plugins (user_id, identifier, manifest, files, granted, source) VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (user_id, identifier) DO UPDATE SET manifest = EXCLUDED.manifest, files = EXCLUDED.files, granted = EXCLUDED.granted, source = EXCLUDED.source, withdrawn = NULL, updated_at = now()",
+    )
+    .bind(user.id)
+    .bind(&identifier)
+    .bind(&req.manifest)
+    .bind(Value::Object(req.files))
+    .bind(json!(req.granted))
+    .bind(&source)
+    .execute(&state.pool)
+    .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct StateRequest {
+    enabled: bool,
+}
+
+/// `POST /api/plugins/{identifier}/state` — enable or disable an installed plugin.
+pub async fn set_state(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(identifier): Path<String>,
+    LenientJson(req): LenientJson<StateRequest>,
+) -> AppResult<Json<Value>> {
+    let done = sqlx::query("UPDATE plugins SET enabled = $3 WHERE user_id = $1 AND identifier = $2")
+        .bind(user.id)
+        .bind(&identifier)
+        .bind(req.enabled)
+        .execute(&state.pool)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `DELETE /api/plugins/{identifier}`
+pub async fn uninstall(State(state): State<AppState>, AuthUser(user): AuthUser, Path(identifier): Path<String>) -> AppResult<Json<Value>> {
+    sqlx::query("DELETE FROM plugins WHERE user_id = $1 AND identifier = $2")
+        .bind(user.id)
+        .bind(&identifier)
+        .execute(&state.pool)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------- the community registry
+
+/// Identifiers under this prefix are the example plugins'; nobody may publish under it.
+const RESERVED_PREFIX: &str = "dev.notaroomba.kicad-collab.";
+
+fn catalog_entry(identifier: &str) -> Option<(Value, Map<String, Value>)> {
+    CATALOG.iter().find_map(|(manifest, files)| {
+        let manifest: Value = serde_json::from_str(manifest).ok()?;
+        if manifest.get("identifier").and_then(Value::as_str) != Some(identifier) {
+            return None;
+        }
+        Some((manifest, files.iter().map(|(k, v)| (k.to_string(), Value::String(v.to_string()))).collect()))
+    })
+}
+
+#[derive(Deserialize)]
+pub struct RegistryQuery {
+    #[serde(default)]
+    q: String,
+}
+
+/// `GET /api/plugins/registry?q=` — published plugins, newest first, with who published
+/// each and how many people have it installed.  Public, like the catalog; files are left
+/// out of the listing and fetched per plugin.
+pub async fn registry_list(State(state): State<AppState>, axum::extract::Query(query): axum::extract::Query<RegistryQuery>) -> AppResult<Json<Value>> {
+    let q: String = query.q.trim().chars().take(80).collect();
+    let like = format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+    let rows = sqlx::query(
+        "SELECT r.identifier, r.manifest, r.published_at, r.updated_at, u.login,
+                (SELECT count(*) FROM plugins p WHERE p.identifier = r.identifier AND p.source LIKE 'registry:%') AS installs
+         FROM plugin_registry r JOIN users u ON u.id = r.owner_id
+         WHERE r.status = 'listed' AND ($1 = '' OR r.identifier ILIKE $2 OR r.manifest->>'name' ILIKE $2 OR r.manifest->>'description' ILIKE $2 OR u.login ILIKE $2)
+         ORDER BY r.updated_at DESC LIMIT 200",
+    )
+    .bind(&q)
+    .bind(&like)
+    .fetch_all(&state.pool)
+    .await?;
+    let plugins: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "identifier": r.get::<String, _>("identifier"),
+                "manifest": r.get::<Value, _>("manifest"),
+                "publisher": r.get::<String, _>("login"),
+                "installs": r.get::<i64, _>("installs"),
+                "publishedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("published_at"),
+                "updatedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "plugins": plugins })))
+}
+
+/// `GET /api/plugins/registry/{identifier}` — one published plugin with its files.  One the
+/// administrators hid or removed answers with who published it, its status and the reason,
+/// and nothing to install.
+pub async fn registry_get(State(state): State<AppState>, Path(identifier): Path<String>) -> AppResult<Json<Value>> {
+    let r = sqlx::query("SELECT r.manifest, r.files, r.updated_at, r.status, r.moderated_reason, u.login FROM plugin_registry r JOIN users u ON u.id = r.owner_id WHERE r.identifier = $1")
+        .bind(&identifier)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let status: String = r.get("status");
+    if status != "listed" {
+        return Ok(Json(json!({ "publisher": r.get::<String, _>("login"), "status": status, "reason": r.get::<Option<String>, _>("moderated_reason"),
+            "version": r.get::<Value, _>("manifest").get("version").cloned() })));
+    }
+    Ok(Json(json!({
+        "manifest": r.get::<Value, _>("manifest"),
+        "files": r.get::<Value, _>("files"),
+        "publisher": r.get::<String, _>("login"),
+        "status": status,
+        "updatedAt": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct PublishRequest {
+    manifest: Value,
+    files: Map<String, Value>,
+}
+
+/// `PUT /api/plugins/registry/{identifier}` — publish a plugin, or a new version of one
+/// the caller published.  The identifier is theirs from then on.
+pub async fn registry_publish(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(identifier): Path<String>,
+    LenientJson(req): LenientJson<PublishRequest>,
+) -> AppResult<Json<Value>> {
+    check(&identifier, &req.manifest, &req.files, &[])?;
+    if is_python(&req.manifest) {
+        return Err(bad("KiCad's own Python plugins are installed from KiCad's repository; they are not republished here"));
+    }
+    if identifier.starts_with(RESERVED_PREFIX) || catalog_entry(&identifier).is_some() {
+        return Err(bad("that identifier belongs to Junction's example plugins; publish under an identifier of your own"));
+    }
+    if req.manifest.get("version").and_then(Value::as_str).map(|v| v.is_empty() || v.len() > 40).unwrap_or(true) {
+        return Err(bad("a published plugin needs a version in its manifest, so people can tell an update from what they have"));
+    }
+    let prev = sqlx::query("SELECT owner_id, status FROM plugin_registry WHERE identifier = $1").bind(&identifier).fetch_optional(&state.pool).await?;
+    let owner: Option<i64> = prev.as_ref().map(|r| r.get("owner_id"));
+    if prev.as_ref().is_some_and(|r| r.get::<String, _>("status") != "listed") {
+        return Err(AppError::Api(axum::http::StatusCode::FORBIDDEN, "moderated", "the administrators took this plugin out of the registry, so it cannot be published again".into()));
+    }
+    if owner.is_some_and(|o| o != user.id) {
+        return Err(AppError::Api(axum::http::StatusCode::CONFLICT, "identifier_taken", "someone else has published a plugin with that identifier".into()));
+    }
+    let mine: i64 = sqlx::query_scalar("SELECT count(*) FROM plugin_registry WHERE owner_id = $1 AND identifier <> $2").bind(user.id).bind(&identifier).fetch_one(&state.pool).await?;
+    if mine >= MAX_PLUGINS {
+        return Err(bad(format!("an account publishes at most {MAX_PLUGINS} plugins")));
+    }
+    sqlx::query(
+        "INSERT INTO plugin_registry (identifier, owner_id, manifest, files) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (identifier) DO UPDATE SET manifest = EXCLUDED.manifest, files = EXCLUDED.files, updated_at = now() WHERE plugin_registry.owner_id = EXCLUDED.owner_id",
+    )
+    .bind(&identifier)
+    .bind(user.id)
+    .bind(&req.manifest)
+    .bind(Value::Object(req.files))
+    .execute(&state.pool)
+    .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `DELETE /api/plugins/registry/{identifier}` — unpublish.  Copies people already
+/// installed stay theirs; projects stop recommending it.
+pub async fn registry_unpublish(State(state): State<AppState>, AuthUser(user): AuthUser, Path(identifier): Path<String>) -> AppResult<Json<Value>> {
+    let done = sqlx::query("DELETE FROM plugin_registry WHERE identifier = $1 AND owner_id = $2 AND status = 'listed'").bind(&identifier).bind(user.id).execute(&state.pool).await?;
+    if done.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    sqlx::query("DELETE FROM project_plugins WHERE identifier = $1 AND origin = 'registry'").bind(&identifier).execute(&state.pool).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------- reports and moderation
+
+/// The server's administrators: the GitHub logins in `KC_ADMINS` (comma separated).  They
+/// moderate the registry; they have no other powers.
+pub(crate) fn is_admin(login: &str) -> bool {
+    std::env::var("KC_ADMINS").map(|v| v.split(',').any(|a| !a.trim().is_empty() && a.trim().eq_ignore_ascii_case(login))).unwrap_or(false)
+}
+
+fn reason_of(text: &str, max: usize) -> String {
+    text.trim().chars().filter(|c| !c.is_control() || *c == '\n').take(max).collect()
+}
+
+#[derive(Deserialize)]
+pub struct ReportRequest {
+    reason: String,
+}
+
+/// `POST /api/plugins/registry/{identifier}/report` — tell the administrators something is
+/// wrong with a published plugin.  One report per person per plugin; a new one replaces it.
+pub async fn registry_report(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(identifier): Path<String>,
+    LenientJson(req): LenientJson<ReportRequest>,
+) -> AppResult<Json<Value>> {
+    let reason = reason_of(&req.reason, 1000);
+    if reason.chars().count() < 10 {
+        return Err(bad("say what is wrong with it, in a sentence or more"));
+    }
+    let listed: i64 = sqlx::query_scalar("SELECT count(*) FROM plugin_registry WHERE identifier = $1 AND status = 'listed'").bind(&identifier).fetch_one(&state.pool).await?;
+    if listed == 0 {
+        return Err(AppError::NotFound);
+    }
+    let open: i64 = sqlx::query_scalar("SELECT count(*) FROM plugin_reports WHERE reporter_id = $1 AND resolved_at IS NULL AND identifier <> $2").bind(user.id).bind(&identifier).fetch_one(&state.pool).await?;
+    if open >= 20 {
+        return Err(bad("you have many reports waiting already; the administrators will get to them"));
+    }
+    sqlx::query(
+        "INSERT INTO plugin_reports (identifier, reporter_id, reason) VALUES ($1, $2, $3)
+         ON CONFLICT (identifier, reporter_id) DO UPDATE SET reason = EXCLUDED.reason, created_at = now(), resolved_at = NULL",
+    )
+    .bind(&identifier)
+    .bind(user.id)
+    .bind(&reason)
+    .execute(&state.pool)
+    .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `GET /api/plugins/moderation` — for administrators: every published plugin that has an
+/// open report or is hidden or removed, with the reports.
+pub async fn moderation_list(State(state): State<AppState>, AuthUser(user): AuthUser) -> AppResult<Json<Value>> {
+    if !is_admin(&user.login) {
+        return Err(AppError::Forbidden);
+    }
+    let rows = sqlx::query(
+        "SELECT r.identifier, r.manifest, r.status, r.moderated_reason, r.updated_at, u.login,
+                (SELECT count(*) FROM plugins p WHERE p.identifier = r.identifier AND p.source LIKE 'registry:%') AS installs,
+                COALESCE((SELECT jsonb_agg(jsonb_build_object('reporter', ru.login, 'reason', pr.reason, 'at', pr.created_at) ORDER BY pr.created_at)
+                          FROM plugin_reports pr JOIN users ru ON ru.id = pr.reporter_id WHERE pr.identifier = r.identifier AND pr.resolved_at IS NULL), '[]'::jsonb) AS reports
+         FROM plugin_registry r JOIN users u ON u.id = r.owner_id
+         WHERE r.status <> 'listed' OR EXISTS (SELECT 1 FROM plugin_reports pr WHERE pr.identifier = r.identifier AND pr.resolved_at IS NULL)
+         ORDER BY (r.status = 'listed') DESC, r.updated_at DESC LIMIT 300",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let plugins: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "identifier": r.get::<String, _>("identifier"),
+                "manifest": r.get::<Value, _>("manifest"),
+                "publisher": r.get::<String, _>("login"),
+                "status": r.get::<String, _>("status"),
+                "reason": r.get::<Option<String>, _>("moderated_reason"),
+                "installs": r.get::<i64, _>("installs"),
+                "reports": r.get::<Value, _>("reports"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "plugins": plugins })))
+}
+
+#[derive(Deserialize)]
+pub struct ModerateRequest {
+    action: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// `POST /api/plugins/registry/{identifier}/moderate` — an administrator's decision on a
+/// published plugin: `hide` it (reversible), `restore` a hidden one, `remove` it for good,
+/// or `dismiss` its open reports.  Hiding or removing also switches off the copies people
+/// installed from the registry and tells them why; those copies stay theirs.
+pub async fn registry_moderate(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(identifier): Path<String>,
+    LenientJson(req): LenientJson<ModerateRequest>,
+) -> AppResult<Json<Value>> {
+    if !is_admin(&user.login) {
+        return Err(AppError::Forbidden);
+    }
+    let status: String = sqlx::query_scalar("SELECT status FROM plugin_registry WHERE identifier = $1").bind(&identifier).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
+    let reason = reason_of(&req.reason, 500);
+    let mut tx = state.pool.begin().await?;
+    match req.action.as_str() {
+        "hide" | "remove" => {
+            if status == "removed" {
+                return Err(bad("that plugin has been removed already"));
+            }
+            if reason.chars().count() < 5 {
+                return Err(bad("give a reason: the publisher and the people who installed it are shown it"));
+            }
+            if req.action == "remove" {
+                sqlx::query("UPDATE plugin_registry SET status = 'removed', files = '{}'::jsonb, moderated_reason = $2, moderated_at = now() WHERE identifier = $1").bind(&identifier).bind(&reason).execute(&mut *tx).await?;
+            } else {
+                sqlx::query("UPDATE plugin_registry SET status = 'hidden', moderated_reason = $2, moderated_at = now() WHERE identifier = $1").bind(&identifier).bind(&reason).execute(&mut *tx).await?;
+            }
+            sqlx::query("UPDATE plugins SET enabled = FALSE, withdrawn = $2 WHERE identifier = $1 AND source LIKE 'registry:%'").bind(&identifier).bind(&reason).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM project_plugins WHERE identifier = $1 AND origin = 'registry'").bind(&identifier).execute(&mut *tx).await?;
+        }
+        "restore" => {
+            if status != "hidden" {
+                return Err(bad("only a hidden plugin can be restored"));
+            }
+            sqlx::query("UPDATE plugin_registry SET status = 'listed', moderated_reason = NULL, moderated_at = now() WHERE identifier = $1").bind(&identifier).execute(&mut *tx).await?;
+            sqlx::query("UPDATE plugins SET withdrawn = NULL WHERE identifier = $1 AND source LIKE 'registry:%'").bind(&identifier).execute(&mut *tx).await?;
+        }
+        "dismiss" => {}
+        _ => return Err(bad("action is hide, restore, remove or dismiss")),
+    }
+    sqlx::query("UPDATE plugin_reports SET resolved_at = now() WHERE identifier = $1 AND resolved_at IS NULL").bind(&identifier).execute(&mut *tx).await?;
+    tx.commit().await?;
+    tracing::info!(admin = %user.login, plugin = %identifier, action = %req.action, "plugin registry moderation");
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------- what a project recommends
+
+/// `GET /api/projects/{id}/plugins` — the plugins this project suggests, each with the
+/// copy to install.  Anyone who can open the project can see them; seeing is all it does.
+pub async fn project_list(State(state): State<AppState>, AuthUser(user): AuthUser, Path(project_id): Path<uuid::Uuid>) -> AppResult<Json<Value>> {
+    let role = crate::persist::effective_role(&state.pool, user.id, project_id).await?.ok_or(AppError::Forbidden)?;
+    let rows = sqlx::query(
+        "SELECT pp.identifier, pp.origin, u.login AS added_by, r.manifest, r.files, ru.login AS publisher
+         FROM project_plugins pp
+         LEFT JOIN users u ON u.id = pp.added_by
+         LEFT JOIN plugin_registry r ON pp.origin = 'registry' AND r.identifier = pp.identifier AND r.status = 'listed'
+         LEFT JOIN users ru ON ru.id = r.owner_id
+         WHERE pp.project_id = $1 ORDER BY pp.added_at",
+    )
+    .bind(project_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut plugins = Vec::new();
+    for r in &rows {
+        let identifier: String = r.get("identifier");
+        let origin: String = r.get("origin");
+        let (manifest, files, publisher) = if origin == "catalog" {
+            match catalog_entry(&identifier) {
+                Some((m, f)) => (m, Value::Object(f), None),
+                None => continue,
+            }
+        } else {
+            match r.get::<Option<Value>, _>("manifest") {
+                Some(m) => (m, r.get::<Value, _>("files"), r.get::<Option<String>, _>("publisher")),
+                None => continue,
+            }
+        };
+        plugins.push(json!({ "identifier": identifier, "origin": origin, "addedBy": r.get::<Option<String>, _>("added_by"), "publisher": publisher, "manifest": manifest, "files": files }));
+    }
+    Ok(Json(json!({ "plugins": plugins, "canEdit": role == "editor" })))
+}
+
+#[derive(Deserialize)]
+pub struct RecommendRequest {
+    origin: String,
+}
+
+/// `PUT /api/projects/{id}/plugins/{identifier}` — an editor recommends a catalog or
+/// registry plugin to the project's collaborators.
+pub async fn project_recommend(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((project_id, identifier)): Path<(uuid::Uuid, String)>,
+    LenientJson(req): LenientJson<RecommendRequest>,
+) -> AppResult<Json<Value>> {
+    if crate::persist::effective_role(&state.pool, user.id, project_id).await?.as_deref() != Some("editor") {
+        return Err(AppError::Forbidden);
+    }
+    let known = match req.origin.as_str() {
+        "catalog" => catalog_entry(&identifier).is_some(),
+        "registry" => sqlx::query_scalar::<_, i64>("SELECT count(*) FROM plugin_registry WHERE identifier = $1 AND status = 'listed'").bind(&identifier).fetch_one(&state.pool).await? > 0,
+        _ => return Err(bad("origin is catalog or registry")),
+    };
+    if !known {
+        return Err(bad("only a plugin from the catalog or the registry can be recommended, so that collaborators can get it"));
+    }
+    let have: i64 = sqlx::query_scalar("SELECT count(*) FROM project_plugins WHERE project_id = $1").bind(project_id).fetch_one(&state.pool).await?;
+    if have >= 30 {
+        return Err(bad("a project recommends at most 30 plugins"));
+    }
+    sqlx::query("INSERT INTO project_plugins (project_id, identifier, origin, added_by) VALUES ($1, $2, $3, $4) ON CONFLICT (project_id, identifier) DO UPDATE SET origin = EXCLUDED.origin")
+        .bind(project_id)
+        .bind(&identifier)
+        .bind(&req.origin)
+        .bind(user.id)
+        .execute(&state.pool)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `DELETE /api/projects/{id}/plugins/{identifier}`
+pub async fn project_unrecommend(State(state): State<AppState>, AuthUser(user): AuthUser, Path((project_id, identifier)): Path<(uuid::Uuid, String)>) -> AppResult<Json<Value>> {
+    if crate::persist::effective_role(&state.pool, user.id, project_id).await?.as_deref() != Some("editor") {
+        return Err(AppError::Forbidden);
+    }
+    sqlx::query("DELETE FROM project_plugins WHERE project_id = $1 AND identifier = $2").bind(project_id).bind(&identifier).execute(&state.pool).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn files(entry: &str) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert(entry.to_string(), Value::String("kicad.actions.register('a', () => {});".into()));
+        m
+    }
+    fn manifest(perms: &[&str]) -> Value {
+        json!({ "identifier": "com.example.p", "name": "P", "description": "", "runtime": { "type": "web", "entrypoint": "main.js" }, "permissions": perms, "actions": [] })
+    }
+
+    #[test]
+    fn accepts_a_plain_plugin() {
+        assert!(check("com.example.p", &manifest(&["design:read"]), &files("main.js"), &["design:read".into()]).is_ok());
+    }
+
+    #[test]
+    fn grants_cannot_exceed_the_manifest() {
+        assert!(check("com.example.p", &manifest(&["design:read"]), &files("main.js"), &["design:write".into()]).is_err());
+        assert!(check("com.example.p", &manifest(&[]), &files("main.js"), &["network:evil.example".into()]).is_err());
+    }
+
+    #[test]
+    fn rejects_what_is_not_a_web_plugin() {
+        let mut m = manifest(&[]);
+        m["runtime"]["type"] = json!("python");
+        assert!(check("com.example.p", &m, &files("main.js"), &[]).is_err());
+        assert!(check("com.example.other", &manifest(&[]), &files("main.js"), &[]).is_err());
+        assert!(check("com.example.p", &manifest(&[]), &files("other.js"), &[]).is_err());
+        assert!(check("com.example.p", &manifest(&[]), &files("../main.js"), &[]).is_err());
+    }
+
+    #[test]
+    fn the_catalog_is_installable() {
+        for (m, fs) in CATALOG {
+            let m: Value = serde_json::from_str(m).unwrap();
+            let id = m["identifier"].as_str().unwrap().to_string();
+            let files: Map<String, Value> = fs.iter().map(|(k, v)| (k.to_string(), Value::String(v.to_string()))).collect();
+            let granted: Vec<String> = m["permissions"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().to_string()).collect();
+            check(&id, &m, &files, &granted).unwrap_or_else(|e| panic!("{id}: {e}"));
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Preferences > PCB Editor > Action Plugins
+
+const MAX_ACTION_ROWS: usize = 500;
+
+/// `GET /api/plugins/action-order` — the person's order of plugin actions and their toolbar buttons
+/// (PCBNEW_SETTINGS m_Plugins.actions: `[[identifier, visible], ...]`).
+pub async fn action_order(State(state): State<AppState>, AuthUser(user): AuthUser) -> AppResult<Json<Value>> {
+    let row: Option<Value> = sqlx::query_scalar("SELECT actions FROM plugin_action_order WHERE user_id = $1")
+        .bind(user.id)
+        .fetch_optional(&state.pool)
+        .await?;
+    Ok(Json(json!({ "actions": row.unwrap_or_else(|| json!([])) })))
+}
+
+/// `PUT /api/plugins/action-order` — save it, as the panel's TransferDataFromWindow does.
+pub async fn save_action_order(State(state): State<AppState>, AuthUser(user): AuthUser, LenientJson(body): LenientJson<Value>) -> AppResult<Json<Value>> {
+    let rows = body.get("actions").and_then(Value::as_array).ok_or_else(|| bad("actions must be a list"))?;
+    if rows.len() > MAX_ACTION_ROWS {
+        return Err(bad("too many actions"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in rows {
+        let pair = r.as_array().filter(|a| a.len() == 2).ok_or_else(|| bad("each action is [identifier, visible]"))?;
+        let id = pair[0].as_str().filter(|s| !s.is_empty() && s.len() <= 400).ok_or_else(|| bad("an action identifier is missing or too long"))?;
+        let visible = pair[1].as_bool().ok_or_else(|| bad("visible must be true or false"))?;
+        if seen.insert(id.to_string()) {
+            out.push(json!([id, visible]));
+        }
+    }
+    let actions = Value::Array(out);
+    sqlx::query("INSERT INTO plugin_action_order (user_id, actions, updated_at) VALUES ($1, $2, now()) ON CONFLICT (user_id) DO UPDATE SET actions = EXCLUDED.actions, updated_at = now()")
+        .bind(user.id)
+        .bind(&actions)
+        .execute(&state.pool)
+        .await?;
+    Ok(Json(json!({ "actions": actions })))
+}

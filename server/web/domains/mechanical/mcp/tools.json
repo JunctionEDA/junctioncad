@@ -1,0 +1,120 @@
+[
+  {
+    "name": "cad_feature_types",
+    "title": "Part studio feature types",
+    "write": false,
+    "description": "The kinds of feature a part studio can hold (sketch, extrude and whatever else this server has), read from the modeller's own feature registry: for each its type name, the default parameters of a new one, and every parameter with what it stores, its unit and its limits. Also how a sketch stores its geometry and the shorthand shapes cad_edit_features accepts. Read this once before adding or editing features.",
+    "input_schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cad_get_features",
+    "title": "Read a part studio",
+    "write": false,
+    "description": "The feature tree of a part studio, in build order: each feature's index, id, name, type, parameters, whether it is suppressed, and its state after a rebuild by the modelling kernel (ok, warning, error with the reason, suppressed or rolled-back). Also where the rollback bar is, and the bodies the features make with their volume, surface area, centre of mass and bounding box in millimetres. A sketch's geometry is summarised as counts unless entities is true. Call this before changing a part studio and whenever you need to know whether it builds.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name, as listed by list_projects." },
+        "document": { "type": "string", "description": "Which part studio: its path as listed by get_project (for example \"Bracket.jpart\"). May be left out when the project has only one." },
+        "entities": { "type": "boolean", "description": "Include every sketch's points and curves in full instead of a count." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cad_get_bodies",
+    "title": "Measure the bodies",
+    "write": false,
+    "description": "The solid bodies of a part studio as the kernel built them: volume (mm3), surface area (mm2), centre of mass, bounding box, and how many faces and edges each has. With names: true also the stable name of every face and edge, which is what a feature's reference ({ kind, body, name }) and a sketch on a face take. Use it to check a dimension or a volume after an edit.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name, as listed by list_projects." },
+        "document": { "type": "string", "description": "Which part studio: its path as listed by get_project. May be left out when the project has only one." },
+        "body": { "type": "string", "description": "Only this body: its id or name." },
+        "names": { "type": "boolean", "description": "List the names of the faces and edges." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cad_edit_features",
+    "title": "Edit a part studio",
+    "write": true,
+    "destructive": true,
+    "description": "Change the feature tree of a part studio: add, set parameters, rename, delete, suppress, reorder, or move the rollback bar. The edits are checked against the feature registry and applied together as one change through the same collaboration pipeline as a person's own edits, so everyone who has the part studio open sees it rebuild at once. If any edit is invalid nothing is applied and each problem is listed. Afterwards the model is rebuilt and the result says what every feature reports (a feature that fails says why) and what bodies exist, with a change_id that undo_changes takes to revert the whole call. With dry_run nothing is applied and the result is the part studio as it would be. Each edit is one of: { op: \"add\", type, name?, params?, ref?, after? | before? | index? } (a new feature at the rollback bar unless placed; ref names it so later edits in the same call can use \"$ref\" wherever a feature id goes, for example an extrude's profile); for a sketch also plane (\"top\", \"front\", \"right\" or a face reference) and shapes (rectangle, circle, polygon, line: see cad_feature_types); { op: \"set\", feature, params } (each key given replaces that parameter; for a sketch shapes replaces its geometry and entities: { id: entity | null } changes single points and curves); { op: \"rename\", feature, name }; { op: \"delete\", feature }; { op: \"suppress\", feature, suppressed }; { op: \"move\", feature, index | before | after }; { op: \"rollback\", before: feature | null }. feature is a feature's id or exact name. Example, a 40 x 20 x 10 block with a hole: [{ op: \"add\", type: \"sketch\", ref: \"s\", plane: \"top\", shapes: [{ type: \"rectangle\", x1: 0, y1: 0, x2: 40, y2: 20 }, { type: \"circle\", cx: 10, cy: 10, r: 3 }] }, { op: \"add\", type: \"extrude\", params: { profile: \"$s\", depth: 10 } }]. Only make changes the person asked for.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name, as listed by list_projects." },
+        "document": { "type": "string", "description": "Which part studio: its path as listed by get_project. May be left out when the project has only one." },
+        "edits": {
+          "type": "array",
+          "minItems": 1,
+          "description": "The edits, applied in order as one change.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": { "type": "string", "enum": ["add", "set", "rename", "delete", "suppress", "move", "rollback"] },
+              "type": { "type": "string", "description": "add: the feature type, from cad_feature_types." },
+              "feature": { "type": "string", "description": "The feature to change: its id, its exact name, or \"$ref\" of an add earlier in this call." },
+              "name": { "type": "string" },
+              "ref": { "type": "string", "description": "add: a name for the new feature inside this call." },
+              "params": { "type": "object", "description": "Parameters by key, as cad_feature_types describes them." },
+              "plane": { "description": "Sketch: \"top\", \"front\", \"right\", or { kind: \"face\", ref: { kind: \"face\", body, name } }." },
+              "shapes": { "type": "array", "description": "Sketch: the geometry as shapes; replaces what the sketch held.", "items": { "type": "object" } },
+              "entities": { "type": "object", "description": "Sketch, with set: single entities by id to add or replace; null removes one." },
+              "suppressed": { "type": "boolean" },
+              "index": { "type": "number", "description": "add, move: the position in the tree, 0 is the top." },
+              "before": { "description": "add, move: put it above this feature. rollback: the feature the bar goes above, or null for the end." },
+              "after": { "type": "string", "description": "add, move: put it below this feature." }
+            },
+            "required": ["op"]
+          }
+        },
+        "dry_run": { "type": "boolean", "description": "Check the edits and rebuild without changing anything." }
+      },
+      "required": ["project", "edits"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cad_render_view",
+    "title": "Render a part",
+    "write": false,
+    "description": "A shaded picture of the bodies of a part studio as they are right now, from a standard direction: iso (from the front right, above), top, bottom, front, back, left or right. Orthographic and framed on the bodies, with their edges drawn and an axis triad in the corner (X red, Y green, Z blue; Z is up). Use it to see whether a feature did what you meant after an edit.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name, as listed by list_projects." },
+        "document": { "type": "string", "description": "Which part studio: its path as listed by get_project. May be left out when the project has only one." },
+        "view": { "type": "string", "enum": ["iso", "top", "bottom", "front", "back", "left", "right"], "description": "Where to look from; iso when omitted." },
+        "width_px": { "type": "number", "description": "Width of the picture in pixels, 300 to 1600; 900 when omitted." },
+        "edges": { "type": "boolean", "description": "false leaves the edge lines out." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cad_create_part_studio",
+    "title": "Create a part studio",
+    "write": true,
+    "description": "Add a new, empty part studio (a .jpart document) to a project, for a mechanical part designed from sketches and features. Returns its path, which is what the document parameter of the other cad_ tools takes. Use it only when the person asks for a new part.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name, as listed by list_projects." },
+        "name": { "type": "string", "description": "The part studio's name, for example \"Bracket\". \"Part Studio N\" when omitted." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  }
+]

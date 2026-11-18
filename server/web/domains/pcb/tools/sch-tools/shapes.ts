@@ -1,0 +1,117 @@
+import type { SchCtx, Pt } from "./types";
+import { root } from "../root";
+import { commitSchArc, schArcClick } from "./arcs";
+import { closePrompt, labelDefaults, promptImpl } from "./dom";
+import { bezierNode, circleNode, ellipseArcAngles, ellipseFromBox, ellipseNode, polygonNode, polylineNode, rectangleNode, ruleAreaNode, sheetCorner, sheetNode, drawTableNode, textBoxNode } from "./nodes";
+import { rememberPlaced } from "./repeat";
+import { SHEET_EXT, nextPage, placeSheet, placeSheetNode, sheetFileFor, sheetInstance } from "./sheets";
+import { K, S, kids, str } from "./state";
+import { addNode, r4, same } from "./util";
+import { simplify } from "./wire";
+
+// ---------------------------------------------------------------- graphic shapes (KiCad's two/three-click drawing)
+// S.draw = { shape, pts (fixed clicks), cur (cursor) }: rect and textbox take two corners, circle its
+// centre then a radius point, arc its start, end and then a point on the arc, lines any number of
+// points until Enter, a double click or a click on the last point.
+export function drawPoint(ctx: SchCtx, mm: Pt) { return ctx.snap([mm[0], mm[1]]).map(r4); }
+export function startDraw(ctx: SchCtx, shape: string, p: Pt) { S.draw = { shape, pts: [p], cur: p.slice() }; ctx.requestRender(); }
+export function cancelDraw(ctx: SchCtx) { S.draw = null; closePrompt(); ctx.requestRender(); }
+export function undoDrawPoint(ctx: SchCtx) { const d = S.draw; if (!d) return; if (d.pts.length > 1) d.pts.pop(); else S.draw = null; ctx.requestRender(); }
+export function drawClick(ctx: SchCtx, shape: string, p: Pt) {
+  if (shape === "arc") { schArcClick(ctx, p); return; }   // EE_GRAPHIC_TOOL::DrawArc and its five drawing modes
+  const d = S.draw;
+  if (!d || d.shape !== shape) { startDraw(ctx, shape, p); return; }
+  d.cur = p.slice();
+  const last = d.pts[d.pts.length - 1];
+  if (shape === "lines" || shape === "polygon" || shape === "rulearea") {
+    if (same(p, last)) { finishDraw(ctx); return; }
+    if (shape !== "lines" && d.pts.length >= 3 && same(p, d.pts[0])) { finishDraw(ctx); return; }   // back on the first point closes it
+    d.pts.push(p); ctx.requestRender(); return;
+  }
+  if (shape === "ellipse_arc") {                   // the box's two corners, then the start and end points (ELLIPSE_GEOM_MANAGER)
+    if (d.pts.length === 1 && same(p, d.pts[0])) return;
+    d.pts.push(p); if (d.pts.length === 4) finishDraw(ctx); else ctx.requestRender(); return;
+  }
+  if (shape === "bezier") {                        // start, control 1, end, then the far handle (BEZIER_GEOM_MANAGER)
+    if (d.pts.length === 2 && same(p, d.pts[0])) { ctx.toast("The curve's end must differ from its start"); return; }
+    d.pts.push(p); if (d.pts.length === 4) finishDraw(ctx); else ctx.requestRender(); return;
+  }
+  if (shape === "sheet") { d.pts.push(sheetCorner(d.pts[0], p, ctx.gridPitch)); finishDraw(ctx); return; }   // sizeSheet: never smaller than the minimum
+  if (same(p, last) && shape !== "table") return;   // a zero-size shape is not a shape (a table is at least one cell)
+  d.pts.push(p); finishDraw(ctx);
+}
+export function finishDraw(ctx: SchCtx) {
+  const d = S.draw; if (!d) return;
+  const doc = ctx.doc, pts = d.pts; let node = null, label = d.shape;
+  if (d.shape === "rect") node = rectangleNode(pts[0], pts[1]), label = "rectangle";
+  else if (d.shape === "ellipse") { node = ellipseNode(ellipseFromBox(pts[0], pts[1]), false); label = "Draw Ellipse"; }
+  else if (d.shape === "ellipse_arc") { if (pts.length === 4) { const e = ellipseFromBox(pts[0], pts[1]); Object.assign(e, ellipseArcAngles(e, pts[2], pts[3])); node = ellipseNode(e, true); } label = "Draw Elliptical Arc"; }
+  else if (d.shape === "circle") node = circleNode(pts[0], Math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]));
+  else if (d.shape === "arc") { commitSchArc(ctx, d, false); ctx.requestRender(); return; }
+  else if (d.shape === "lines") { const p = simplify(pts); if (p.length >= 2) node = polylineNode(p); label = "lines"; }
+  else if (d.shape === "polygon") { const p = simplify(pts); if (p.length >= 3) node = polygonNode(p); }
+  else if (d.shape === "rulearea") { const p = simplify(pts); if (p.length >= 3) node = ruleAreaNode(p); label = "rule area"; }
+  else if (d.shape === "bezier") {
+    // KiCad's fourth click is the handle beyond the end: control 2 is its reflection over the end point
+    if (pts.length === 4) { const e = pts[2], c2 = [r4(2 * e[0] - pts[3][0]), r4(2 * e[1] - pts[3][1])]; node = bezierNode(pts[0], pts[1], c2, e); }
+  }
+  else if (d.shape === "table") {
+    // SCH_DRAWING_TOOLS::DrawTable: the second click fixes the table sized by the drag, then DIALOG_TABLE_PROPERTIES
+    // opens on it; OK adds it ("Draw Table") and selects it, Cancel drops it
+    const node = drawTableNode(pts[0], pts[1], ctx.gridPitch, labelDefaults().textSize);
+    d.await = true; ctx.requestRender();
+    const done = (n: SNode | null) => { if (S.draw !== d) return; S.draw = null; if (n) commitShape(ctx, n, "Draw Table"); ctx.requestRender(); };
+    const T = root.CollabTableCells;
+    if (T && T.newSchTableDialog && !ctx.viewOnly) { T.newSchTableDialog(ctx, node, done); return; }
+    done(node); return;
+  }
+  else if (d.shape === "sheet") {
+    // the rectangle is fixed; DIALOG_SHEET_PROPERTIES opens on "Untitled Sheet" / "untitled.kicad_sch", then the file is made
+    d.await = true; ctx.requestRender();
+    const KD = typeof root.KDialogs !== "undefined" ? root.KDialogs : null;
+    if (KD && KD.schItemDialog && !ctx.viewOnly) {
+      const pre = S.sheetPreset; S.sheetPreset = null;
+      const sn = pre ? sheetNode(pts[0], pts[1], pre.name, pre.file) : sheetNode(pts[0], pts[1], "Untitled Sheet", "untitled" + SHEET_EXT);
+      const inst = sheetInstance(ctx, ctx.doc, nextPage(ctx, ctx.doc)); if (inst) sn.push(inst);
+      const it = { id: "", kind: "sheet", node: sn, geom: [], bbox: null };
+      KD.schItemDialog(ctx, it, { cancel() { if (S.draw === d) { S.draw = null; ctx.requestRender(); } }, onCreate(staged) {
+        if (S.draw !== d) return; S.draw = null;
+        const fp = kids(staged, "property").find((q) => /^Sheet ?file$/i.test(str(q[1])));
+        placeSheetNode(ctx, staged, fp ? str(fp[2]) : "untitled" + SHEET_EXT);
+      } });
+      return;
+    }
+    promptImpl("Sheet name", "", S.cursorClient, (name) => {
+      if (S.draw !== d) return;
+      if (!name) { S.draw = null; ctx.requestRender(); return; }
+      promptImpl("Sheet file", sheetFileFor(name), S.cursorClient, (file) => {
+        if (S.draw !== d) return; S.draw = null;
+        if (file) placeSheet(ctx, pts[0], pts[1], name, file); else ctx.requestRender();
+      });
+    });
+    return;
+  }
+  else if (d.shape === "textbox") {
+    // the box is fixed; DIALOG_TEXT_PROPERTIES opens for its text, Cancel drops the box
+    d.await = true; ctx.requestRender();
+    const KD = typeof root.KDialogs !== "undefined" ? root.KDialogs : null;
+    if (KD && (KD.openNew as typeof KD.openNew | undefined) && !ctx.viewOnly) {
+      const tb = textBoxNode("", pts[0], pts[1]);
+      KD.openItem(ctx, { id: "", kind: "text_box", node: tb, geom: [], bbox: null }, { generic: true, cancel() { if (S.draw === d) { S.draw = null; ctx.requestRender(); } },
+        onCreate(staged) { if (S.draw !== d) return; S.draw = null; commitShape(ctx, staged, "text box"); ctx.requestRender(); } });
+      return;
+    }
+    promptImpl("Text box", "", S.cursorClient, (text) => { if (S.draw !== d) return; S.draw = null; if (text) commitShape(ctx, textBoxNode(text, pts[0], pts[1]), "text box"); ctx.requestRender(); });
+    return;
+  }
+  S.draw = null;
+  if (node) commitShape(ctx, node, label);
+  ctx.requestRender();
+}
+export function commitShape(ctx: SchCtx, node: SNode, label: string) {
+  const { item, change } = addNode(ctx.doc, node);
+  ctx.commit([change], label);
+  rememberPlaced(item.kind, item.node);
+  S.sel = item.id; ctx.setSelected(null);
+  return item;
+}

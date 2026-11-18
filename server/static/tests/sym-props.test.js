@@ -1,0 +1,153 @@
+// sym-props.test.js — DIALOG_SYMBOL_PROPERTIES' own logic (web/domains/pcb/dialogs/sym-props-logic.ts): the passthrough token,
+// local power, body style names, the composed reference suffix, SCH_SYMBOL::SyncOtherUnits / CollectOtherUnits and
+// the pin-to-pad maps of PANEL_SYMBOL_PIN_MAP.  Run: node server/static/tests/sym-props.test.js
+"use strict";
+const path = require("path"), assert = require("assert");
+const { webPath } = require("./web-path");
+require(path.join(__dirname, "..", "kicad-canvas.js"));
+const K = globalThis.KiCadCanvas;
+const esbuild = require("esbuild");
+function load(file) {
+  const out = esbuild.buildSync({ entryPoints: [webPath(file)], bundle: true, format: "cjs", write: false, platform: "node", logLevel: "silent" });
+  const m = { exports: {} }; new Function("module", "exports", "require", out.outputFiles[0].text)(m, m.exports, require); return m.exports;
+}
+const P = load("dialogs/sym-props-logic.ts");
+let passed = 0, failed = 0;
+function test(name, fn) { try { fn(); passed++; console.log("  ok   " + name); } catch (e) { failed++; console.log("  FAIL " + name + "\n       " + (e.stack || e).toString().split("\n").slice(0, 4).join("\n       ")); } }
+const S = (n) => K.serialize(n), N = (s) => K.parse(s);
+console.log("symbol properties logic under node");
+
+const SYM = `(symbol (lib_id "74xx:74HC00") (at 50 50 0) (unit 1) (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (fields_autoplaced yes) (uuid "u1")
+  (property "Reference" "U1" (at 52 48 0) (effects (font (size 1.27 1.27))))
+  (property "Value" "74HC00" (at 52 52 0) (effects (font (size 1.27 1.27))))
+  (property "Footprint" "Package_DIP:DIP-14" (at 50 50 0) (hide yes) (effects (font (size 1.27 1.27))))
+  (property "MPN" "SN74HC00N" (at 55 55 0) (hide yes) (effects (font (size 1.27 1.27))))
+  (pin "1" (uuid "p1") (alternate "IN_A")) (pin "2" (uuid "p2"))
+  (instances (project "demo" (path "/root" (reference "U1") (unit 1)))))`;
+
+test("passthrough: Default omits the token; Block / Force go after (dnp) and are read back", () => {
+  const n = N(SYM); assert.strictEqual(P.passthroughOf(n), "default");
+  P.setPassthrough(n, "block"); assert.ok(/\(dnp no\) \(passthrough block\) \(fields_autoplaced yes\)/.test(S(n)), S(n));
+  assert.strictEqual(P.passthroughOf(n), "block");
+  P.setPassthrough(n, "force"); assert.ok(/\(passthrough force\)/.test(S(n)) && !/block/.test(S(n)));
+  P.setPassthrough(n, "default"); assert.ok(!/passthrough/.test(S(n)));
+  const m = N(`(symbol (lib_id "x") (dnp no) (pin_map_override (mode identity)) (uuid "a"))`); P.setPassthrough(m, "block");
+  assert.ok(/\(pin_map_override \(mode identity\)\) \(passthrough block\)/.test(S(m)), S(m));
+});
+test("local power: (power local) / (power global); a non-power symbol is left alone", () => {
+  const g = N(`(symbol "power:GND" (power) (pin_names (offset 0)))`);
+  assert.ok(P.isPowerLib(g) && !P.isLocalPower(g));
+  assert.ok(P.setLocalPower(g, true)); assert.ok(/\(symbol "power:GND" \(power local\)/.test(S(g)), S(g)); assert.ok(P.isLocalPower(g));
+  assert.ok(P.setLocalPower(g, false)); assert.ok(/\(power global\)/.test(S(g)));
+  assert.ok(!P.setLocalPower(g, false), "no change, nothing written");
+  const r = N(`(symbol "Device:R" (pin_names (offset 0)))`); assert.ok(!P.setLocalPower(r, true)); assert.ok(!/power/.test(S(r)));
+});
+test("body styles: De Morgan reads Standard / Alternate, custom names from (body_styles …), else one", () => {
+  assert.deepStrictEqual(P.bodyStyleNames(N(`(symbol "a" (symbol "a_1_1") (symbol "a_1_2"))`)), ["Standard", "Alternate"]);
+  assert.deepStrictEqual(P.bodyStyleNames(N(`(symbol "a" (body_styles demorgan) (symbol "a_1_1"))`)), ["Standard", "Alternate"]);
+  assert.deepStrictEqual(P.bodyStyleNames(N(`(symbol "a" (body_styles "Big" "Small" "Tiny") (symbol "a_1_1"))`)), ["Big", "Small", "Tiny"]);
+  assert.deepStrictEqual(P.bodyStyleNames(N(`(symbol "a" (symbol "a_1_1"))`)), ["Standard"]);
+});
+test("composed reference: the path's Reference Suffix fields joined; unannotated references stay unsuffixed", () => {
+  const s1 = N(`(sheet (property "Sheetname" "a") (property "Reference Suffix" "_L"))`), s2 = N(`(sheet (property "Sheetname" "b") (property "Reference Suffix" "2"))`);
+  assert.strictEqual(P.composeRefSuffix([s1, null, s2]), "_L2");
+  assert.strictEqual(P.composedReference("R12", "_L"), "R12_L"); assert.strictEqual(P.composedReference("R?", "_L"), "R?");
+});
+test("SyncOtherUnits: Value, footprint and other fields, flags, alternates; the reference and position stay", () => {
+  const src = N(SYM.replace('"74HC00" (at', '"74HCT00" (at').replace("(dnp no)", "(dnp yes)").replace("(in_bom yes)", "(in_bom no)"));
+  const dst = N(`(symbol (lib_id "74xx:74HC00") (at 100 50 0) (unit 2) (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "u2")
+    (property "Reference" "U1" (at 102 48 0) (effects (font (size 1.27 1.27)))) (property "Value" "74HC00" (at 102 52 0) (effects (font (size 1.27 1.27))))
+    (property "Footprint" "" (at 100 50 0) (hide yes) (effects (font (size 1.27 1.27)))) (property "Extra" "gone" (at 100 50 0) (effects (font (size 1.27 1.27))))
+    (pin "1" (uuid "q1")) (pin "2" (uuid "q2") (alternate "OLD")) (instances (project "demo" (path "/root" (reference "U1") (unit 2)))))`);
+  const out = P.syncUnit(src, dst); const s = S(out);
+  assert.ok(/\(property "Value" "74HCT00" \(at 102 52 0\)/.test(s), "value text, own position");
+  assert.ok(/\(property "Footprint" "Package_DIP:DIP-14" \(at 100 50 0\)/.test(s));
+  assert.ok(/\(property "MPN" "SN74HC00N" \(at 105 55 0\)/.test(s), "a missing field is added at the same offset: " + s);
+  assert.ok(!/Extra/.test(s), "a user field the source lacks is removed");
+  assert.ok(/\(in_bom no\)/.test(s) && /\(dnp yes\)/.test(s));
+  assert.ok(/\(pin "1" \(uuid "q1"\) \(alternate "IN_A"\)\)/.test(s) && /\(pin "2" \(uuid "q2"\)\)/.test(s), s);
+  assert.ok(/\(property "Reference" "U1" \(at 102 48 0\)/.test(s) && /\(unit 2\)/.test(s));
+  assert.ok(/\(exclude_from_sim no\)/.test(s), "exclude from simulation is not synced");
+  assert.strictEqual(P.syncUnit(out, out), null, "nothing to do -> null");
+});
+test("SyncOtherUnits with a property filter: only that property", () => {
+  const src = N(SYM.replace('"74HC00" (at', '"X" (at').replace("(dnp no)", "(dnp yes)"));
+  const dst = N(SYM.replace('(uuid "u1")', '(uuid "u2")'));
+  const v = S(P.syncUnit(src, dst, P.syncFor("Value"))); assert.ok(/"Value" "X"/.test(v) && /\(dnp no\)/.test(v));
+  const d = S(P.syncUnit(src, dst, P.syncFor("Do not Populate"))); assert.ok(/"Value" "74HC00"/.test(d) && /\(dnp yes\)/.test(d));
+});
+test("CollectOtherUnits: same reference on that path, same lib_id, other unit; power symbols never", () => {
+  const doc = K.parseDoc(`(kicad_sch (version 20250114) (generator "eeschema") (uuid "root") (paper "A4") (lib_symbols)
+    ${SYM}
+    ${SYM.replace('(uuid "u1")', '(uuid "u2")').replace("(unit 1) (exclude", "(unit 2) (exclude").replace('(reference "U1") (unit 1)', '(reference "U1") (unit 2)')}
+    ${SYM.replace('(uuid "u1")', '(uuid "u3")').replace('(reference "U1") (unit 1)', '(reference "U2") (unit 2)')}
+    ${SYM.replace('(uuid "u1")', '(uuid "u4")').replace('"74xx:74HC00"', '"74xx:74HC04"').replace('(reference "U1") (unit 1)', '(reference "U1") (unit 3)')})`, "kicad_sch");
+  const self = doc.items.get("u1");
+  const hits = P.collectOtherUnits([{ path: "/root", doc }], self, "U1", 1, "74xx:74HC00", "demo", () => false);
+  assert.deepStrictEqual(hits.map((x) => x.item.id), ["u2"]);
+  assert.deepStrictEqual(P.collectOtherUnits([{ path: "/root", doc }], self, "U1", 1, "74xx:74HC00", "demo", () => true), []);
+  assert.ok(P.isAnnotated("U1") && !P.isAnnotated("U?"));
+});
+test("pin maps: read, edit (identity not stored), rename-safe write in KiCad's order before the units", () => {
+  const lib = N(`(symbol "Q:NPN" (property "Reference" "Q" (at 0 0 0)) (associated_footprints (footprint "Package_TO_SOT_THT:TO-92" (map "TO92"))) (pin_maps (pin_map "TO92" (entry "1" "3") (entry "3" "1")) (pin_map "SOT23")) (symbol "NPN_1_1"))`);
+  const st = P.readPinMaps(lib);
+  assert.deepStrictEqual(st.maps.map((m) => m.name), ["TO92", "SOT23"]); assert.strictEqual(st.footprints.get("TO92"), "Package_TO_SOT_THT:TO-92");
+  assert.strictEqual(P.pinMapCell(st.maps[0], "1"), "3"); assert.strictEqual(P.pinMapCell(st.maps[0], "2"), "2");
+  P.setPinMapCell(st.maps[1], "1", "2"); P.setPinMapCell(st.maps[0], "1", "1");
+  st.maps.push({ name: P.newMapName(st.maps), entries: new Map() }); assert.strictEqual(st.maps[2].name, "map1");
+  st.footprints.set("SOT23", "Package_TO_SOT_SMD:SOT-23");
+  P.writePinMaps(lib, st); const s = S(lib);
+  assert.ok(s.indexOf("(associated_footprints") < s.indexOf("(pin_maps") && s.indexOf("(pin_maps") < s.indexOf('(symbol "NPN_1_1"'), s);
+  assert.ok(/\(pin_map "TO92" \(entry "3" "1"\)\)/.test(s), "the identity entry is dropped: " + s);
+  assert.ok(/\(pin_map "SOT23" \(entry "1" "2"\)\)/.test(s) && /\(pin_map "map1"\)/.test(s));
+  assert.ok(/\(footprint "Package_TO_SOT_SMD:SOT-23" \(map "SOT23"\)\)/.test(s));
+  assert.ok(P.validFootprintId("Package_TO_SOT_SMD:SOT-23") && !P.validFootprintId("SOT-23") && !P.validFootprintId(":x"));
+  assert.strictEqual(P.PIN_MAP_MSG.removeAsk("TO92"), "Remove pin map 'TO92' and its footprint association?");
+  const ov = P.readOverride(N(`(symbol (pin_map_override (mode named_map) (map "SOT23") (edit "1" "2")))`));
+  assert.deepStrictEqual([ov.mode, ov.map, Array.from(ov.edits)], ["named_map", "SOT23", [["1", "2"]]]);
+});
+test("Properties pin map: active footprint, effective pads, override written after (dnp) and dropped when default", () => {
+  const lib = N(`(symbol "Q:NPN" (associated_footprints (footprint "P:TO-92" (map "TO92")) (footprint "P:SOT-23" (map "SOT23"))) (pin_maps (pin_map "TO92" (entry "1" "3") (entry "3" "1")) (pin_map "SOT23" (entry "2" "1"))))`);
+  assert.strictEqual(P.activeAssociatedFootprint(lib, "P:SOT-23").map, "SOT23");
+  assert.strictEqual(P.activeAssociatedFootprint(lib, "Other:X").footprint, "P:TO-92", "no match: the first association");
+  const dflt = P.defaultOverride();
+  assert.strictEqual(P.effectivePadNumber(lib, dflt, "P:TO-92", "1"), "3");
+  assert.strictEqual(P.effectivePadNumber(lib, dflt, "Other:X", "1"), "1", "library default resolves through the footprint only");
+  assert.strictEqual(P.effectivePadNumber(lib, { mode: "named_map", map: "SOT23", edits: new Map() }, "P:TO-92", "2"), "1");
+  assert.strictEqual(P.effectivePadNumber(lib, { mode: "identity", map: "", edits: new Map([["1", "9"]]) }, "P:TO-92", "1"), "1", "identity ignores edits");
+  assert.strictEqual(P.effectivePadNumber(lib, { mode: "library_default", map: "", edits: new Map([["1", "9"]]) }, "P:TO-92", "1"), "9");
+  const sym = N(`(symbol (lib_id "Q:NPN") (in_bom yes) (on_board yes) (dnp no) (uuid "u"))`);
+  P.writeOverride(sym, { mode: "named_map", map: "SOT23", edits: new Map() });
+  assert.ok(S(sym).includes('(dnp no) (pin_map_override (mode named_map) (map "SOT23")) (uuid'), S(sym));
+  P.writeOverride(sym, { mode: "identity", map: "SOT23", edits: new Map() });
+  assert.ok(S(sym).includes("(pin_map_override (mode identity))"), "the map name only in named-map mode: " + S(sym));
+  P.writeOverride(sym, dflt); assert.ok(!S(sym).includes("pin_map_override"), S(sym));
+});
+const L = load("dialogs/sch-items-logic.ts");
+test("ChangeSheetFile linking an existing file: new sheet path instances with the annotation cleared, sub-sheets paged", () => {
+  const doc = K.parseDoc(`(kicad_sch (version 20250114) (generator "eeschema") (uuid "sub-uuid") (paper "A4") (lib_symbols)
+    (symbol (lib_id "Device:R") (at 10 10 0) (unit 1) (uuid "r1")
+      (property "Reference" "R5" (at 0 0 0) (effects (font (size 1.27 1.27))))
+      (pin "1" (uuid "p1"))
+      (instances (project "proj" (path "/root/s1" (reference "R5") (unit 1)))))
+    (symbol (lib_id "power:GND") (at 20 10 0) (unit 1) (uuid "g1")
+      (property "Reference" "#PWR03" (at 0 0 0) (effects (font (size 1.27 1.27))))
+      (instances (project "proj" (path "/root/s1" (reference "#PWR03") (unit 1)))))
+    (sheet (at 30 30) (size 10 10) (uuid "deep")
+      (property "Sheetname" "Deep" (at 30 29 0) (effects (font (size 1.27 1.27))))
+      (property "Sheetfile" "deep.kicad_sch" (at 30 41 0) (effects (font (size 1.27 1.27))))
+      (instances (project "proj" (path "/root/s1" (page "3"))))))`);
+  let pg = 4;
+  const r = L.newSheetPathNodes(doc, "/root/s2", "proj", () => pg++);
+  const ser = (id) => K.serialize(r.nodes.get(id));
+  assert.ok(ser("r1").includes('(path "/root/s1" (reference "R5") (unit 1)) (path "/root/s2" (reference "R?") (unit 1))'), ser("r1"));
+  assert.ok(ser("g1").includes('(path "/root/s2" (reference "#PWR?") (unit 1))'), ser("g1"));
+  assert.ok(ser("deep").includes('(path "/root/s2" (page "4"))'), ser("deep"));
+  assert.deepStrictEqual(r.subs, [{ file: "deep.kicad_sch", path: "/root/s2/deep" }]);
+  assert.strictEqual(K.serialize(doc.items.get("r1").node).includes("/root/s2"), false, "the document's own nodes are untouched");
+  // an entry that already exists for the path is re-annotated, not duplicated
+  const again = L.newSheetPathNodes(doc, "/root/s1", "proj", () => pg++);
+  const s1 = K.serialize(again.nodes.get("r1")); assert.strictEqual((s1.match(/\/root\/s1/g) || []).length, 1); assert.ok(s1.includes('(path "/root/s1" (reference "R?") (unit 1))'), s1);
+});
+console.log(`\n${passed} passed, ${failed} failed`);
+process.exit(failed ? 1 : 0);

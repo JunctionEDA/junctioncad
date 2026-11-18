@@ -1,0 +1,136 @@
+// kicad-canvas (web/domains/pcb/canvas) — parse KiCad s-expression documents (schematic sheets and
+// boards) and draw them on a 2D canvas, applying live collaboration ops per item.
+//
+// Coordinates are millimetres with Y down (KiCad's screen convention) for both
+// document types; library symbol geometry (Y up) is mapped through KiCad's own
+// orientation matrices.  Nothing here touches the DOM except the canvas context
+// handed to render(), so the parser also runs under node for tests.
+//
+// Placement rules follow eeschema/sch_painter.cpp, eeschema/pin_layout_cache.cpp,
+// eeschema/sch_label.cpp and pcbnew/pcb_painter.cpp; colours are KiCad's default
+// theme (common/settings/builtin_color_themes.h).
+//
+// Beyond drawing, the module answers the tools layer's geometry questions (hitTest, padAt, bboxOf,
+// fieldAt, markerAt, flipX/unflipX) and exports the document as SVG (renderSvg) or PNG (renderPng);
+// render()'s comment lists every display option (ratsnest, markers, netNames, netColors, zoneFill,
+// flip, padNumbers, showHiddenText, …).
+//
+// Package layout: sexpr (parser/serializer + node helpers), text (metrics), colors (KiCad's theme,
+// layers, z-order), doc (documents, items, libraries), geom / geom-sch / geom-pcb (geometry builders),
+// tables-images, ops (applyChange), edit (tool-layer helpers), hit (hit tests, boxes, fields, pads),
+// render (the canvas painter), export (SVG / PNG).  `npm run build:canvas` bundles this entry into
+// static/kicad-canvas.js, which the server serves and the node test suites load.
+// kicad-canvas — GENERATED SOURCE MODULE (split from the former static/kicad-canvas.js; static/kicad-canvas.js is now the esbuild output of web/domains/pcb/canvas/index.ts — edit these modules, not the bundle).
+import { root } from "./env";
+import { PCB_BG, PCB_COLORS, PCB_HIDDEN_DEFAULT, SCH, SCH_DEFAULT, SCH_THEMES, pcbColor, pcbZ, schTheme, schThemeColors, setSchTheme, withSchTheme } from "./colors";
+import { PAPER_SIZES, addItem, applyDocProps, computeBBox, mm2mils, paperSize, parseDoc, titleBlockOf } from "./doc";
+import type { Doc } from "./types";
+import { addChange, boardChangeExtras, createItem, fieldAt, fieldBoxes, groupMemberIds, moveItem, netNameOf, newUuid, pinPoints, pointInQuad, removeChange, replaceChange, typeNameOf, wireEndsAt } from "./edit";
+import { SvgPath, renderPng, renderSvg, serialize, serializeItem, setRenderCacheWriter, svgDrawingSheet, wrapFragment } from "./export";
+import { buildGeom, ensureFontGeom, ensureSchTheme, inSchTheme } from "./geom";
+import { faceMetrics, kicadAscDesc, outlineBoxCorners, outlineLayout, readSfnt } from "./outline-text";
+import { hatchLines } from "./geom-pcb";
+import { ORIENT, fieldColor, hasOpTextVar, intersheetRefsText, opVars, resolveLib, schDisplay, schFormat, symbolTransform, type OpTextVar } from "./geom-sch";
+import { bboxOf, geomBox, geomHit, geomTouchesRect, itemTouchesRect, itemVisible, hitTest, hitTestDetail, layerList, movableItems, padAt, padGeomHit, snap } from "./hit";
+import { applyChange, setAt, setPts } from "./ops";
+import { darkened, mixColor, brightenedItemColor, lockedShadowMargin, footprintBodyBox, drawLockedShadow, DRC_HIGHLIGHTED, HL_FACTOR, HC_EDGE_MIN, viaSpans, umbilicalLines, viaStitchOutline, viaStitchTicks, gridItemGeom, gridItemArea, gridTakesPrecedence, autoSparsePitch } from "./render";
+import { DASH_RATIOS, HIDDEN_TEXT_ALPHA, HL_DIM, MARKER_COLORS, MARKER_CORNERS, MARKER_SCALE, PX_PER_MM_ZOOM1, RATSNEST_COLOR, VIA_NETNAME_COLOR, ZONE_OPACITY, brightened, dashPattern, defaultCreateCanvas, drawDrawingSheet, drawHalo, drawMarkers, drawPad, drawSelectionHalo, SCH_SELECTION_SHADOW, selectedColor, flipCentre, flipX, highlightColor, markerAt, markerPolygon, markerScale, render, busConnectedLabels, busPinTint, setViewTransform, trackNameColor, unflipX, zoomFactor } from "./render";
+import { isBusLabel } from "./busname";
+import { boardSetup } from "./board-setup";
+import { PlotRecorder, blackAndWhite, dashRuns, itemsBox, luminance, plotItems, plotRecorder, sheetPlotItems } from "./plot-rec";
+import { plotParams } from "./plot-params";
+import { DRC_ITEMS } from "./drc-items";
+import { pcbNetlist } from "./pcb-netlist";
+import { schNets } from "./sch-nets";
+import { projectFile } from "./project-file";
+import { arcFrom3, atOf, bezierPts, boxOf, cloneNode, cornersInSequence, effectsOf, fillOf, kid, kids, num, parse, parseAll, pointInPoly, ptsOf, quotedMask, str, strokeOf, uuidOf } from "./sexpr";
+import { DEFAULT_DRAWING_SHEET, PRODUCT_NAME, TB_TOKENS, WS_TOKENS, alphabeticFromIndex, buildDrawingSheet, defaultDrawingSheet, documentDrawingSheet, hitTestDrawingSheet, expandTextVars, incrementLabel, indexFromAlphabetic, parseDrawingSheet, sheetTextPen, sheetTextVars, varResolver } from "./sheet";
+import { IMAGE_CACHE, base64Bytes, imageInfo, shiftTable, tableCellShownText, cellAddr, parseCellAddress } from "./tables-images";
+import { SCH_PEN, TEXT_INTERLINE, isUrlText, lineOffsets, parseMarkup, setSchPen, textWidth, unescapeText, urlRunAt, urlRunBox, urlRuns } from "./text";
+import { drawStrokeText, linebreakText, parseStrokeMarkup, strokeGlyph, strokeLine, strokeLineWidth, strokeOrigin } from "./stroke-font";
+import { displayNetName, netCode } from "./geom-pcb";
+import { unitLetter } from "./geom-sch";
+import { GRID_MIN_SPACING, GRID_TICK, MIN_TEXT_PX, allFontData, drawOutlineText, drawTextStroke, faceAvailable, fontChanged, fontData, setFontData, textMode, wantFace } from "./render";
+import { pcbSizes } from "./pcb-sizes";
+import { boardItemBox, presenceSelection } from "./kicad-bbox";
+import { padModel } from "./pad-model";
+import { parseLibSymbol, subUnitBody, PIN_TYPE_NAMES, libGraphicGeom } from "./libsym";
+import { footprintDocApi } from "./footprint-doc";
+import { HOPOVER_MULT, hopOver, hopShapes, wireHopShape } from "./hop-over";
+import { tableModel } from "./table-model";
+import { autoPanDirection, autoPanStep, AUTOPAN_TICK_MS } from "./autopan";
+export const api = {
+  // the schematic View options that change geometry (show_pin_alt_icons): set, then the symbols of `doc` are rebuilt
+  // Schematic Setup > Formatting: the painter's text offset / label size ratios, pin symbol size, DNP markers and
+  // default line width; the document's items are rebuilt with them
+  setSchFormatting(o: { textOffsetRatio?: number; labelSizeRatio?: number; pinSymbolSize?: number; showDnpMarkers?: boolean; lineWidth?: number; overbarHeight?: number; hopOverChoice?: number }, doc?: Doc | null) {
+    let changed = false;
+    // overbar_offset_ratio (KIFONT::METRICS::m_OverbarHeight) and hop_over_size_choice are applied at paint time
+    if (typeof o.overbarHeight === "number" && isFinite(o.overbarHeight) && o.overbarHeight > 0) schFormat.overbarHeight = o.overbarHeight;
+    if (typeof o.hopOverChoice === "number" && o.hopOverChoice >= 0) schFormat.hopOverChoice = Math.min(5, Math.round(o.hopOverChoice));
+    hopOver.radius = SCH_PEN * HOPOVER_MULT[schFormat.hopOverChoice];
+    for (const k of ["textOffsetRatio", "labelSizeRatio", "pinSymbolSize"] as const) { const v = o[k]; if (typeof v === "number" && isFinite(v) && v >= 0 && Math.abs(v - schFormat[k]) > 1e-9) { schFormat[k] = v; changed = true; } }
+    if (typeof o.showDnpMarkers === "boolean" && o.showDnpMarkers !== schFormat.showDnpMarkers) { schFormat.showDnpMarkers = o.showDnpMarkers; changed = true; }
+    if (typeof o.lineWidth === "number" && o.lineWidth > 0 && Math.abs(o.lineWidth - SCH_PEN) > 1e-9) { setSchPen(o.lineWidth); changed = true; hopOver.radius = SCH_PEN * HOPOVER_MULT[schFormat.hopOverChoice]; }
+    if (changed && doc && doc.type === "sch") for (const it of doc.items.values()) { try { buildGeom(doc, it); } catch (e) { /* no geometry */ } }
+    return changed;
+  }, schFormat,
+  /** The open sheet's intersheet references (Doc.intersheetRefs); its global labels are rebuilt with them. */
+  intersheetRefsText,
+  setIntersheetRefs(refs: Doc["intersheetRefs"], doc?: Doc | null) { if (!doc || doc.type !== "sch") return; doc.intersheetRefs = refs || null; for (const it of doc.items.values()) if (it.kind === "global_label") { try { buildGeom(doc, it); } catch (e) { /* no geometry */ } } },
+  // ${OP} text variables: the host's resolver (sim/op-overlay.ts), and a rebuild of the items of `doc` that use one
+  // once the operating point changes (SCH_EDIT_FRAME::RefreshOperatingPointDisplay)
+  setOpTextVar(fn: OpTextVar | null) { opVars.resolve = fn; },
+  refreshOpTextVars(doc?: Doc | null) { if (!doc || doc.type !== "sch") return; for (const it of doc.items.values()) if (hasOpTextVar(it)) { try { buildGeom(doc, it); } catch (e) { /* no geometry */ } } },
+  setSchDisplay(o: { pinAltIcons?: boolean }, doc?: Doc | null) { if (typeof o.pinAltIcons === "boolean") schDisplay.pinAltIcons = o.pinAltIcons; if (doc && doc.type === "sch") for (const it of doc.items.values()) if (it.kind === "symbol") { try { buildGeom(doc, it); } catch (e) { /* no geometry */ } } }, schDisplay,
+  parse, parseAll, serialize, serializeItem, parseDoc, applyDocProps, paperSize, titleBlockOf, DASH_RATIOS, setViewTransform, drawSelectionHalo, selectedColor, moveItem, replaceChange, addChange, removeChange, typeNameOf, boardChangeExtras, netNameOf, groupMemberIds, wrapFragment, pinPoints, wireEndsAt, newUuid, createItem, setPts, setAt, atOf, ptsOf, kid, kids, num, str, uuidOf, cloneNode, quotedMask, resolveLib, ORIENT, addItem, applyChange, render, movableItems, hitTest, layerList, snap, computeBBox, PCB_HIDDEN_DEFAULT, SCH, PCB_COLORS, PCB_BG,
+  // schematic colour themes (colors.ts): KiCad Default / KiCad Classic / Dark; the painters rebuild stale geometry,
+  // renderSvg / renderPng use opts.colorTheme (KiCad Default unless given)
+  SCH_DEFAULT, SCH_THEMES, schTheme, schThemeColors, setSchTheme, withSchTheme, ensureSchTheme, inSchTheme,
+  // asset hook: set to a function ({ id, kind: "image", ok }) => void; called once an image item's bitmap has
+  // decoded (ok) or failed (!ok) after render() drew its placeholder, so the app can request a repaint
+  onAssetLoaded: null,
+  // font hook: set to a function (face, bold, italic) => void; called the first time text in an outline font is
+  // drawn, so the app can fetch the font (web/domains/pcb/editor/fonts.ts) and call fontChanged(face) once it is on the page
+  onFontWanted: null, fontChanged, wantFace, faceAvailable, setFontData, fontData, allFontData, loadFontsFor: null, setRenderCacheWriter,
+  // outline-font text laid out as KiCad's OUTLINE_FONT places it (outline-text.ts): metrics, layout, box, painter
+  faceMetrics, readSfnt, kicadAscDesc, outlineLayout, outlineBoxCorners, drawOutlineText, ensureFontGeom, fieldColor,
+  hopShapes, wireHopShape, hopOver, drawHalo, SCH_SELECTION_SHADOW, HL_DIM, brightened, highlightColor, imageInfo, base64Bytes, IMAGE_CACHE, strokeOf, boxOf, cornersInSequence, shiftTable, tableCellShownText, cellAddr, parseCellAddress, autoPanDirection, autoPanStep, AUTOPAN_TICK_MS,
+  darkened, mixColor, brightenedItemColor, lockedShadowMargin, footprintBodyBox, drawLockedShadow, DRC_HIGHLIGHTED, HL_FACTOR, HC_EDGE_MIN, viaSpans, umbilicalLines, viaStitchOutline, viaStitchTicks, gridItemGeom, gridItemArea, gridTakesPrecedence, autoSparsePitch,
+  // the drawing sheet (web/domains/pcb/canvas/sheet.ts): KiCad's built-in (kicad_wks …) description, its interpreter
+  // and the text-variable resolution the title block uses; render()/renderSvg() paint what it returns
+  DEFAULT_DRAWING_SHEET, parseDrawingSheet, defaultDrawingSheet, buildDrawingSheet, documentDrawingSheet, hitTestDrawingSheet,
+  sheetTextVars, varResolver, expandTextVars, incrementLabel, indexFromAlphabetic, alphabeticFromIndex, sheetTextPen, drawDrawingSheet, svgDrawingSheet,
+  PRODUCT_NAME, WS_TOKENS, TB_TOKENS, PAPER_SIZES, mm2mils, TEXT_INTERLINE, lineOffsets,
+  fieldBoxes, fieldAt, pointInQuad, hitTestDetail, geomHit, geomBox,
+  // exposed for tests and tools
+  symbolTransform, textWidth, parseMarkup, urlRuns, urlRunAt, urlRunBox, isUrlText, hatchLines, arcFrom3, bezierPts, pcbColor, pcbZ, drawPad, buildGeom, effectsOf, fillOf,
+  // display-option helpers (see render()): ratsnest / marker / net-name / zone-preview / flip constants and look-ups
+  bboxOf, padAt, padGeomHit, markerAt, markerPolygon, markerScale, busConnectedLabels, busPinTint, isBusLabel, drawMarkers, zoomFactor, flipX, unflipX, flipCentre, dashPattern, trackNameColor,
+  MARKER_CORNERS, MARKER_SCALE, MARKER_COLORS, RATSNEST_COLOR, ZONE_OPACITY, HIDDEN_TEXT_ALPHA, PX_PER_MM_ZOOM1, VIA_NETNAME_COLOR,
+  // export: SVG / PNG of the whole document or a subset; createCanvas is the offscreen-canvas factory (replaceable for tests / workers)
+  renderSvg, renderPng, SvgPath, createCanvas: defaultCreateCanvas, pointInPoly,
+  // KiCad's stroke font (web/domains/pcb/canvas/stroke-font.ts): glyphs, markup, line layout, word wrap and the painter.
+  // textMode: undefined = stroke font wherever Path2D exists, canvas fonts otherwise; "stroke" / "native" force one
+  textMode: undefined, currentTextMode: textMode, strokeGlyph, strokeLine, strokeLineWidth, strokeOrigin, parseStrokeMarkup, linebreakText, drawStrokeText, drawTextStroke,
+  unescapeText, displayNetName, netCode, unitLetter, GRID_MIN_SPACING, GRID_TICK, MIN_TEXT_PX,
+  // the board editor's track / via sizes, netclass resolution and routing layer pair (web/domains/pcb/canvas/pcb-sizes.ts)
+  pcbSizes,
+  // the Symbol Editor's render mode (web/domains/pcb/canvas/libsym.ts): one library symbol as an editable document
+  parseLibSymbol, subUnitBody, PIN_TYPE_NAMES, libGraphicGeom };
+
+/** The api with the members assigned below, after the literal (the literal's own type does not have them). */
+type Api = typeof api & {
+  itemTouchesRect: typeof itemTouchesRect; itemVisible: typeof itemVisible; geomTouchesRect: typeof geomTouchesRect;
+  boardItemBox: typeof boardItemBox; presenceSelection: typeof presenceSelection;
+  pcbNetlist: typeof pcbNetlist; schNets: typeof schNets; boardSetup: typeof boardSetup; DRC_ITEMS: typeof DRC_ITEMS; projectFile: typeof projectFile; padModel: typeof padModel;
+  footprintDoc: typeof footprintDocApi; plot: typeof plotApi; tableModel: typeof tableModel;
+};
+const plotApi = { PlotRecorder, plotRecorder, plotItems, sheetPlotItems, itemsBox, dashRuns, blackAndWhite, luminance, params: plotParams };
+(api as Api).itemTouchesRect = itemTouchesRect; (api as Api).itemVisible = itemVisible; (api as Api).geomTouchesRect = geomTouchesRect;
+(api as Api).boardItemBox = boardItemBox; (api as Api).presenceSelection = presenceSelection;   // BOARD_ITEM::GetBoundingBox for the presence payload (web/domains/pcb/canvas/kicad-bbox.ts)
+(api as Api).pcbNetlist = pcbNetlist; (api as Api).schNets = schNets; (api as Api).boardSetup = boardSetup; (api as Api).DRC_ITEMS = DRC_ITEMS; (api as Api).projectFile = projectFile; (api as Api).padModel = padModel;   // the board dialogs' pure halves (web/domains/pcb/editor/pcbdialogs)
+(api as Api).footprintDoc = footprintDocApi;
+(api as Api).plot = plotApi;   // File > Plot / Print: the painter recorded as plot items (web/domains/pcb/canvas/plot-rec.ts), the board's plot settings   // the Footprint Editor's document (web/domains/pcb/canvas/footprint-doc.ts)
+(api as Api).tableModel = tableModel;   // a table's structure edits and layout (web/domains/pcb/canvas/table-model.ts), shared by both editors   // the Footprint Editor's document (web/domains/pcb/canvas/footprint-doc.ts)
+root.KiCadCanvas = api;

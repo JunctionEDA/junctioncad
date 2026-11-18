@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Junction: KiCad with everyone on the same board</title>
+<meta name="description" content="Open source KiCad with real-time collaboration built into the schematic and PCB editors. Shared cursors, live edits, comments and history, in the desktop app and in the browser.">
+<meta property="og:title" content="Junction">
+<meta property="og:description" content="KiCad with everyone on the same board. Shared cursors, live edits, comments and history, in the desktop app and in the browser.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Junction">
+<meta property="og:url" content="{{SITE}}/">
+<meta property="og:image" content="{{SITE}}/icon-512.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="512">
+<meta property="og:image:height" content="512">
+<meta property="og:image:alt" content="The Junction icon">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="{{SITE}}/icon-512.png">
+<meta name="theme-color" content="#001023">
+<link rel="icon" type="image/svg+xml" href="/brand/j2/icon.svg"><link rel="icon" type="image/png" sizes="192x192" href="/brand/j2/icon-192.png"><link rel="alternate icon" href="/brand/j2/favicon.ico" sizes="any"><link rel="apple-touch-icon" href="/brand/j2/icon-180.png">
+<script>document.documentElement.classList.add("js"); try { var t = localStorage.getItem("kui.theme"); if (t === "dark" || t === "light") document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<style>
+{{THEME}}
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+  html, body { margin: 0; }
+  body { color: var(--ink); font: 16px/1.6 var(--font); -webkit-font-smoothing: antialiased;
+         background-color: var(--paper);
+         background-image: radial-gradient(color-mix(in srgb, var(--line-2) 50%, transparent) 1px, transparent 1.3px);
+         background-size: 20px 20px; overflow-x: clip; }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+  img { max-width: 100%; display: block; }
+  h1, h2, h3, p { margin: 0; }
+  .wrap { width: min(1180px, 100% - 48px); margin-inline: auto; }
+  .mono { font-family: var(--mono); }
+
+  /* ---- nav ---- */
+  .nav { position: sticky; top: 0; z-index: 30; border-bottom: 1px solid transparent;
+         transition: background-color .25s, border-color .25s; }
+  .nav.stuck { background: color-mix(in srgb, var(--bench) 88%, transparent); border-bottom-color: var(--line);
+               -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
+  .nav .wrap { display: flex; align-items: center; gap: 28px; height: 58px; }
+  .brand { display: flex; align-items: center; gap: 10px; color: var(--ink); font-weight: 600; font-size: 15px; letter-spacing: -.005em; }
+  .brand:hover { text-decoration: none; }
+  .brand svg { width: 24px; height: 24px; display: block; }
+  .nav nav { display: flex; gap: 22px; margin-left: 8px; }
+  .nav nav a { color: var(--ink-2); font-size: 14px; }
+  .nav nav a:hover { color: var(--ink); text-decoration: none; }
+  .nav .sp { flex: 1; }
+  .icon-btn { width: 34px; height: 34px; display: grid; place-items: center; background: none; border: 1px solid transparent;
+              border-radius: 3px; color: var(--ink-2); }
+  .icon-btn:hover { border-color: var(--line); color: var(--ink); }
+  .icon-btn svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  .icon-btn .moon { display: none; }
+  :root[data-theme="dark"] .icon-btn .moon { display: block; } :root[data-theme="dark"] .icon-btn .sun { display: none; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .icon-btn .moon { display: block; } :root:not([data-theme="light"]) .icon-btn .sun { display: none; } }
+
+  .btn { display: inline-flex; align-items: center; gap: 9px; padding: 10px 18px; border-radius: 3px; border: 1px solid var(--line);
+         background: var(--panel); color: var(--ink); font: 500 15px/1.3 var(--font); white-space: nowrap;
+         transition: border-color .15s, background-color .15s, transform .15s; }
+  .btn:hover { border-color: var(--ink-3); text-decoration: none; }
+  .btn:active { transform: translateY(1px); }
+  .btn.primary { background: var(--accent); border-color: var(--accent-2); color: var(--on-accent); }
+  .btn.primary:hover { background: var(--accent-2); }
+  .btn.sm { padding: 6px 13px; font-size: 14px; }
+  .btn svg { width: 17px; height: 17px; fill: currentColor; flex: none; }
+
+  /* ---- section furniture: every section opens like a sheet reference ---- */
+  .tag { display: flex; align-items: center; gap: 12px; font: 500 11.5px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
+  .tag b { color: var(--accent); font-weight: 500; }
+  .tag::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  h2 { font-size: clamp(28px, 3.5vw, 44px); line-height: 1.08; letter-spacing: -.025em; font-weight: 600; text-wrap: balance; }
+  .lead { color: var(--ink-2); font-size: clamp(16px, 1.35vw, 18.5px); line-height: 1.55; max-width: 62ch; text-wrap: pretty; }
+  section { padding: clamp(72px, 10vw, 136px) 0; }
+  section[id] { scroll-margin-top: 84px; }
+  #make { scroll-margin-top: 0; }
+
+  /* ---- hero ---- */
+  .hero { padding: clamp(24px, 3.4vw, 48px) 0 clamp(48px, 6vw, 80px); }
+  .hero .eyebrow { font: 500 11.5px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .hero .eyebrow span + span::before { content: "/"; margin-right: 14px; color: var(--line-2); }
+  .hero h1 { font-size: clamp(40px, 5.9vw, 80px); line-height: .98; letter-spacing: -.04em; font-weight: 600; margin: 0;
+             text-wrap: balance; }
+  .hero h1 em { font-style: normal; color: var(--accent); }
+  .hero-row { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); gap: 28px clamp(32px, 4vw, 64px); align-items: end; margin-top: 22px; }
+  .hero-side { display: grid; gap: 22px; padding-bottom: 8px; }
+  .hero .acts { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .hero .also { font-size: 14px; color: var(--ink-2); margin-top: 12px; }
+  .hero .also a { color: var(--ink-2); text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 3px; }
+  .hero .also a:hover { color: var(--ink); }
+
+  .win { margin-top: clamp(24px, 3vw, 40px); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: #001023;
+         box-shadow: 0 1px 0 #ffffff14 inset, 0 30px 60px -28px #000a, 0 8px 18px -8px #0005; }
+  /* The window leans back a little until it is scrolled into full view (index.ts sets --lean). */
+  .js .win.rv, .js .win.rv.in { transition: opacity .8s cubic-bezier(.2, .7, .2, 1); transition-delay: calc(var(--i, 0) * 70ms); }
+  .js .win.rv, .js .win.rv.in { transform: perspective(1800px) rotateX(calc(var(--lean, 0) * 7deg)) scale(calc(1 - var(--lean, 0) * .03)); transform-origin: 50% 0; will-change: transform; }
+  .win { --fcu: #C83434; --bcu: #4D7FC4; }   /* KiCad's layer colours */
+  .win-bar, .win-status, .win-tools { display: flex; align-items: center; gap: 12px; background: var(--bench); color: var(--ink-2); font: 12px var(--mono); padding: 0 12px; }
+  .win-bar { height: 34px; border-bottom: 1px solid var(--line); }
+  .win-bar b { font-weight: 500; color: var(--ink); }
+  .win-bar .app { color: var(--ink-3); }
+  .win-bar .sp, .win-status .sp, .win-tools .sp { flex: 1; }
+  .win-bar .tabs { display: flex; align-self: stretch; margin-left: -12px; }
+  .win-bar .tabs button { all: unset; box-sizing: border-box; display: flex; align-items: center; padding: 0 14px; font: 12px var(--mono); color: var(--ink-3); border-right: 1px solid var(--line); cursor: pointer; }
+  .win-bar .tabs button { white-space: nowrap; }
+  @media (max-width: 560px) { .win-bar .tabs .long { display: none; } }
+  .win-bar .tabs button:hover { color: var(--ink); }
+  .win-bar .tabs button[aria-selected="true"] { color: var(--ink); font-weight: 500; background: var(--paper); box-shadow: inset 0 -2px 0 var(--ink); }
+  .win-bar .tabs button:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+  #hero[data-view="pcb"] .sch-only, #hero[data-view="pcb"] canvas[data-sch] { display: none; }
+  #hero[data-view="sch"] .win-tools > :not(.sch-only), #hero[data-view="sch"] .win-status > :not(.sch-only), #hero[data-view="sch"] .win-side, #hero[data-view="sch"] .win-body > canvas:not([data-sch]) { display: none; }
+  #hero[data-view="sch"] .win-body { grid-template-columns: minmax(0, 1fr); }
+  .win-tools .cap-s { padding: 0 6px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .avs { display: flex; }
+  .avs i { min-width: 22px; height: 22px; border-radius: 11px; background: var(--c); color: #fff; font: 600 10.5px/22px var(--font); text-align: center;
+           font-style: normal; margin-left: -5px; box-shadow: 0 0 0 2px var(--bench); }
+  .avs .you { background: var(--panel); color: var(--ink-2); padding: 0 7px; box-shadow: 0 0 0 1px var(--line), 0 0 0 2px var(--bench); }
+  .win-tools { height: 36px; gap: 2px; padding: 0 6px; border-bottom: 1px solid var(--line); }
+  .win-body { display: grid; grid-template-columns: minmax(0, 1fr) 36px; position: relative; }
+  .win-body > canvas.fading { position: absolute; pointer-events: none; opacity: 1; transition: opacity 650ms cubic-bezier(.4, 0, .2, 1); }
+  .win-side { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 5px 0; background: var(--bench); border-left: 1px solid var(--line); }
+  .tb { width: 28px; height: 28px; padding: 0; display: grid; place-items: center; background: none; border: 1px solid transparent; border-radius: 2px; color: var(--ink-2); }
+  .tb:hover:not(:disabled) { background: color-mix(in srgb, var(--ink) 9%, transparent); }
+  .tb[aria-pressed="true"] { background: color-mix(in srgb, var(--blue) 22%, transparent); border-color: color-mix(in srgb, var(--blue) 55%, transparent); }
+  .tb:disabled { opacity: .38; cursor: default; }
+  .tb img { width: 22px; height: 22px; }
+  .tb.text { width: auto; display: inline-flex; align-items: center; gap: 5px; padding: 0 8px 0 4px; font: 12px var(--font); }
+  .tb .id, :root[data-theme="dark"] .tb .il { display: none; }
+  :root[data-theme="dark"] .tb .id { display: block; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .tb .il { display: none; } :root:not([data-theme="light"]) .tb .id { display: block; } }
+  .win-tools .sep { width: 1px; height: 20px; background: var(--line); margin: 0 5px; }
+  .layers { display: flex; border: 1px solid var(--line); border-radius: 2px; overflow: hidden; }
+  .layers button { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 9px; background: var(--panel); border: 0; font: 12px var(--mono); color: var(--ink-2); }
+  .layers button + button { border-left: 1px solid var(--line); }
+  .layers button i { width: 10px; height: 10px; background: var(--c); border-radius: 1px; }
+  .layers button[aria-pressed="true"] { background: color-mix(in srgb, var(--blue) 20%, var(--panel)); color: var(--ink); }
+  .win-status { height: 24px; border-top: 1px solid var(--line); font-size: 11px; color: var(--ink-3); gap: 18px; white-space: pre; overflow: hidden; }
+  .win-status .ok { color: var(--wire); }
+  .live { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); }
+  .live::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--wire); box-shadow: 0 0 0 0 color-mix(in srgb, var(--wire) 60%, transparent); animation: ping 2.2s ease-out infinite; }
+  @keyframes ping { 70%, 100% { box-shadow: 0 0 0 7px transparent; } }
+  .win canvas { display: block; width: 100%; height: clamp(280px, min(62vh, 74vw), 640px); touch-action: pan-y; outline: none; }
+  .win canvas:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+  .win[data-tool="route"] canvas, .win[data-tool="via"] canvas { cursor: crosshair; }
+  .cap { margin-top: 12px; font: 12px var(--mono); color: var(--ink-3); }
+  .keep { display: flex; align-items: flex-start; gap: 16px; margin-top: 12px; }
+  .keep .cap { margin: 0; flex: 1; min-width: 0; }
+  .keep .btn { flex: none; }
+  @media (max-width: 720px) { .keep { flex-direction: column; gap: 10px; } }
+
+  /* ---- the scroll story ---- */
+  .story { padding: 0; }
+  .story-head { padding: clamp(40px, 6vw, 80px) 0 0; display: grid; gap: 18px; }
+  .story-track { height: 560vh; position: relative; }
+  .story-pin { position: sticky; top: 0; height: 100vh; height: 100svh; display: grid; grid-template-columns: minmax(270px, 330px) minmax(0, 1fr);
+               gap: clamp(24px, 4vw, 64px); align-items: center; padding-top: 58px; }
+  .steps { list-style: none; margin: 0; padding: 0; display: grid; }
+  .steps li { position: relative; padding: 15px 0 15px 22px; cursor: pointer; border-left: 2px solid var(--line); }
+  .steps li::before { content: ""; position: absolute; left: -2px; top: 0; width: 2px; height: 100%; background: var(--accent);
+                      transform-origin: top; transform: scaleY(var(--p, 0)); }
+  .steps li.done::before { transform: scaleY(1); }
+  .steps .n { font: 500 11.5px var(--mono); letter-spacing: .1em; color: var(--ink-3); text-transform: uppercase; }
+  .steps li.on .n { color: var(--accent); }
+  .steps h3 { font-size: 21px; font-weight: 600; letter-spacing: -.015em; line-height: 1.25; margin-top: 3px; color: var(--ink-3); transition: color .3s; }
+  .steps li.on h3, .steps li:hover h3 { color: var(--ink); }
+  .steps .more { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .5s cubic-bezier(.2, .7, .2, 1), opacity .4s; opacity: 0; }
+  .steps .more > div { overflow: hidden; }
+  .steps li.on .more { grid-template-rows: 1fr; opacity: 1; }
+  .steps p { color: var(--ink-2); font-size: 15.5px; line-height: 1.55; padding-top: 8px; }
+  .scene { position: relative; height: min(80vh, 760px); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: #F5F4EF;
+           box-shadow: 0 30px 60px -30px #0009, 0 8px 18px -10px #0004; }
+  .scene canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .scene .v3d { position: absolute; inset: 0; opacity: 0; pointer-events: none; cursor: grab; }
+  .scene .v3d:active { cursor: grabbing; }
+  .scene .chip { position: absolute; left: 12px; top: 12px; font: 500 11px var(--mono); padding: 3px 8px; border-radius: 3px; letter-spacing: .04em;
+                 background: #1b1b1bcc; color: #fff; transition: opacity .3s; pointer-events: none; }
+  .scene .chip span { display: none; }
+  .scene .turn { position: absolute; right: 12px; bottom: 10px; font: 11px var(--mono); color: #ffffff8c; opacity: 0; transition: opacity .4s; pointer-events: none; }
+  .story[data-chapter="3"] .scene .turn { opacity: 1; }
+  .story[data-chapter="3"] .scene canvas { cursor: grab; touch-action: pan-y; }
+  .story[data-chapter="3"] .scene canvas:active { cursor: grabbing; }
+  .story[data-chapter="0"] .chip .c0, .story[data-chapter="1"] .chip .c1, .story[data-chapter="2"] .chip .c2, .story[data-chapter="3"] .chip .c3 { display: inline; }
+
+  /* ---- design with an AI: a recorded run, scrubbed by the scroll ---- */
+  .ai { padding: 0; }
+  .ai-track { height: 620vh; position: relative; }
+  .ai-pin { position: sticky; top: 0; height: 100vh; height: 100svh; display: grid; grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
+            gap: clamp(20px, 3vw, 48px); align-items: center; padding-top: 58px; }
+  .chat { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); display: flex; flex-direction: column; max-height: min(80vh, 760px); overflow: hidden;
+          box-shadow: 0 30px 60px -32px #0007, 0 8px 18px -10px #0003; }
+  .chat-bar { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid var(--line); background: var(--bench); color: var(--ink-2); font: 12px var(--mono); }
+  .chat-bar .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--wire); }
+  .chat-body { padding: 14px; display: grid; gap: 12px; overflow: auto; scrollbar-width: none; }
+  .chat-body::-webkit-scrollbar { display: none; }
+  .chat-body > * { min-width: 0; overflow-wrap: anywhere; }
+  .ai-pin > * { min-width: 0; }
+  .msg small { display: block; font: 500 11px var(--mono); color: var(--ink-3); margin-bottom: 4px; }
+  .msg p { margin: 0; font-size: 15px; line-height: 1.5; color: var(--ink); min-height: 1.5em; }
+  .msg.you p { padding: 10px 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); }
+  .caret { display: inline-block; width: 2px; height: 1.05em; margin-left: 1px; vertical-align: -0.15em; background: var(--accent); animation: blink 1s steps(1) infinite; }
+  .caret[hidden] { display: none; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .call, .msg.ai { display: none; }
+  .call.on, .msg.ai.on { display: block; }
+  .call { border: 1px solid var(--line); border-radius: 4px; font: 12.5px/1.5 var(--mono); color: var(--ink-2); }
+  .call-h { display: flex; align-items: center; gap: 8px; padding: 7px 10px; }
+  .call-h code { font: 600 12px var(--mono); color: var(--ink); }
+  .call-h span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .call .spin { width: 11px; height: 11px; border-radius: 50%; border: 1.5px solid var(--line-2); border-top-color: var(--accent); opacity: 0; }
+  .call.busy .spin { opacity: 1; animation: spin .8s linear infinite; }
+  .ai.still .call.busy .spin, .ai.still .caret { animation: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .call ul { display: none; margin: 0; padding: 7px 10px 8px 26px; border-top: 1px solid var(--line); }
+  .call ul.on { display: block; }
+  .call li { margin: 1px 0; }
+  .ai-scene .chip .b, .ai[data-phase="pcb"] .ai-scene .chip .s { display: none; }
+  .ai[data-phase="pcb"] .ai-scene .chip .b { display: inline; }
+  .ai-scene .chip span { display: inline; }
+  .ai[data-phase="pcb"] .ai-scene { background: #001023; }
+
+  /* ---- together ---- */
+  .shots { display: grid; gap: 28px; min-width: 0; }
+  .shots figure { margin: 0; }
+  .together-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); gap: clamp(28px, 4vw, 60px); margin-top: 44px; align-items: start; }
+  .shot { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--bench);
+          box-shadow: 0 30px 60px -32px #0009, 0 8px 18px -10px #0004; }
+  .shot img { width: 100%; height: auto; aspect-ratio: 16 / 10; object-fit: cover; object-position: left top; }
+  .shot figcaption, figure .cap { font: 12px var(--mono); color: var(--ink-3); }
+  figure { margin: 0; }
+  .notes { list-style: none; margin: 0; padding: 0; counter-reset: n; border-top: 1px solid var(--ink); }
+  .notes::before { content: "NOTES"; display: block; font: 500 11.5px var(--mono); letter-spacing: .14em; color: var(--ink); padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .notes li { counter-increment: n; display: grid; grid-template-columns: 30px 1fr; padding: 13px 0; border-bottom: 1px solid var(--line); }
+  .notes li::before { content: counter(n) "."; font: 13px var(--mono); color: var(--ink-3); padding-top: 2px; }
+  .notes b { font-weight: 600; display: block; }
+  .notes span { color: var(--ink-2); font-size: 15px; line-height: 1.5; display: block; margin-top: 2px; }
+
+  /* ---- get it ---- */
+  .get-grid { display: grid; grid-template-columns: 1fr 1fr; margin-top: 44px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); overflow: hidden; }
+  .get-grid > div { padding: clamp(22px, 3vw, 36px); display: grid; gap: 14px; align-content: start; }
+  .get-grid > div + div { border-left: 1px solid var(--line); }
+  .get-grid h3 { font-size: 22px; letter-spacing: -.015em; font-weight: 600; }
+  .get-grid p { color: var(--ink-2); font-size: 15.5px; }
+  .get-grid ol { margin: 0; padding: 0 0 0 20px; color: var(--ink-2); font-size: 15px; display: grid; gap: 4px; }
+  .get-grid ol b { color: var(--ink); font-weight: 500; }
+  .get-grid .acts { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+  .os { font: 12px var(--mono); color: var(--ink-3); }
+
+  /* ---- closing and title block ---- */
+  .close { text-align: left; padding-bottom: clamp(48px, 6vw, 80px); }
+  .close h2 { font-size: clamp(34px, 5.4vw, 68px); letter-spacing: -.035em; max-width: 16ch; }
+  .close .acts { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 30px; }
+  .titleblock { margin: 0 0 40px; border: 1.5px solid var(--ink); display: grid; grid-template-columns: 2.2fr 1fr 1fr 1fr; gap: 1px; font-size: 13.5px; background: var(--ink); }
+  .titleblock > div { padding: 9px 12px; min-width: 0; background: var(--paper); }   /* the rules between cells are the grid's gaps */
+  .titleblock small { display: block; font: 500 10px var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); }
+  .titleblock a { color: var(--ink); text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 3px; }
+  .titleblock .big { font-weight: 600; font-size: 16px; display: flex; align-items: center; gap: 9px; }
+  .titleblock .big svg { width: 20px; height: 20px; }
+  .titleblock .wide { grid-column: span 4; color: var(--ink-2); font-size: 12.5px; }
+
+  /* ---- the page's own look: KiCad's lettering and drawing-sheet furniture, the app's flat panels ---- */
+  :root { --page: var(--sheet); }
+  :root[data-theme="dark"] { --page: var(--panel); }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --page: var(--panel); } }
+  /* the page lies on KiCad's schematic canvas: its sheet colour and its grid of dots */
+  /* The dots hold still, as the canvas does: the pinned story and AI panels stand still while the page
+     scrolls past them, so a grid that slid behind them would look like it was coming loose. */
+  body { background-color: var(--page); background-image: none; }
+  body::before { content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+         background-image: radial-gradient(circle, color-mix(in srgb, var(--line-2) 70%, transparent) 0.9px, transparent 1.2px);
+         background-size: 20px 20px; background-position: 10px 10px; }
+  /* Loose text sits on the dotted sheet: a halo of the sheet's colour keeps the dots out of the letters. */
+  main, footer { text-shadow: 0 0 2px var(--page), 0 0 2px var(--page), 0 0 5px var(--page); }
+  .win, .scene, .shot, .get-grid, .sheet-h, .titleblock, .btn { text-shadow: none; }
+  [data-stroke] { font-weight: 600; letter-spacing: 0; }
+  .lettered { line-height: 0; }
+  .lettered .t { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .lettered svg { display: block; max-width: 100%; height: auto; overflow: visible; }
+  .lettered path { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; }
+  .hero h1 { font-size: clamp(28px, 4vw, 52px); line-height: 1.15; letter-spacing: 0; color: var(--ink); }
+  .hero-row { grid-template-columns: minmax(0, 1fr); gap: 22px; align-items: start; }
+  .hero-side { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 20px clamp(28px, 4vw, 64px); align-items: start; padding-bottom: 0; }
+  @media (max-width: 900px) { .hero-side { grid-template-columns: minmax(0, 1fr); } }
+  .hero .also { max-width: 52ch; }
+  h2 { font-size: clamp(22px, 2.5vw, 31px); line-height: 1.2; letter-spacing: 0; }
+  h3, .steps h3, .get-grid h3 { letter-spacing: 0; }
+  /* every section opens with a strip of a drawing sheet's title block */
+  .sheet-h { display: grid; grid-template-columns: minmax(0, 1fr) auto; border: 1.5px solid var(--ink); background: var(--paper); }
+  .sheet-h h2 { padding: 14px 16px 12px; min-width: 0; }
+  .sheet-n { display: flex; align-items: center; padding: 0 16px; border-left: 1px solid var(--ink); font-size: 13px; color: var(--ink-2); white-space: nowrap; }
+  .story-head { gap: 0; }
+  .cap, .shot figcaption, figure .cap, .os, .steps .n, .titleblock small, .scene .chip, .scene .turn, .win-bar, .win-status, .layers button {
+    font-family: var(--font); letter-spacing: 0; text-transform: none; }
+  .cap, .shot figcaption, figure .cap, .os { font-size: 13px; }
+  .steps .n { font-size: 13px; font-weight: 500; }
+  .titleblock small { font-size: 11.5px; font-weight: 400; }
+  .notes { border-top: 1px solid var(--line); }
+  .notes::before { content: none; }
+  .notes li { grid-template-columns: 1fr; padding: 12px 0; }
+  .notes li::before { content: none; }
+  /* flat, square surfaces as in the application: no soft cards, no floating shadows, nothing leaning */
+  .win, .scene, .shot, .get-grid { border-radius: 2px; box-shadow: none; border-color: var(--line-2); }
+  .js .win.rv, .js .win.rv.in { transform: none; }
+  .close { padding-top: clamp(40px, 6vw, 72px) !important; }
+  #get { padding-bottom: clamp(40px, 5vw, 64px); }   /* the page ends at Get it now, straight into the footer */
+  .close .lead { max-width: 60ch; }
+  .close .acts { margin-top: 18px; }
+  @media (max-width: 640px) { .sheet-n { display: none; } .sheet-h h2 { padding: 12px 12px 10px; } }
+
+  /* ---- entrances ---- */
+  .js .rv { opacity: 0; transform: translateY(16px); transition: opacity .8s cubic-bezier(.2, .7, .2, 1), transform .8s cubic-bezier(.2, .7, .2, 1); transition-delay: calc(var(--i, 0) * 70ms); }
+  .js .rv.in { opacity: 1; transform: none; }
+
+  @media (max-width: 900px) {
+    .nav nav { display: none; }
+    .hero-row { grid-template-columns: 1fr; }
+    .story-track { height: 480vh; }
+    .ai-track { height: 540vh; }
+    .ai-pin { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); gap: 12px; align-items: stretch; padding: 66px 0 16px; }
+    .chat { max-height: 36vh; max-height: 36svh; }
+    .ai .ai-scene { order: 0; height: auto; min-height: 0; }
+    .story-pin { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); gap: 14px; align-items: start; padding: 66px 0 16px; }
+    .scene { order: -1; height: 52vh; height: 52svh; }
+    .steps { grid-template-columns: repeat(4, 1fr); column-gap: 8px; }
+    .steps li { border-left: 0; border-top: 2px solid var(--line); padding: 8px 0 0; display: contents; }
+    .steps li::before { display: none; }
+    .steps li .n { grid-row: 1; border-top: 2px solid var(--line); padding-top: 8px; }
+    .steps li.on .n, .steps li.done .n { border-top-color: var(--accent); }
+    .steps li h3, .steps li .more { grid-column: 1 / -1; display: none; }
+    .steps li h3 { grid-row: 2; } .steps li .more { grid-row: 3; }
+    .steps li.on h3 { display: block; margin-top: 12px; }
+    .steps li.on .more { display: block; opacity: 1; }
+    .win-status .hide-m { display: none; }
+    .together-grid { grid-template-columns: 1fr; }
+    .get-grid { grid-template-columns: 1fr; }
+    .get-grid > div + div { border-left: 0; border-top: 1px solid var(--line); }
+    .titleblock { grid-template-columns: 1fr 1fr; }
+    .titleblock .wide, .titleblock .t1, .titleblock > div:nth-child(4), .titleblock > div:nth-last-child(2) { grid-column: span 2; }
+  }
+  @media (max-width: 520px) {
+    .wrap { width: calc(100% - 32px); }
+    .brand span { display: none; }
+    .win-status .hide-s, .win-bar .app, .tb.text span { display: none; }
+    .tb.text { padding: 0; width: 28px; justify-content: center; }
+    .btn { padding: 10px 14px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .js .rv { opacity: 1; transform: none; transition: none; }
+    .js .win.rv, .js .win.rv.in { transform: none; }
+    .live::before { animation: none; }
+    .steps .more { transition: none; }
+  }
+</style>
+</head>
+<body>
+
+<header class="nav" id="nav">
+  <div class="wrap">
+    <a class="brand" href="/welcome" aria-label="Junction">{{MARK}}<span>Junction</span></a>
+    <nav aria-label="Sections">
+      <a href="#make">How a board gets made</a>
+      <a href="#ai">Design with an AI</a>
+      <a href="#together">Working together</a>
+      <a href="#get">Get it</a>
+    </nav>
+    <span class="sp"></span>
+    <button class="icon-btn" id="theme" type="button" aria-label="Switch between light and dark">
+      <svg class="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.5 1.5M17.2 17.2l1.5 1.5M5.3 18.7l1.5-1.5M17.2 6.8l1.5-1.5"/></svg>
+      <svg class="moon" viewBox="0 0 24 24"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg>
+    </button>
+    <a class="btn sm" data-signin href="/auth/github/login?next=/">Sign in</a>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="wrap">
+    <div class="hero-row">
+      <h1 class="rv" data-stroke>Real-time collaboration for KiCad</h1>
+      <div class="hero-side">
+        <p class="lead rv" style="--i:2">Real-time collaboration built into the schematic and PCB editors. You see each other's cursors, edits land as they are made, and the project lives online, so nobody has to pass a zip around. It works in the desktop app and in the browser.</p>
+        <div class="rv" style="--i:3">
+          <div class="acts">
+            <a class="btn primary" data-signin data-long href="/auth/github/login?next=/"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 .2a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38v-1.33c-2.23.48-2.7-1.07-2.7-1.07-.36-.93-.89-1.17-.89-1.17-.73-.5.05-.49.05-.49.8.06 1.23.83 1.23.83.72 1.23 1.88.87 2.34.67.07-.52.28-.87.5-1.07-1.77-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.19c0 .21.15.46.55.38A8 8 0 0 0 8 .2z"/></svg><span>Sign in with GitHub</span></a>
+            <a class="btn" href="#get">Get the desktop app</a>
+          </div>
+          <p class="also">Or <a href="/gallery">browse public projects</a> without an account. Backwards compatible: it opens projects from any KiCad version from 6 to 10. Open source under GPL-3.0, <a href="https://github.com/JunctionEDA/junction">on GitHub</a>, for macOS, Windows, Linux and the browser.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="win rv" style="--i:4" id="hero" data-tool="select" data-layer="F.Cu" data-view="pcb">
+      <div class="win-bar">
+        <div class="tabs" role="tablist" aria-label="Open documents">
+          <button type="button" role="tab" data-tab="sch" aria-selected="false"><span class="long">stm32-usbc.</span>kicad_sch</button>
+          <button type="button" role="tab" data-tab="pcb" aria-selected="true"><span class="long">stm32-usbc.</span>kicad_pcb</button>
+        </div>
+        <span class="app" data-app>PCB Editor</span>
+        <span class="sp"></span>
+        <span class="live">live</span>
+        <span class="avs" aria-label="Mara, Jun and Ada are in this file with you"><i style="--c:#A45BD6">M</i><i style="--c:#149C94">J</i><i style="--c:#D9822B">A</i><i class="you">You</i></span>
+      </div>
+      <div class="win-tools" role="toolbar" aria-label="Board editor">
+        <span class="sch-only cap-s" data-sch-cap>Mara, Jun and Ada are drawing the schematic. The board comes next.</span>
+        <button type="button" class="tb" data-act="undo" title="Undo (Ctrl+Z)" aria-label="Undo" disabled><img class="il" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:%23545454;}%3C/style%3E%3C/defs%3E%3Cpath class='cls-1' d='m 10.692917,22 c -0.063,0 -0.125152,-9.16e-4 -0.18948,-0.0018 A 10.229771,9.8921921 0 0 1 3.2675531,18.943853 0.95053869,0.91917126 0 1 1 4.6338973,17.665656 8.4243054,8.1463063 0 0 0 16.741705,6.3362253 8.3960728,8.1190054 0 0 0 4.8465893,6.1295444 0.95071867,0.91934529 0 0 1 3.5283731,4.8045328 10.059049,9.7271043 0 0 1 10.872829,2.0037133 10.32669,9.9859126 0 0 1 20.998101,12.179816 10.325269,9.9845385 0 0 1 10.692917,22 Z' style='stroke-width:1;stroke-miterlimit:4;stroke-dasharray:none' /%3E%3Cpath class='cls-1' d='M 8.6954,9.4573 A 0.993,0.993 0 0 1 8.3911,9.4102 L 2.6976,7.5895 A 1.0049,1.0049 0 0 1 2,6.6319 v -5.63 a 1.0019,1.0019 0 1 1 2.0038,0 v 4.896 L 9,7.4953 a 1.0051,1.0051 0 0 1 -0.3046,1.962 z' style='stroke-width:1;stroke-miterlimit:4;stroke-dasharray:none' /%3E%3C/svg%3E"><img class="id" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:%23DED3DD;}%3C/style%3E%3C/defs%3E%3Cpath class='cls-1' d='m 10.692917,22 c -0.063,0 -0.125152,-9.16e-4 -0.18948,-0.0018 A 10.229771,9.8921921 0 0 1 3.2675531,18.943853 0.95053869,0.91917126 0 1 1 4.6338973,17.665656 8.4243054,8.1463063 0 0 0 16.741705,6.3362253 8.3960728,8.1190054 0 0 0 4.8465893,6.1295444 0.95071867,0.91934529 0 0 1 3.5283731,4.8045328 10.059049,9.7271043 0 0 1 10.872829,2.0037133 10.32669,9.9859126 0 0 1 20.998101,12.179816 10.325269,9.9845385 0 0 1 10.692917,22 Z' style='stroke-width:1;stroke-miterlimit:4;stroke-dasharray:none' /%3E%3Cpath class='cls-1' d='M 8.6954,9.4573 A 0.993,0.993 0 0 1 8.3911,9.4102 L 2.6976,7.5895 A 1.0049,1.0049 0 0 1 2,6.6319 v -5.63 a 1.0019,1.0019 0 1 1 2.0038,0 v 4.896 L 9,7.4953 a 1.0051,1.0051 0 0 1 -0.3046,1.962 z' style='stroke-width:1;stroke-miterlimit:4;stroke-dasharray:none' /%3E%3C/svg%3E"></button>
+        <i class="sep"></i>
+        <button type="button" class="tb" data-act="zoom-in" title="Zoom in (+)" aria-label="Zoom in"><img class="il" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:%23545454;}.cls-2{fill:none;stroke:%23545454;stroke-linecap:round;stroke-linejoin:round;stroke-width:2px;}%3C/style%3E%3C/defs%3E%3Cpath class='cls-1' d='M 9.9976493,18.999997 A 8.998129,8.9999987 0 1 1 16.362105,3.6373763 v 0 A 8.9954858,8.9973549 0 0 1 9.9976493,18.999997 Z m 0,-16.2787305 A 7.2800339,7.2815466 0 1 0 15.148695,4.8510385 7.2612755,7.2627843 0 0 0 9.9976493,2.7216076 Z' style='fill:%23545454;fill-opacity:1;stroke-width:1;stroke-miterlimit:4;stroke-dasharray:none' /%3E%3Cpath class='cls-1' d='M 21.941949,23.012172 A 1.071826,1.071826 0 0 1 21.181811,22.69715 l -6.176896,-6.176896 a 1.0927916,1.0927916 0 0 1 1.520275,-1.520382 l 6.177004,6.176896 a 1.075159,1.075159 0 0 1 -0.760245,1.835404 z' style='stroke-width:1' /%3E%3Cline class='cls-2' x1='6.5' y1='10.018' x2='13.494992' y2='10.018' /%3E%3Cline class='cls-2' x1='10' y1='6.5200853' x2='10' y2='13.515091' /%3E%3C/svg%3E"><img class="id" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:%23DED3DD;}.cls-2{fill:none;stroke:%23DED3DD;stroke-linecap:round;stroke-linejoin:round;stroke-width:2px;}%3C/style%3E%3C/defs%3E%3Cpath class='cls-1' d='M 9.9976493,18.999997 A 8.998129,8.9999987 0 1 1 16.362105,3.6373763 v 0 A 8.9954858,8.9973549 0 0 1 9.9976493,18.999997 Z m 0,-16.2787305 A 7.2800339,7.2815466 0 1 0 15.148695,4.8510385 7.2612755,7.2627843 0 0 0 9.9976493,2.7216076 Z' style='fill:%23DED3DD;fill-opacity:1;stroke-width:1;stroke-miterlimit:4;stroke-dasharray:none' /%3E%3Cpath class='cls-1' d='M 21.941949,23.012172 A 1.071826,1.071826 0 0 1 21.181811,22.69715 l -6.176896,-6.176896 a 1.0927916,1.0927916 0 0 1 1.520275,-1.520382 l 6.177004,6.176896 a 1.075159,1.075159 0 0 1 -0.760245,1.835404 z' style='stroke-width:1' /%3E%3Cline class='cls-2' x1='6.5' y1='10.018' x2='13.494992' y2='10.018' /%3E%3Cline class='cls-2' x1='10' y1='6.5200853' x2='10' y2='13.515091' /%3E%3C/svg%3E"></button>
+        <button type="button" class="tb" data-act="zoom-out" title="Zoom out (-)" aria-label="Zoom out"><img class="il" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:%23545454;}.cls-2{fill:none;stroke:%23545454;stroke-linecap:round;stroke-linejoin:round;stroke-width:2px;}%3C/style%3E%3C/defs%3E%3Cpath class='cls-1' d='M 9.9976493,18.999997 A 8.998129,8.9999987 0 1 1 16.362105,3.6373763 v 0 A 8.9954858,8.9973549 0 0 1 9.9976493,18.999997 Z m 0,-16.2787305 A 7.2800339,7.2815466 0 1 0 15.148695,4.8510385 7.2612755,7.2627843 0 0 0 9.9976493,2.7216076 Z' style='stroke-width:1;stroke-miterlimit:4;stroke-dasharray:none' /%3E%3Cpath class='cls-1' d='M 21.941949,23.012172 A 1.071826,1.071826 0 0 1 21.181811,22.69715 l -6.176896,-6.176896 a 1.0927916,1.0927916 0 0 1 1.520275,-1.520382 l 6.177004,6.176896 a 1.075159,1.075159 0 0 1 -0.760245,1.835404 z' style='stroke-width:1' /%3E%3Cline class='cls-2' x1='6.5' y1='10.018' x2='13.494992' y2='10.018' /%3E%3C/svg%3E"><img class="id" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:%23DED3DD;}.cls-2{fill:none;stroke:%23DED3DD;stroke-linecap:round;stroke-linejoin:round;stroke-width:2px;}%3C/style%3E%3C/defs%3E%3Cpath class='cls-1' d='M 9.9976493,18.999997 A 8.998129,8.9999987 0 1 1 16.362105,3.6373763 v 0 A 8.9954858,8.9973549 0 0 1 9.9976493,18.999997 Z m 0,-16.2787305 A 7.2800339,7.2815466 0 1 0 15.148695,4.8510385 7.2612755,7.2627843 0 0 0 9.9976493,2.7216076 Z' style='stroke-width:1;stroke-miterlimit:4;stroke-dasharray:none' /%3E%3Cpath class='cls-1' d='M 21.941949,23.012172 A 1.071826,1.071826 0 0 1 21.181811,22.69715 l -6.176896,-6.176896 a 1.0927916,1.0927916 0 0 1 1.520275,-1.520382 l 6.177004,6.176896 a 1.075159,1.075159 0 0 1 -0.760245,1.835404 z' style='stroke-width:1' /%3E%3Cline class='cls-2' x1='6.5' y1='10.018' x2='13.494992' y2='10.018' /%3E%3C/svg%3E"></button>
+        <button type="button" class="tb" data-act="zoom-fit" title="Zoom to fit (Home)" aria-label="Zoom to fit"><img class="il" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:%23545454;}.cls-2{fill:%23b9b9b9;}%3C/style%3E%3C/defs%3E%3Cpath class='cls-1' d='M 21.941949,23.012172 A 1.071826,1.071826 0 0 1 21.181811,22.69715 l -6.176896,-6.176896 a 1.0927916,1.0927916 0 0 1 1.520275,-1.520382 l 6.177004,6.176896 a 1.075159,1.075159 0 0 1 -0.760245,1.835404 z' style='stroke-width:1' /%3E%3Cpath style='fill:%23909090;fill-opacity:1;stroke:%23909090;stroke-width:1;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1' d='M 6.5,5.5 H 11 L 13.5,8 V 8.5 12.454544 14.5 h -7 z' class='cls-2' /%3E%3Cpath class='cls-1' d='M 9.9976484,18.999997 A 8.998129,8.9999987 0 1 1 16.362105,3.6373767 v 0 A 8.9954858,8.9973549 0 0 1 9.9976484,18.999997 Z m 0,-16.2787301 A 7.2800339,7.2815466 0 1 0 15.148695,4.8510389 7.2612755,7.2627843 0 0 0 9.9976484,2.721608 Z' style='stroke-width:1;stroke-miterlimit:4;stroke-dasharray:none' /%3E%3C/svg%3E"><img class="id" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:%23DED3DD;}.cls-2{fill:%238f8f8f;}%3C/style%3E%3C/defs%3E%3Cpath class='cls-1' d='M 21.941949,23.012172 A 1.071826,1.071826 0 0 1 21.181811,22.69715 l -6.176896,-6.176896 a 1.0927916,1.0927916 0 0 1 1.520275,-1.520382 l 6.177004,6.176896 a 1.075159,1.075159 0 0 1 -0.760245,1.835404 z' style='stroke-width:1' /%3E%3Cpath style='fill:%23d0d0d0;fill-opacity:1;stroke:%23d0d0d0;stroke-width:1;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1' d='M 6.5,5.5 H 11 L 13.5,8 V 8.5 12.454544 14.5 h -7 z' class='cls-2' /%3E%3Cpath class='cls-1' d='M 9.9976484,18.999997 A 8.998129,8.9999987 0 1 1 16.362105,3.6373767 v 0 A 8.9954858,8.9973549 0 0 1 9.9976484,18.999997 Z m 0,-16.2787301 A 7.2800339,7.2815466 0 1 0 15.148695,4.8510389 7.2612755,7.2627843 0 0 0 9.9976484,2.721608 Z' style='stroke-width:1;stroke-miterlimit:4;stroke-dasharray:none' /%3E%3C/svg%3E"></button>
+        <i class="sep"></i>
+        <div class="layers" role="group" aria-label="Active layer">
+          <button type="button" data-layer-btn="F.Cu" aria-pressed="true" title="Front copper (PgUp)"><i style="--c:var(--fcu)"></i>F.Cu</button>
+          <button type="button" data-layer-btn="B.Cu" aria-pressed="false" title="Back copper (PgDn)"><i style="--c:var(--bcu)"></i>B.Cu</button>
+        </div>
+        <span class="sp"></span>
+        <button type="button" class="tb text" data-act="reset" title="Put the board back as it was" disabled><img class="il" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:none;stroke:%231a81c4;stroke-linecap:round;stroke-linejoin:round;stroke-width:2px;}%3C/style%3E%3C/defs%3E%3Cpath class='cls-1' d='M 2.95,16.43 A 10.2024,10.2024 0 0 0 21.5675,15.4465' /%3E%3Cpath class='cls-1' d='M 21.0361,7.65 A 10.1937,10.1937 0 0 0 2.0809,9.4958' /%3E%3Cpolyline class='cls-1' points='17.701 8.519 22.198 8.922 23.071 4.262' transform='translate(-1,-1)' /%3E%3Cpolyline class='cls-1' points='8.441 17.769 3.945 17.366 3.071 22.026' transform='translate(-1,-1)' /%3E%3C/svg%3E"><img class="id" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:none;stroke:%2342B8EB;stroke-linecap:round;stroke-linejoin:round;stroke-width:2px;}%3C/style%3E%3C/defs%3E%3Cpath class='cls-1' d='M 2.95,16.43 A 10.2024,10.2024 0 0 0 21.5675,15.4465' /%3E%3Cpath class='cls-1' d='M 21.0361,7.65 A 10.1937,10.1937 0 0 0 2.0809,9.4958' /%3E%3Cpolyline class='cls-1' points='17.701 8.519 22.198 8.922 23.071 4.262' transform='translate(-1,-1)' /%3E%3Cpolyline class='cls-1' points='8.441 17.769 3.945 17.366 3.071 22.026' transform='translate(-1,-1)' /%3E%3C/svg%3E"><span>Start over</span></button>
+      </div>
+      <div class="win-body">
+        <canvas tabindex="0" aria-label="A small board editor. The board is an STM32 USB-C development board. Three scripted teammates design it from the bare outline: they place the parts from a pile, route every connection, pour and stitch the ground planes and add the labels. On the way one of them leaves a review comment, another makes the change and the comment is resolved. Drag a footprint to move it, or pick the route tool and click two pads to join them; a teammate then puts your change back."></canvas>
+        <canvas data-sch aria-label="The schematic of the same STM32 USB-C board, drawn block by block by three scripted teammates: USB-C input, 3.3 V regulator, the microcontroller, the buttons, the LED and the edge pins. When it is complete the window turns to the board."></canvas>
+        <div class="win-side" role="toolbar" aria-label="Tools" aria-orientation="vertical">
+          <button type="button" class="tb" data-tool-btn="select" aria-pressed="true" title="Select and move (Esc)" aria-label="Select and move"><img class="il" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:%23545454;}%3C/style%3E%3C/defs%3E%3Cpath class='cls-1' d='m 7,4 4.18e-4,13.636621 3.013224,-2.910219 c 0.40646,0.927255 1.002473,2.296662 1.523834,3.492113 a 1.5317443,1.5317443 0 0 0 2.031021,0.78694 v 0 a 1.5537557,1.5537557 0 0 0 0.792899,-2.03839 C 13.840175,15.77142 13.243405,14.399854 12.836027,13.469757 L 17,13.184675 Z' style='stroke-width:1' /%3E%3C/svg%3E"><img class="id" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:%23DED3DD;}%3C/style%3E%3C/defs%3E%3Cpath class='cls-1' d='m 7,4 4.18e-4,13.636621 3.013224,-2.910219 c 0.40646,0.927255 1.002473,2.296662 1.523834,3.492113 a 1.5317443,1.5317443 0 0 0 2.031021,0.78694 v 0 a 1.5537557,1.5537557 0 0 0 0.792899,-2.03839 C 13.840175,15.77142 13.243405,14.399854 12.836027,13.469757 L 17,13.184675 Z' style='stroke-width:1;fill:%23DED3DD;fill-opacity:1' /%3E%3C/svg%3E"></button>
+          <button type="button" class="tb" data-tool-btn="route" aria-pressed="false" title="Route tracks (X)" aria-label="Route tracks"><img class="il" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:none;stroke:%23545454;stroke-linecap:round;stroke-linejoin:round;stroke-width:2px;}%3C/style%3E%3C/defs%3E%3Cpath style='fill:none;stroke:%231a81c4;stroke-width:2px;stroke-linecap:round;stroke-linejoin:round;stroke-opacity:1' transform='translate(-1,-1)' d='M 23,3 18.5,13 H 7.5 L 3,23' class='cls-1' /%3E%3C/svg%3E"><img class="id" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:none;stroke:%23DED3DD;stroke-linecap:round;stroke-linejoin:round;stroke-width:2px;}%3C/style%3E%3C/defs%3E%3Cpath style='fill:none;stroke:%2342B8EB;stroke-width:2px;stroke-linecap:round;stroke-linejoin:round;stroke-opacity:1' transform='translate(-1,-1)' d='M 23,3 18.5,13 H 7.5 L 3,23' class='cls-1' /%3E%3C/svg%3E"></button>
+          <button type="button" class="tb" data-tool-btn="via" aria-pressed="false" title="Add via (V)" aria-label="Add via"><img class="il" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:%23f29100;}.cls-2{fill:%23b9b9b9;}%3C/style%3E%3C/defs%3E%3Ccircle class='cls-1' cx='12' cy='12' r='7' /%3E%3Ccircle class='cls-2' cx='12' cy='12' style='fill:%23ffffff;fill-opacity:1;stroke-width:1' r='3' /%3E%3C/svg%3E"><img class="id" alt="" width="22" height="22" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-name='Слой 1' viewBox='0 0 24 24' version='1.1'%3E%3Cdefs%3E%3Cstyle%3E.cls-1{fill:%23f29100;}.cls-2{fill:%238f8f8f;}%3C/style%3E%3C/defs%3E%3Ccircle class='cls-1' cx='12' cy='12' r='7' /%3E%3Ccircle class='cls-2' cx='12' cy='12' style='fill:%23e0e0e0;fill-opacity:1;stroke-width:1' r='3' /%3E%3C/svg%3E"></button>
+        </div>
+      </div>
+      <div class="win-status"><span class="sch-only" data-sch-counts>Symbols 22</span><span class="sch-only">Nets 27</span><span class="sch-only sp"></span><span class="sch-only hide-s">grid 1.27</span><span class="sch-only">mm</span><span class="hide-s" data-counts>Pads 100</span><span data-unrouted>Unrouted 73</span><span class="sp"></span><span class="hide-s" data-z>Z 1.00</span><span data-xy>X --.--  Y --.--</span><span class="hide-s">grid 0.25</span><span class="hide-s">mm</span><span class="hide-m" data-toolname>Select item(s)</span></div>
+    </div>
+    <div class="keep">
+      <p class="cap">Try it: this is the web editor's renderer on a real .kicad_pcb, an STM32 USB-C board. Mara, Jun and Ada are designing it from the bare outline: placing the parts, routing them, pouring the ground planes. When one of them leaves a review comment, another makes the change. Drag a part or a label, route a track (X), change layer and drop a via (V), and one of them comes over to put it back. Here they are scripted; in a project they are your teammates.</p>
+      <a class="btn" data-keep href="/auth/github/login?next=%2F%3Fstart%3Dmini" title="Makes a project of this board, with its schematic, and opens it in the editor">Keep going in a real project</a>
+    </div>
+  </div>
+</section>
+
+<section class="story" id="make" data-chapter="0">
+  <div class="wrap story-head">
+    <div class="sheet-h rv"><h2 data-stroke>How a board gets made</h2><span class="sheet-n">Sheet 1 / 4</span></div>
+    <p class="lead rv" style="--i:1; margin-top:18px">One design, from the first wire to a finished board, in a file everyone has open. Scroll to follow it.</p>
+  </div>
+  <div class="story-track">
+    <div class="wrap story-pin">
+      <ol class="steps">
+        <li data-step class="on"><span class="n">1. Schematic</span><h3>Draw the circuit together</h3>
+          <div class="more"><div><p>Symbols, wires and labels show up on everyone's sheet as they are placed. A wire someone is still drawing appears as a preview, so two people never wire the same net twice.</p></div></div></li>
+        <li data-step><span class="n">2. Placement</span><h3>Split the board and place it</h3>
+          <div class="more"><div><p>Parts arrive on the board in a pile, with airwires showing what connects to what. Take the connector while someone else takes the timing parts. A part being dragged is outlined in its owner's colour.</p></div></div></li>
+        <li data-step><span class="n">3. Routing</span><h3>Route it, by hand or not</h3>
+          <div class="more"><div><p>Tracks appear for everyone segment by segment as they are laid. In the web editor, the autorouter can finish the connections you leave and shows its result as a preview before anything is kept.</p></div></div></li>
+        <li data-step><span class="n">4. 3D viewer</span><h3>It is still KiCad</h3>
+          <div class="more"><div><p>The files are ordinary .kicad_sch and .kicad_pcb. Rule checks, the 3D viewer and fabrication outputs work in the browser as well as in the desktop app. Name a checkpoint before you order, and restore it if you need to.</p></div></div></li>
+      </ol>
+      <div class="scene">
+        <canvas aria-label="A 555 LED blinker drawn as a schematic, then placed, routed and shown as a finished board as you scroll."></canvas>
+        <div class="v3d" data-3d aria-hidden="true"></div>
+        <span class="turn">drag to turn</span>
+        <span class="chip"><span class="c0">blinker.kicad_sch</span><span class="c1">blinker.kicad_pcb</span><span class="c2">blinker.kicad_pcb</span><span class="c3">3D Viewer</span></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="ai" id="ai">
+  <div class="wrap story-head">
+    <div class="sheet-h rv"><h2 data-stroke>Design with an AI</h2><span class="sheet-n">Sheet 2 / 4</span></div>
+    <p class="lead rv" style="--i:1; margin-top:18px">Connect an AI app to your projects over MCP and ask it for a board. Its edits land in the same files, live, like anyone else's. This is a recorded run, played back as you scroll.</p>
+  </div>
+  <div class="ai-track">
+    <div class="wrap ai-pin">
+      <div class="chat" aria-live="off">
+        <div class="chat-bar"><span class="dot"></span>AI app, connected to Junction over MCP</div>
+        <div class="chat-body">
+          <div class="msg you"><small>You</small><p><span data-prompt></span><i class="caret" data-caret></i></p></div>
+          <div class="call" data-call>
+            <div class="call-h"><code>run_python</code><span>ESP32-C3 battery devboard schematic</span><i class="spin"></i></div>
+            <ul data-out></ul>
+          </div>
+          <div class="call" data-call>
+            <div class="call-h"><code>run_python</code><span>Place and route the board</span><i class="spin"></i></div>
+            <ul data-out></ul>
+          </div>
+          <div class="msg ai" data-done><small>AI</small><p></p></div>
+        </div>
+      </div>
+      <div class="scene ai-scene">
+        <canvas aria-label="An ESP32-C3 devboard drawn by an AI: the schematic appears item by item, then the footprints move from a pile onto a Pico-sized board and the tracks are laid, as you scroll."></canvas>
+        <span class="chip"><span class="s">esp32.kicad_sch</span><span class="b">esp32.kicad_pcb</span></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="together">
+  <div class="wrap">
+    <div class="sheet-h rv"><h2 data-stroke>Working together</h2><span class="sheet-n">Sheet 3 / 4</span></div>
+    <p class="lead rv" style="--i:1; margin-top:18px">What you see when someone else is in the file.</p>
+    <div class="together-grid">
+      <div class="shots">
+        <figure class="rv">
+          <div class="shot"><img src="/static/landing/board.webp" width="2400" height="1500" loading="lazy" alt="The web PCB editor in dark mode on a small STM32 USB-C board. Jun has the regulator U3 selected, which is outlined on Ada's screen with Jun's named cursor beside it. Mara's cursor is on the boot button, and a numbered comment pin sits on a capacitor."></div>
+          <figcaption class="cap" style="margin-top:10px">The web PCB editor, Ada's window. Jun has U3 selected, Mara is at the boot button, and a comment is pinned to C4.</figcaption>
+        </figure>
+        <figure class="rv" style="--i:1">
+          <div class="shot"><img src="/static/landing/schematic.webp" width="2400" height="1500" loading="lazy" alt="The web schematic editor on the same project. Jun has the microcontroller U1 selected, Mara's named cursor is on the USB-C connector, and a comment pin sits on the boot resistor."></div>
+          <figcaption class="cap" style="margin-top:10px">The schematic of the same project, a moment later. Jun has U1 selected.</figcaption>
+        </figure>
+      </div>
+      <ol class="notes rv" style="--i:1">
+        <li><div><b>Named cursors and selections</b><span>Everyone gets a colour. Their pointer and whatever they have selected are drawn in it on your canvas.</span></div></li>
+        <li><div><b>Edits before they land</b><span>A track being routed, a wire being drawn or a part being dragged shows as a preview until it is committed.</span></div></li>
+        <li><div><b>Follow</b><span>Follow a collaborator's viewport while they walk you through a design.</span></div></li>
+        <li><div><b>Comments</b><span>Pin a comment to a spot on the canvas, or keep a thread on the document.</span></div></li>
+        <li><div><b>Checkpoints</b><span>Name a version. The project's owner can restore it later.</span></div></li>
+        <li><div><b>Offline</b><span>Lose the connection and keep working. Edits are journalled locally and replayed when you are back.</span></div></li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<section id="get" style="padding-top:0">
+  <div class="wrap">
+    <div class="sheet-h rv"><h2 data-stroke>Get it</h2><span class="sheet-n">Sheet 4 / 4</span></div>
+    <p class="lead rv" style="--i:1; margin-top:18px">Use the desktop app or the browser. It is the same project either way.</p>
+    <div class="get-grid rv" style="--i:2">
+      <div>
+        <h3>Desktop app</h3>
+        <p>All of KiCad, with collaboration built into the editors. Use it when you need the full toolset.</p>
+        <ol>
+          <li>Open the project manager and choose <b>File, Online Projects</b>.</li>
+          <li>Sign in with GitHub. Upload a project or open one shared with you.</li>
+          <li>Use <b>Share</b> to invite someone, then open the same sheet or board.</li>
+        </ol>
+        <div class="acts"><a class="btn primary" href="/download/macos">macOS</a><a class="btn" href="/download/windows">Windows</a><a class="btn" href="/download/linux">Linux</a></div>
+        <p class="os">Apple Silicon (macOS 15+) / Windows x64 / Linux x64 (Ubuntu 24.04) · <a href="https://github.com/JunctionEDA/junction/releases/latest">Release notes and all files</a></p>
+      </div>
+      <div>
+        <h3>Browser</h3>
+        <p>Nothing to install. Good for a review, a quick fix from another machine, or a collaborator who does not have KiCad.</p>
+        <ol>
+          <li>Sign in with GitHub.</li>
+          <li>Upload a KiCad project, import one from a repository, or open an invite link.</li>
+          <li>Edit. People in the desktop app see you, and you see them.</li>
+        </ol>
+        <div class="acts"><a class="btn primary" data-signin data-long href="/auth/github/login?next=/"><span>Sign in with GitHub</span></a><a class="btn" href="/gallery">Browse public projects</a></div>
+        <p class="os">junctioneda.com</p>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- The closing call repeated Get it's buttons; the person asked for it to go (2026-11-16).
+<section class="close" style="padding-top:0">
+  <div class="wrap">
+    <p class="lead rv">Sign in to start a project in the browser, or get the desktop app and open it from there.</p>
+    <div class="acts rv" style="- -i:1">
+      <a class="btn primary" data-signin data-long href="/auth/github/login?next=/"><span>Sign in with GitHub</span></a>
+      <a class="btn" href="#get">Get the desktop app</a>
+    </div>
+  </div>
+</section>
+-->
+</main>
+
+<footer class="wrap">
+  <div class="titleblock">
+    <div class="t1"><small>Title</small><span class="big">{{MARK}}Junction</span></div>
+    <div><small>Source</small><a href="https://github.com/JunctionEDA/junction">GitHub</a></div>
+    <div><small>Releases</small><a href="https://github.com/JunctionEDA/junction/releases">Downloads</a></div>
+    <div><small>License</small>Open source, GPL-3.0</div>
+    <div class="t1"><small>Drawn by</small><a href="https://github.com/notaroomba">notaroomba</a></div>
+    <div><small>Guide</small><a href="https://github.com/JunctionEDA/junction/blob/master/COLLABORATION.md">Collaboration</a></div>
+    <div><small>Explore</small><a href="/gallery">Public projects</a></div>
+    <div><small>Sheet</small>1 / 1</div>
+    <div class="wide">An independent fork of <a href="https://www.kicad.org/">KiCad</a>, not affiliated with or endorsed by the KiCad project. Built on the work of the KiCad developers.</div>
+  </div>
+</footer>
+
+<script src="/static/dist/landing.js" defer></script>
+</body>
+</html>

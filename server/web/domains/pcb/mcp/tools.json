@@ -1,0 +1,504 @@
+[
+  {
+    "name": "list_projects",
+    "title": "List projects",
+    "write": false,
+    "description": "The person's online KiCad projects: the ones they own and the ones shared with them, most recently changed first. Each has an id, a name, the person's role (editor or viewer), who owns it and how many documents it holds. Call this first to find the project to work on; every other tool takes the project's id or exact name.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": "Only projects whose name or description contains this text (case-insensitive)." }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_project",
+    "title": "Get project",
+    "write": false,
+    "description": "One project: its documents (schematic sheets and the board, by path, which is what the document parameter of the other tools takes), the person's role, the members it is shared with, and the address that opens it in the web editor.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name, as listed by list_projects." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "create_project",
+    "title": "Create project",
+    "write": true,
+    "description": "Start a new, empty online project owned by the person: a project file, one schematic sheet and one board, named after the project. Returns its id and documents. Use it only when the person asks for a new project or design.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The project's name, for example \"usb-c-breakout\"." }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_design_guide",
+    "title": "Design guide",
+    "write": false,
+    "description": "House rules for working on a design here, written for you: the owner's schematic drawing rules (wires inside a block, labels only between blocks, horizontal labels, supplies up and ground down, shared rails for decoupling), how to take a design from a prompt to a routed board in stages, how to plan placement and routing for the engines, and how to review a design. Read the relevant topic once before you draw or rearrange a schematic, lay out or route a board, or write a review.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "topic": { "type": "string", "enum": ["all", "quick", "python", "schematic", "board", "routing", "layout", "review"], "description": "Which part to read; all when omitted. quick is the short way to lay out and route a whole board with one harness call (board.design): read it first and the long board, routing and layout topics only when a finding sends you there." }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "render_view",
+    "title": "Render image",
+    "write": false,
+    "description": "A picture of a schematic sheet or of the board as it is right now, drawn the way the editor draws it (KiCad's colours and stroke font). Use it to see layout, readability and placement that lists of coordinates do not show, and to check your own changes after applying them. Scope it to what you need, since a smaller picture costs less to look at: an area, parts (refs), nets (cropped to the net, which is drawn at full strength over a dimmed board or sheet), board layers, or view_of a person to see exactly what they are looking at with their selection outlined. violations: true numbers the findings of the rules check on the picture and lists them. Without any of these it shows the whole sheet or board; a schematic sheet is large, so ask for the part you care about to be able to read values and pin names.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Document path as listed by get_project, or \"board\"." },
+        "area": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4, "description": "The rectangle to show, [x0, y0, x1, y1] in millimetres." },
+        "refs": { "type": "array", "items": { "type": "string" }, "description": "Show these components and their surroundings instead of an area." },
+        "nets": { "type": "array", "items": { "type": "string" }, "description": "Show these nets, by the names list_nets gives: cropped to them, with their wires or copper, pads and pins standing out and the rest dimmed." },
+        "ids": { "type": "array", "items": { "type": "string" }, "description": "Show these items, by the ids get_items or get_selection gives." },
+        "emphasize": { "type": "boolean", "description": "Dim everything except the refs, nets and ids asked for. Default: true for nets, false otherwise." },
+        "view_of": { "type": "string", "description": "The name or login of a person who has the document open (get_selection lists them), or \"anyone\": shows what they are looking at right now, their selection outlined in their colour and their cursor with their name." },
+        "violations": { "type": "boolean", "description": "Run the rules check (ERC on a sheet, DRC on the board) and mark each finding in view with its number; the answer lists them." },
+        "layers": { "type": "array", "items": { "type": "string" }, "description": "Board only: draw just these layers, for example [\"F.Cu\", \"Edge.Cuts\"]. Default: every layer the editor shows by default." },
+        "width_px": { "type": "integer", "minimum": 400, "maximum": 2000, "description": "Longest side of the image in pixels (default 1500). 800 is enough for a close-up and costs about a quarter as much to look at." }
+      },
+      "required": ["project", "document"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "highlight",
+    "title": "Highlight for everyone",
+    "write": false,
+    "description": "Point at something so the people in the document see what you mean: the parts, nets, items or region are outlined live on everyone's canvas (browser and desktop) in your colour with your name tag, the way a collaborator's selection shows, and anyone following you has their view brought there. Add a short note to say why (\"C5 is 9 mm from U1's VDD pin\"). It changes nothing in the design and clears by itself after `seconds`; a new highlight replaces the last, and clear: true removes it. Use it whenever you refer to a place in the design while people are working in it, instead of describing where it is. The answer says who has the document open.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Document path as listed by get_project, or \"board\"." },
+        "refs": { "type": "array", "items": { "type": "string" }, "description": "Components to outline, by reference." },
+        "nets": { "type": "array", "items": { "type": "string" }, "description": "Nets to trace: their wires or tracks are lit and their pins or pads outlined." },
+        "ids": { "type": "array", "items": { "type": "string" }, "description": "Items by id (from get_items, get_selection or a violation)." },
+        "area": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4, "description": "A region to frame, [x0, y0, x1, y1] in millimetres." },
+        "at": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2, "description": "A point to ring, [x, y] in millimetres: where a check found something." },
+        "note": { "type": "string", "description": "What you are saying about it, up to 140 characters, shown beside your name tag." },
+        "seconds": { "type": "integer", "minimum": 5, "maximum": 300, "description": "How long it stays (default 45)." },
+        "clear": { "type": "boolean", "description": "Remove your highlight from this document now." }
+      },
+      "required": ["project", "document"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_selection",
+    "title": "See who is here",
+    "write": false,
+    "description": "The people who have the project open right now: for each, whether they are in the browser or the desktop editor, what they have selected (references, or item kinds with ids and nets), where their cursor is and the area they are looking at. Call it when the person says \"this\", \"here\" or \"what I selected\", then read those items with the other tools or look with render_view view_of. Without a document it covers every sheet and the board.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Only this document; every sheet and the board when omitted." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "trace_net",
+    "title": "Trace a net",
+    "write": false,
+    "description": "One net end to end, in a compact answer. On the board: every pad with its position and side, the routed length in total and per layer, track widths in use, vias, zones, how many separate islands of copper it is in, each connection still open (from which pad to which, and how far), and any net it is shorted to. On a sheet: its pins with their types, its labels and whether it leaves the sheet. highlight: true also lights the net up for the people in the document.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Document path as listed by get_project, or \"board\"." },
+        "net": { "type": "string", "description": "The net's name, as list_nets gives it." },
+        "highlight": { "type": "boolean", "description": "Also highlight the net live for everyone in the document." },
+        "note": { "type": "string", "description": "With highlight: the note shown beside your name tag." },
+        "seconds": { "type": "integer", "minimum": 5, "maximum": 300 }
+      },
+      "required": ["project", "document", "net"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "compare_versions",
+    "title": "Compare with a checkpoint",
+    "write": false,
+    "description": "What changed in a schematic sheet or the board since a saved version: each change as one line (added, removed or modified, what it is, what changed about it: \"moved 2.54 mm\", \"Value: 10k to 22k\") with counts, and a picture of the changed area as it is now with every change boxed (green added, amber changed, red removed). Use it to answer \"what did I change since the last checkpoint\", to review somebody's work, or to check your own edits against where you started. Without `with` it compares with the newest named checkpoint.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Document path as listed by get_project, or \"board\"." },
+        "with": { "type": "string", "description": "The checkpoint's name (list_checkpoints gives them). Default: the newest named checkpoint, or the newest saved version when none is named." },
+        "area": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4, "description": "Only picture this rectangle, [x0, y0, x1, y1] in millimetres." },
+        "side_by_side": { "type": "boolean", "description": "Return two pictures of the same area, the saved version and now, instead of one." },
+        "picture": { "type": "boolean", "description": "false returns the list only, which is cheaper." },
+        "limit": { "type": "integer", "minimum": 5, "maximum": 200, "description": "How many changes to list (default 60)." },
+        "width_px": { "type": "integer", "minimum": 400, "maximum": 2000, "description": "Longest side of each picture in pixels (default 1500)." }
+      },
+      "required": ["project", "document"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_bom",
+    "title": "Bill of materials",
+    "write": false,
+    "description": "The bill of materials with cost and stock: one line per distinct part (references as runs like C3-C10, quantity, value, footprint, the vendor part or manufacturer part number its fields name), each priced at the vendor's break for the quantity needed and checked against the vendor's stock, with the total for the number of boards, the lines that are short of stock and the lines that have no part chosen yet. Covers every sheet of the schematic, or the board when document is the board. Parts marked do-not-populate or excluded from the BOM are left out.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "\"board\" to take the BOM from the board's footprints; the schematic (all sheets) when omitted." },
+        "boards": { "type": "integer", "minimum": 1, "description": "How many boards are being built (default 1): sets the price break and the stock needed." },
+        "prices": { "type": "boolean", "description": "false lists the parts without asking the vendors, which is faster." },
+        "vendor": { "type": "string", "enum": ["lcsc", "mouser", "digikey"], "description": "Look manufacturer part numbers up at this vendor only." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "export_fab",
+    "title": "Make fabrication files",
+    "write": false,
+    "description": "The board's fabrication package as one zip the person downloads: Gerbers for every layer the fabricator needs, drill files, the BOM and the placement file, named and formatted for the chosen fabricator (the same writers as the editor's Fabrication Outputs). The answer gives the download link, what the package contains, the board's size, layers and hole count, and whether the board is ready to order: the design rule check is run first, and open connections or errors are reported with the files. Use it when the person asks for Gerbers, manufacturing files or to order the board.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "preset": { "type": "string", "enum": ["jlcpcb", "pcbway", "kicad"], "description": "Whose order page the files are for (default jlcpcb); kicad is KiCad's own defaults, for any other fabricator." },
+        "bom": { "type": "boolean", "description": "false leaves the BOM out." },
+        "placement": { "type": "boolean", "description": "false leaves the placement (pick and place) file out." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "simulate",
+    "title": "Simulate the circuit",
+    "write": false,
+    "description": "Runs the schematic through ngspice (KiCad's own SPICE netlist of the whole hierarchy, with each symbol's Sim model fields and the project's model files) and answers with a few numbers per signal and one plot: for a transient the minimum, maximum, mean, final value, frequency of an oscillation or settling time; for an AC sweep gain and phase at the ends, the peak and the -3 dB points; for .op every node voltage and source current. command is the analysis (.op, .tran, .ac or .dc line); without it the schematic's own simulation command is used. probes names what to report and plot, e.g. V(OUT), I(R1); other_signals lists the rest. To try an idea without touching the design, pass netlist: any complete SPICE netlist is simulated instead of the schematic. Parts need SPICE models: resistors, capacitors, inductors and sources work as drawn, other parts by their Sim.Device / Sim.Library fields.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "The root sheet to simulate (default: the project's root schematic)." },
+        "command": { "type": "string", "description": "One analysis line, e.g. \".tran 10u 20m\", \".ac dec 20 10 1meg\", \".dc V1 0 5 0.1\", \".op\"." },
+        "probes": { "type": "array", "items": { "type": "string" }, "description": "Up to 8 signals to report and plot: V(net), I(part) or a vector name. Default: the named nets' voltages." },
+        "netlist": { "type": "string", "description": "A complete SPICE netlist to simulate instead of the schematic." },
+        "netlist_only": { "type": "boolean", "description": "Return the netlist that would be run, without running it." },
+        "plot": { "type": "boolean", "description": "false leaves the picture out." },
+        "timeout_s": { "type": "number", "description": "Seconds the run may take (default 40, 120 at most)." },
+        "width_px": { "type": "integer", "description": "Width of the plot in pixels (default 1500)." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "propose_fixes",
+    "title": "Offer fixes for rule violations",
+    "write": true,
+    "description": "Runs the ERC (a sheet) or DRC (the board) and offers a fix for every violation that has a mechanical cure, each kind as one proposal the people in the document see drawn over the design and Accept or Reject: open connections routed, dangling tracks and vias removed, silkscreen moved off pads, unconnected pins flagged no-connect, PWR_FLAG on undriven supply nets, stray labels and flags removed. Nothing changes until a person accepts. Violations that need a design decision (clearance, shorts, pin conflicts) come back in left_for_you with a hint; solve those yourself and offer them with apply_changes propose: true.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "A schematic sheet's path, or \"board\"." },
+        "codes": { "type": "array", "items": { "type": "string" }, "description": "Only these violation codes (as run_checks names them)." }
+      },
+      "required": ["project", "document"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "list_proposals",
+    "title": "Proposals and their outcome",
+    "write": false,
+    "description": "The changes you proposed with apply_changes propose: true, and what the people decided: pending, accepted (applied by the person), rejected (with their reason), stale (the design changed under it) or withdrawn. Pass proposal with wait_s to wait for one decision; pass withdraw to take a pending proposal back.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Only this document's proposals." },
+        "status": { "type": "string", "enum": ["pending", "accepted", "rejected", "stale", "withdrawn"], "description": "Only proposals in this state." },
+        "proposal": { "type": "string", "description": "One proposal by id." },
+        "wait_s": { "type": "number", "description": "With proposal: wait up to this many seconds (50 at most) for a person to decide." },
+        "withdraw": { "type": "string", "description": "Id of a pending proposal to take back." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "read_document",
+    "title": "Read source",
+    "write": false,
+    "description": "A document as KiCad s-expression text, as it stands now: the file's header followed by every item. For reading exact syntax (to write an add_item edit that matches the file, or to inspect something no structured tool reports). Long documents come in parts; pass next_offset back as offset. Prefer list_components, list_nets and get_items for questions about the design, they are far shorter.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Document path as listed by get_project, or \"board\"." },
+        "offset": { "type": "integer", "minimum": 0, "description": "Character to start at (default 0)." },
+        "max_chars": { "type": "integer", "minimum": 1000, "maximum": 100000, "description": "How much to return (default 40000)." }
+      },
+      "required": ["project", "document"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "list_changes",
+    "title": "List changes",
+    "write": false,
+    "description": "The changes made to a project through this connection or the person's other connected apps, newest first: an id, the title, what each edit did, the document, when, and whether it has been undone. The id is what undo_changes and redo_changes take.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Only changes to this document." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "undo_changes",
+    "title": "Undo a change",
+    "write": true,
+    "description": "Take back one apply_changes call: what it added is removed, what it removed comes back, what it moved or edited returns to how it was, and board rules it set are restored. Everyone in the document sees it happen. It is refused, with nothing changed, when somebody has edited one of the same items since, so nobody's newer work is overwritten. Undo the newest change first when undoing several.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "change_id": { "type": "integer", "description": "The change to undo, as returned by apply_changes or list_changes. Omit for the most recent change to the project that has not been undone." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "redo_changes",
+    "title": "Redo a change",
+    "write": true,
+    "description": "Put back a change that undo_changes took away, exactly as it was applied (the same items with the same ids, and the board rules it set). Like an undo it is refused, with nothing changed, when somebody has edited one of the same items since.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "change_id": { "type": "integer", "description": "The undone change to put back, from list_changes. Omit for the change that was undone most recently." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "list_comments",
+    "title": "List comments",
+    "write": false,
+    "description": "The review comments people have pinned on a schematic sheet or the board: each thread with what it is pinned to (on: a component or item, net: a net), its position in millimetres, author, text, replies and whether it is resolved. Resolved threads are left out unless include_resolved is true.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Document path as listed by get_project, or \"board\"." },
+        "include_resolved": { "type": "boolean" }
+      },
+      "required": ["project", "document"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "add_comment",
+    "title": "Add comment",
+    "write": true,
+    "description": "Pin a comment on a schematic sheet or the board, signed as the person, where everyone in the project sees it: on a component (ref), on a net (net), or at a point (x, y in millimetres). A comment on a component follows the component when it is moved; one on a net highlights the net when opened. Or answer an existing thread with reply_to. Good for review findings the person wants left on the design; do not comment unless asked to.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Document path as listed by get_project, or \"board\"." },
+        "text": { "type": "string", "description": "The comment, up to 4000 characters." },
+        "ref": { "type": "string", "description": "Pin it on this component." },
+        "net": { "type": "string", "description": "Pin it on this net, by the name list_nets gives." },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "reply_to": { "type": "integer", "description": "The id of the thread to reply to, from list_comments." }
+      },
+      "required": ["project", "document", "text"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "resolve_comment",
+    "title": "Resolve comment",
+    "write": true,
+    "description": "Mark a comment thread resolved once what it asked for is done, or reopen it with resolved false.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "comment_id": { "type": "integer", "description": "The thread's id, from list_comments." },
+        "resolved": { "type": "boolean", "description": "Default true." }
+      },
+      "required": ["project", "comment_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "list_checkpoints",
+    "title": "List checkpoints",
+    "write": false,
+    "description": "The named checkpoints of a project (the versions people saved under a name), newest first, with the documents each covers.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "create_checkpoint",
+    "title": "Create checkpoint",
+    "write": true,
+    "description": "Save a named checkpoint of the project, the way File > Save Checkpoint does in the editor, so the person can find this state in the project's history. A project linked to GitHub with checkpoint pushes turned on pushes it there as well.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "name": { "type": "string", "description": "A short name, for example \"Before rerouting the USB pair\"." }
+      },
+      "required": ["project", "name"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "run_python",
+    "title": "Run a Python script on the design",
+    "write": true,
+    "description": "Run a Python script that works on the design with the kicad_harness package. This is the cheapest way to do anything that takes more than a couple of edits: one call places parts, wires them, generates parts from datasheets, lays out and routes the board, and returns only what the script prints. Keep a script with the project to save tokens: send it once as `code` with a `script` name, then run it again with only the name, or change it with `edits` (small replacements) instead of sending it all again. The script never sees or writes KiCad file text and you do not compute coordinates: the harness reads pin positions, finds free space, draws the wires and keeps everything on the grid.\n\nAlready defined in the script: `project` (the project named in this call), `kh` (the package) and `parts`. Print what you want to read back, or set a variable named `result` (returned as data). Read get_design_guide with topic \"python\" once for the whole API; the core of it:\n\nsch = project.schematic()            # or project.schematic(\"power\")\nsch.place(\"Device:R\", ref=\"R1\", value=\"10k\", near=\"U1\")   # returns the reference; position is chosen when not given\nsch.connect(\"U1.3\", \"R1.1\")         # wire (or matching labels when there is no clear path); pins by number or name: \"U1.VDD\"\nsch.net(\"GND\", \"U1.GND\", \"C1.2\")    # power symbol or label on each pin\nsch.decouple(\"U1.VDD\", \"100n\")       # capacitor at a supply pin, to ground\nsch.build(parts=[...], nets={...})   # a whole block from a netlist\nsch.check()                           # ERC summary\nboard = project.board(); board.sync(); board.outline(100, 100, 150, 130)\nboard.autoplace(groups={...}); board.route(); board.check()\npart = parts.from_datasheet(url_or_part_number)   # symbol and IPC-7351 footprint from the datasheet's tables\nsch.place(part, ref=\"U2\")\nparts.find(\"3.3V LDO SOT-23-5\")     # LCSC, Mouser, DigiKey, TI, Analog Devices\n\nPlan first, draw once. A script is one change: its edits are worked out off the page and drawn once, at their final places, when it ends. Try it with dry_run: true (nothing is changed, nobody sees it) and read the output; correct the stored script with `edits` and try again; run it for real only when the dry run shows no errors and nothing refused. Never rebuild a design that is on the page to try a variation: no clear() followed by the same build, no second run of a whole layout to move two parts; change the few things that are wrong (board.place, board.seat, board.route(nets=[...])). A board layout with faults (a part off the board, an open connection, a DRC error, a part away from the pin it serves) is refused: the script fails and nothing is drawn. If the script fails, the edits it had made are taken back and the error names the script line, so fix the script and run it again. There is no network or file access inside the script other than through the harness. A script still working after 45 seconds answers with running: true and a run_id while it carries on: collect its result with get_run instead of running it again.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "code": { "type": "string", "description": "The Python script. With `script`, it is stored under that name and run." },
+        "script": { "type": "string", "description": "Name of a script kept with the project. Send `code` with it once to store the script; after that give only the name to run it again, or the name and `edits` to change it and run. get_project lists the stored scripts." },
+        "edits": { "type": "array", "description": "Changes to the stored script before it runs: each `old` text (it must occur exactly once) is replaced by `new`, and the result is stored.", "items": { "type": "object", "properties": { "old": { "type": "string" }, "new": { "type": "string" } }, "required": ["old", "new"], "additionalProperties": false } },
+        "run": { "type": "boolean", "description": "false stores or edits the script without running it (default true)." },
+        "show": { "type": "boolean", "description": "true returns the stored script's text under script.code (default false)." },
+        "title": { "type": "string", "description": "A few words naming what the script does. It is what the person sees in the list of changes." },
+        "live": { "type": "boolean", "description": "Draw the edits step by step with a moving cursor (default true)." },
+        "plan": { "type": "boolean", "description": "Work the edits out first and draw each item once, at its final place, when the script ends or calls project.publish() (default true). false sends each batch as it is made." },
+        "dry_run": { "type": "boolean", "description": "Run the script without changing anything: nobody sees it and nothing is stored. The answer is what the script printed, what it would change and anything the layout checks refuse. Work with dry_run: true until the output is clean, then run the same stored script once without it." },
+        "keep_on_error": { "type": "boolean", "description": "Keep the edits made before a failure instead of taking them back (default false)." },
+        "timeout_s": { "type": "number", "description": "Time limit in seconds (default 180, at most 400)." }
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "review_design",
+    "title": "Review against the checklists",
+    "write": false,
+    "description": "Check a schematic sheet or the board against the house checklists (Andrew Greenberg's Actually Useful Schematics talk with his schematic and PCB layout checklists, and Graham Sutherland's schematic guidelines). On a sheet: supplies drawn as symbols that point the right way, useful supply names with their voltage range and current written down, named nets, global labels with a direction shape on stubs, wires before labels, wire crossings, labelled and described blocks, notes on connectors, switches and LEDs, the title block, symbols drawn by function not by package, values, capacitor voltage ratings (twice the rail), resistor dissipation, MOSFET body diodes, a bypass capacitor on every IC supply, signals that cross supply voltages, UART TX/RX, I2C and open-drain pull-ups, reset and enable default states, test points, programming access, input protection, the ERC, and MFR/MPN fields. On the board: bypass capacitors at their pins, power track widths and vias, ground planes on both sides with stitching, zone clearance, courtyards, test point access, reference designators on pads, the board's name, version and date on the silkscreen, three fiducials, and the DRC. Each finding names the rule, the parts and nets, and the call that fixes it; errors first. `passed` lists the rules with nothing against them and `manual` the checklist items only a person can judge. Run it after drawing a sheet or laying out a board and before reporting that a design is finished; a design is not finished while it has errors.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Which sheet (its path or file name), or \"board\"." },
+        "level": { "type": "string", "enum": ["error", "warning", "note"], "description": "List only findings at least this serious (note, the default, lists all)." },
+        "rule": { "type": "string", "description": "List only one rule or family of rules, for example \"power\" or \"caps.voltage\"." }
+      },
+      "required": ["project", "document"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "check_layout",
+    "title": "Check sheet layout",
+    "write": false,
+    "description": "How a schematic sheet reads: every place where something is drawn on top of something else (text over text, text over a symbol, a wire through text or through a symbol, symbols overlapping, a frame cutting through anything), and anything outside the page border or over the title block. Each finding names the two things and where. Run it after drawing or changing a sheet and fix what it finds: autoplace_fields moves references and values, move and move_region move parts and whole blocks, set_page makes the page larger. It also returns the box around everything on the sheet (extent), the usable drawing area and the title block. Optional: within [x0, y0, x1, y1] measures only what lies inside that box; of [refs] measures those parts with the stubs, labels and power symbols on their pins (what a frame around them must contain); wrap [{text, size, width}] breaks notes into lines that fit a width.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Which sheet: its path or file name." },
+        "within": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4, "description": "Measure only the items wholly inside this box [x0, y0, x1, y1] in mm." },
+        "of": { "type": "array", "items": { "type": "string" }, "description": "Measure these parts (references) with what hangs on their pins." },
+        "wrap": { "type": "array", "items": { "type": "object", "properties": { "text": { "type": "string" }, "size": { "type": "number" }, "width": { "type": "number" } }, "required": ["text", "width"], "additionalProperties": false }, "description": "Notes to break into lines no wider than width mm at this text size." },
+        "free": { "type": "object", "properties": { "near": { "type": "string" }, "w": { "type": "number" }, "h": { "type": "number" } }, "required": ["w", "h"], "additionalProperties": false, "description": "Find free room for a box of w by h mm, beside the part named in near when given; the answer's free is its top left corner." },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "How many findings to list (40 by default); the counts are always complete." }
+      },
+      "required": ["project", "document"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_run",
+    "title": "Get run result",
+    "write": false,
+    "description": "Wait for a run_python or apply_changes call that was still working when it answered (its answer had running: true and a run_id). Returns that call's result when it is finished, or running: true again with the time so far; then call get_run again. The work goes on by itself in the meantime and the people in the document see the edits arrive.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "run_id": { "type": "string", "description": "The run_id from the answer that said running: true." },
+        "wait_s": { "type": "integer", "description": "How long to wait for it this time, in seconds (default 45, at most 50)." }
+      },
+      "required": ["run_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_geometry",
+    "title": "Get geometry",
+    "write": false,
+    "description": "Every part of a schematic sheet or of the board with its position, rotation, box and the position, side and net of each pin or pad, plus the sheet's wires, labels and junctions or the board's outline, in one compact answer. It is what the Python harness (run_python, or kicad_harness on the person's own computer) plans placement and wiring from; for a question about one part, get_component is smaller.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "description": "Project id or exact name." },
+        "document": { "type": "string", "description": "Which document: its path, or \"board\" for the board." },
+        "silk": { "type": "boolean", "description": "Board only: also list the boxes of everything printed on the silkscreen, as [x0, y0, x1, y1, layer]." }
+      },
+      "required": ["project", "document"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "view_datasheet",
+    "title": "Look at datasheet pages",
+    "write": false,
+    "description": "Pages of a PDF datasheet as pictures, for what read_datasheet's text cannot carry: the pinout drawing, the typical application circuit, a graph, the package outline or land pattern, a timing diagram. Give page numbers (read_datasheet reports which pages answer a question), or a query and the best matching page is drawn. Up to three pages per call; a page is a large picture, so ask for the one you need.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "description": "The https address of the PDF, usually the part's Datasheet field (find_datasheets lists them)." },
+        "pages": { "type": "array", "items": { "type": "integer" }, "description": "Page numbers to draw (up to 3)." },
+        "query": { "type": "string", "description": "Without pages: what to find, in the datasheet's own words (\"typical application\", \"pin configuration\", \"land pattern\")." },
+        "width_px": { "type": "integer", "minimum": 600, "maximum": 2000, "description": "Longest side of each page in pixels (default 1300, enough to read a pin table)." }
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    }
+  }
+]

@@ -1,0 +1,2437 @@
+// Node test for the board editing tools: routing legs, via/graphic node shapes,
+// footprint rotate/flip invariants, hit testing, connected-run selection, a
+// DOM-free drive of the module hooks, and the writer-exact fragments of the
+// curve, text box, table, image, zone, rule area and dimension tools.
+// Run: node server/static/tests/pcb-tools.test.js
+"use strict";
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const { webPath } = require("./web-path");
+const zlib = require("node:zlib");
+
+require(path.join(__dirname, "..", "kicad-canvas.js"));
+require(path.join(__dirname, "..", "pcb-tools.js"));
+const K = globalThis.KiCadCanvas, P = globalThis.PcbTools, pcb = globalThis.CollabTools.pcb;
+// graphics go on the active layer (F.Cu when a board opens, and wherever a layer key leaves it); these tests draw on the front silkscreen
+test.beforeEach(() => { P.state.gfxLayer = "F.SilkS"; });
+const IU = 1e6;
+
+const FIXTURE = `(kicad_pcb (version 20260728) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (44 "Edge.Cuts" user) (37 "F.SilkS" user) (36 "B.SilkS" user) (49 "F.Fab" user))
+  (footprint "Test:R" (layer "F.Cu") (uuid "fp-1") (transform (translate 100 50) (rotate -90) (scale 1 1))
+    (property "Reference" "R1" (at 0 -1.5 -90) (layer "F.SilkS") (uuid "p-1") (effects (font (size 1 1) (thickness 0.15))))
+    (property "Value" "10k" (at 0 1.5 -90) (layer "F.Fab") (uuid "p-2") (effects (font (size 1 1) (thickness 0.15))))
+    (fp_line (start -1 -0.5) (end 1 -0.5) (stroke (width 0.1) (type default)) (layer "F.SilkS") (uuid "l-1"))
+    (pad "1" smd roundrect (at -0.9 0 -90) (size 1 1.2) (layers "F.Cu" "F.Mask" "F.Paste") (roundrect_rratio 0.25) (net "GND") (uuid "pad-1"))
+    (pad "2" smd roundrect (at 0.9 0 -90) (size 1 1.2) (layers "F.Cu" "F.Mask" "F.Paste") (roundrect_rratio 0.25) (net "/SIG") (uuid "pad-2")))
+  (segment (start 110 50) (end 115 50) (width 0.25) (layer "F.Cu") (net "GND") (uuid "s-1"))
+  (segment (start 115 50) (end 118 53) (width 0.25) (layer "F.Cu") (net "GND") (uuid "s-2"))
+  (via (at 118 53) (size 0.8) (drill 0.4) (layers "F.Cu" "B.Cu") (net "GND") (uuid "v-1"))
+  (segment (start 118 53) (end 118 60) (width 0.25) (layer "B.Cu") (net "GND") (uuid "s-3"))
+  (segment (start 130 50) (end 135 50) (width 0.25) (layer "F.Cu") (net "GND") (uuid "s-4"))
+  (arc (start 140 50) (mid 141 51) (end 142 50) (width 0.25) (layer "F.Cu") (net "GND") (uuid "a-1"))
+  (gr_line (start 90 40) (end 140 40) (stroke (width 0.05) (type default)) (layer "Edge.Cuts") (uuid "g-1"))
+)`;
+const CODE_STYLE = `(kicad_pcb (version 20240108) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (net 0 "") (net 2 "GND")
+  (segment (start 0 0) (end 5 0) (width 0.25) (layer "F.Cu") (net 2) (uuid "cs-1"))
+)`;
+const SAMPLE = "/private/tmp/claude-502/-Users-roomba-Documents-GitHub-kicad-collaborative/dbbcf49c-094f-41fc-be3a-cd8a1023d083/scratchpad/shape-test/orig/StickHub.kicad_pcb";
+
+const fixture = () => K.parseDoc(FIXTURE, "kicad_pcb");
+const near = (a, b, tol = 1e-6) => Math.abs(a - b) <= tol;
+const rot90 = (fx, fy, x, y) => [fx + (y - fy), fy - (x - fx)];   // +90° with Y down: CCW on screen, same as the renderer's rotator
+const absPads = (node) => P.padsOf({ node }).map((p) => [p.x, p.y]);
+const angleDiff = (a, b) => ((a - b) % 360 + 360) % 360;
+// file round trip compared as text: the serializer writes numeric-looking strings (pad "1") bare, which KiCad reads the same
+const roundTrips = (node) => K.serialize(K.parse(K.serialize(node))) === K.serialize(node);
+// angles compared modulo 360 (real boards carry unnormalized 360 / 225 text angles), a zero angle dropped
+function canon(node) {
+  if (!Array.isArray(node)) return node;
+  const out = node.map(canon);
+  if (out[0] === "at" && out.length >= 4) { const a = angleDiff(out[3], 0); if (a === 0) out.length = 3; else out[3] = a; }
+  if (out[0] === "rotate") out[1] = angleDiff(out[1], 0);
+  return out;
+}
+
+test("a routed leg is a 45° diagonal plus an orthogonal run, in either posture", () => {
+  const diag = P.routeLeg([100, 49.1], [110, 52], true);
+  assert.equal(diag.length, 2);
+  assert.deepEqual(diag[0], [[100, 49.1], [102.9, 52]]);       // |dx| == |dy| on the diagonal
+  assert.deepEqual(diag[1], [[102.9, 52], [110, 52]]);         // then horizontal
+  const orth = P.routeLeg([100, 49.1], [110, 52], false);
+  assert.deepEqual(orth[0], [[100, 49.1], [107.1, 49.1]]);     // horizontal first
+  assert.deepEqual(orth[1], [[107.1, 49.1], [110, 52]]);
+  assert.equal(P.routeLeg([0, 0], [5, 0], true).length, 1);    // pure orthogonal
+  assert.equal(P.routeLeg([0, 0], [3, 3], false).length, 1);   // pure diagonal
+  assert.equal(P.routeLeg([1, 1], [1, 1], true).length, 0);
+});
+
+test("routed segments become well-formed, wrapped segment fragments that re-parse", () => {
+  const doc = fixture();
+  const net = { code: -1, name: "GND" };
+  const changes = P.routeLeg([100, 49.1], [110, 52], true).map(([a, b]) => P.addedChange(doc, P.segmentNode(doc, a, b, 0.25, "F.Cu", net), net));
+  assert.equal(changes.length, 2);
+  for (const c of changes) {
+    assert.equal(c.kind, "ADDED"); assert.equal(c.typeName, "PCB_TRACK"); assert.equal(c.netName, "GND");
+    const tree = K.parse(c.sexpr);
+    assert.equal(tree[0], "kicad_pcb"); assert.equal(K.kid(tree, "version")[1], P.BOARD_VERSION);
+    const seg = K.kid(tree, "segment"); assert.ok(seg, "segment inside the kicad_pcb wrapper");
+    assert.equal(K.kid(seg, "layer")[1], "F.Cu"); assert.equal(K.kid(seg, "width")[1], 0.25);
+    assert.deepEqual(K.kid(seg, "net"), ["net", "GND"]);       // the document's name-based net style
+    assert.equal(K.uuidOf(seg), c.id); assert.ok(K.kid(seg, "start") && K.kid(seg, "end"));
+    // the same fragment applies to another copy of the document through the canvas's own applier
+    const other = fixture(); assert.ok(K.applyChange(other, c, IU));
+    const it = other.items.get(c.id); assert.equal(it.kind, "segment"); assert.equal(it.geom[0].t, "line");
+  }
+  assert.deepEqual([K.kid(K.kid(K.parse(changes[0].sexpr), "segment"), "end").slice(1), K.kid(K.kid(K.parse(changes[1].sexpr), "segment"), "start").slice(1)], [[102.9, 52], [102.9, 52]]);
+});
+
+test("via node shape follows the KiCad file format in both net styles", () => {
+  const doc = fixture();
+  assert.deepEqual(P.viaNode(doc, 105, 55, 0.8, 0.4, { code: 0, name: "" }), ["via", ["at", 105, 55], ["size", 0.8], ["drill", 0.4], ["layers", "F.Cu", "B.Cu"], ["net", ""]]);
+  const legacy = K.parseDoc(CODE_STYLE, "kicad_pcb");
+  assert.equal(P.netStyle(legacy), "code");
+  assert.deepEqual(P.viaNode(legacy, 1, 2, 0.8, 0.4, { code: 0, name: "" }), ["via", ["at", 1, 2], ["size", 0.8], ["drill", 0.4], ["layers", "F.Cu", "B.Cu"], ["net", 0]]);
+  assert.deepEqual(K.kid(P.segmentNode(legacy, [0, 0], [1, 1], 0.25, "F.Cu", { code: 2, name: "GND" }), "net"), ["net", 2]);
+  const c = P.addedChange(doc, P.viaNode(doc, 105, 55, 0.8, 0.4, { code: -1, name: "GND" }), { code: -1, name: "GND" });
+  assert.equal(c.typeName, "PCB_VIA"); assert.equal(c.netName, "GND");
+  const it = doc.items.get(c.id); assert.equal(it.kind, "via"); assert.equal(it.geom[0].t, "circle"); assert.equal(it.geom[0].r, 0.4);
+});
+
+test("graphic and text nodes re-parse into geometry on their layers", () => {
+  const doc = fixture();
+  const line = doc.items.get(P.addedChange(doc, P.lineNode([90, 40], [90, 80], "Edge.Cuts")).id);
+  assert.equal(line.kind, "gr_line"); assert.equal(line.edge, true); assert.equal(line.geom[0].w, 0.05);
+  const rect = doc.items.get(P.addedChange(doc, P.rectNode([1, 1], [4, 3], "F.SilkS")).id);
+  assert.equal(rect.geom[0].t, "poly"); assert.equal(rect.geom[0].fill, null); assert.equal(rect.geom[0].layer, "F.SilkS");
+  const circ = doc.items.get(P.addedChange(doc, P.circleNode([10, 10], [13, 10], "F.SilkS")).id);
+  assert.equal(circ.geom[0].t, "circle"); assert.equal(circ.geom[0].r, 3);
+  const text = doc.items.get(P.addedChange(doc, P.textNode("hello", 5, 5, "B.SilkS")).id);
+  assert.equal(text.kind, "gr_text"); assert.equal(text.geom[0].text, "hello"); assert.equal(text.geom[0].mirror, true);
+  assert.equal(P.addedChange(doc, P.lineNode([0, 0], [1, 1], "F.SilkS")).typeName, "PCB_SHAPE");
+});
+
+test("rotating a footprint keeps every pad's angle relative to the footprint and turns the pads about its origin", () => {
+  const doc = fixture(); const fp = doc.items.get("fp-1");
+  const before = absPads(fp.node); const [fx, fy, a0] = K.atOf(fp.node);
+  const node = P.rotateFootprintNode(JSON.parse(JSON.stringify(fp.node)), 90);
+  const a1 = K.atOf(node)[2]; assert.equal(a1, 0);
+  const pads0 = K.kids(fp.node, "pad"), pads1 = K.kids(node, "pad");
+  pads0.forEach((p, i) => assert.equal(angleDiff(K.atOf(pads1[i])[2], a1), angleDiff(K.atOf(p)[2], a0), "pad " + p[1]));
+  K.kids(fp.node, "property").forEach((p, i) => { if (K.kid(p, "at")) assert.equal(angleDiff(K.atOf(K.kids(node, "property")[i])[2], a1), angleDiff(K.atOf(p)[2], a0)); });
+  absPads(node).forEach(([x, y], i) => { const [ex, ey] = rot90(fx, fy, before[i][0], before[i][1]); assert.ok(near(x, ex) && near(y, ey), `pad ${i} at ${x},${y} expected ${ex},${ey}`); });
+  assert.ok(roundTrips(node));   // survives the file round trip unchanged
+  const change = P.replacedChange(fp, node);
+  assert.equal(change.kind, "MODIFIED"); assert.equal(change.typeName, "FOOTPRINT"); assert.deepEqual(change.padNets, { 1: "GND", 2: "/SIG" });
+  assert.ok(K.applyChange(doc, change, IU)); assert.equal(doc.items.get("fp-1").rot, 0);
+});
+
+test("flipping a footprint swaps F./B. layers and is written as pcbnew writes it: angle 180 - a, local Y mirrored", () => {
+  const doc = fixture(); const fp = doc.items.get("fp-1");
+  const before = absPads(fp.node); const [fx] = K.atOf(fp.node);
+  const node = P.flipFootprintNode(JSON.parse(JSON.stringify(fp.node)));
+  assert.equal(K.kid(node, "layer")[1], "B.Cu"); assert.equal(K.atOf(node)[2], -90);   // 180 - (-90), as FOOTPRINT::Flip: the 3D model follows this angle
+  const pad1 = K.kids(node, "pad")[0];
+  assert.deepEqual(K.kid(pad1, "layers").slice(1), ["B.Cu", "B.Mask", "B.Paste"]);
+  assert.equal(K.atOf(pad1)[0], -0.9); assert.equal(K.atOf(pad1)[2], -90);   // relative angle negated (PAD::Flip), turned with the footprint
+  absPads(node).forEach(([x, y], i) => assert.ok(near(x, 2 * fx - before[i][0]) && near(y, before[i][1]), `pad ${i} mirrored about the origin`));
+  const ref = K.kids(node, "property")[0];
+  assert.equal(K.kid(ref, "layer")[1], "B.SilkS"); assert.ok(K.kid(K.kid(ref, "effects"), "justify").includes("mirror")); assert.equal(K.atOf(ref)[2], 90);
+  assert.equal(K.kid(K.kids(node, "property")[1], "layer")[1], "B.Fab");
+  const l = K.kid(node, "fp_line"); assert.equal(K.kid(l, "layer")[1], "B.SilkS"); assert.equal(K.kid(l, "start")[1], -1); assert.equal(K.kid(l, "end")[1], 1);
+  assert.ok(roundTrips(node));
+  // flipping back restores the original file content
+  assert.deepEqual(P.flipFootprintNode(JSON.parse(JSON.stringify(node))), fp.node);
+  assert.ok(K.applyChange(doc, P.replacedChange(fp, node), IU)); assert.equal(doc.items.get("fp-1").layer, "B.Cu");
+});
+
+test("connected-run selection follows shared endpoints through vias, hit testing picks tracks and vias", () => {
+  const doc = fixture();
+  assert.deepEqual([...P.connectedRun(doc, ["s-1"])].sort(), ["s-1", "s-2", "s-3", "v-1"]);
+  assert.deepEqual([...P.connectedRun(doc, ["s-4"])], ["s-4"]);
+  assert.equal(P.connectedRun(doc, ["g-1"]).size, 0);
+  assert.equal(P.hitTestItem(doc, 112, 50.05, 0.2).id, "s-1");
+  assert.equal(P.hitTestItem(doc, 112, 50.5, 0.2), null);           // 0.125 + 0.2 mm is the reach
+  assert.equal(P.hitTestItem(doc, 118, 53, 0.2).id, "v-1");          // the via wins over the tracks meeting under it
+  assert.equal(P.hitTestItem(doc, 120, 40.02, 0.2).id, "g-1");
+  assert.equal(P.hitTestItem(doc, 141, 51.05, 0.2).id, "a-1");
+  assert.equal(P.removedChange(doc.items.get("a-1")).typeName, "PCB_ARC");
+});
+
+test("magnetic snapping finds pads on the active layer and their nets", () => {
+  const doc = fixture();
+  const s = P.snapTarget(doc, 100.3, 49.2, 0.5, "F.Cu", null);
+  assert.ok(s && s.kind === "pad"); assert.ok(near(s.x, 100) && near(s.y, 49.1)); assert.equal(s.net.name, "GND");
+  assert.equal(P.snapTarget(doc, 100.3, 49.2, 0.5, "B.Cu", null), null);                       // SMD pad is front-only
+  assert.equal(P.snapTarget(doc, 100.3, 49.2, 0.5, "F.Cu", { code: -1, name: "/SIG" }), null);   // never onto another net
+  assert.equal(P.snapTarget(doc, 115.1, 50.1, 0.5, "F.Cu", null).kind, "track");
+  assert.equal(P.netUnder(doc, 112, 50, "F.Cu").name, "GND");
+  assert.equal(P.netUnder(doc, 100, 50.9, "F.Cu").name, "/SIG");
+});
+
+test("PNS drag geometry: AssembleLine, dragSegment45 keeps the ends and re-angles at 45°, dragCorner45 / free angle", () => {
+  const doc = fixture();
+  const ln = P.assembleLine(doc, doc.items.get("s-1"));   // s-1 and s-2 meet at a trivial joint; the via ends the line
+  assert.deepEqual(ln.ids, ["s-1", "s-2"]); assert.deepEqual(ln.pts, [[110, 50], [115, 50], [118, 53]]); assert.equal(ln.index, 0);
+  // the first segment pulled down 2 mm: its free end stays, a 45° segment grows from it, the neighbour keeps its 45° into the via
+  assert.deepEqual(P.dragSegment45(ln.pts, 0, [112, 52], 0), [[110, 50], [112, 52], [117, 52], [118, 53]]);
+  // a straight pad-to-pad run breaks into a dog-leg (the colinear ends get 45° knees)
+  assert.deepEqual(P.dragSegment45([[0, 0], [10, 0]], 0, [5, 2], 0), [[0, 0], [2, 2], [8, 2], [10, 0]]);
+  // a middle segment: the neighbours keep their direction and change length
+  assert.deepEqual(P.dragSegment45([[0, 0], [0, 5], [10, 5], [10, 10]], 1, [5, 7], 0), [[0, 0], [0, 7], [10, 7], [10, 10]]);
+  // a segment between two parallel neighbours two away snaps onto them inside the threshold (snapToNeighbourSegments)
+  assert.deepEqual(P.dragSegment45([[0, 0], [5, 0], [8, 3], [12, 3], [15, 0], [20, 0]], 2, [10, 0.05], 0.1), [[0, 0], [20, 0]]);
+  // corner drag: both legs rebuilt straight + 45°
+  assert.deepEqual(P.dragCorner45(ln.pts, 1, [115, 51], 0), [[110, 50], [114, 50], [115, 51], [116, 51], [118, 53]]);
+  // the end vertex: only its leg follows
+  assert.deepEqual(P.dragCorner45([[0, 0], [10, 0]], 1, [12, 3], 0), [[0, 0], [9, 0], [12, 3]]);
+  assert.deepEqual(P.dragCornerFree(ln.pts, 1, [116, 49]), [[110, 50], [116, 49], [118, 53]]);
+  for (const [a, b] of [[[0, 0], [5, 2]], [[0, 0], [2, 5]], [[0, 0], [3, 3]]]) { const t = P.initialTrace(a, b, -1, false); for (let i = 0; i + 1 < t.length; i++) assert.ok(P.dir8(t[i], t[i + 1]) >= 0); }
+});
+
+test("PNS drag modes: a grab near an end is a corner drag, Free Angle takes the nearer vertex, a via drags its fanout", () => {
+  const doc = fixture(); const { ctx } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  let d = P.dragStart(ctx, doc.items.get("s-1"), [112.3, 50.1], false);
+  assert.equal(d.mode, "segment"); assert.deepEqual(d.start, [112.25, 50], "the grab is snapped onto the track, on the grid");
+  d = P.dragStart(ctx, doc.items.get("s-2"), [115.05, 50.05], false);
+  assert.equal(d.mode, "corner"); assert.equal(d.lines[0].vertex, 1); assert.deepEqual(d.start, [115, 50]);
+  d = P.dragStart(ctx, doc.items.get("s-1"), [111, 50], true);
+  assert.equal(d.mode, "corner"); assert.equal(d.lines[0].vertex, 0);
+  d = P.dragStart(ctx, doc.items.get("s-1"), [114, 50], true);
+  assert.equal(d.lines[0].vertex, 1, "free angle on the far half drags the inner vertex");
+  // DM_VIA: the front line and the back track follow the via with 45° corners
+  d = P.dragStart(ctx, doc.items.get("v-1"), [118, 53], false);
+  assert.equal(d.mode, "via"); assert.equal(d.lines.length, 2);
+  assert.equal(P.dragTo(ctx, d, [118, 55]), true);
+  const byLayer = Object.fromEntries(d.sol.lines.map(({ l, pts }) => [l.layer, pts]));
+  assert.deepEqual(byLayer["F.Cu"], [[118, 55], [118, 53], [115, 50], [110, 50]]);
+  assert.deepEqual(byLayer["B.Cu"], [[118, 55], [118, 60]]);
+  const ch = P.dragChanges(ctx, d);
+  assert.deepEqual(ch.map((c) => c.kind).sort(), ["ADDED", "ADDED", "MODIFIED", "REMOVED"], "s-1 and s-2 are kept, s-3 replaced, the via moved");
+  assert.ok(ch.some((c) => c.kind === "MODIFIED" && c.id === "v-1"));
+});
+
+// ---- the module driven through fake hooks (no DOM: stage/document are absent under node)
+function fakeCtx(doc) {
+  const log = { commits: [], toasts: [], tool: "select" };
+  const ctx = {
+    K, doc, IU, isSch: false, zoom: 1, pxPerMm: 4, gridPitch: 0.25, snapOn: true, selected: null, items: [], viewOnly: false, live: true,
+    snap: (mm) => mm.map((v) => Math.round(v / 0.25) * 0.25), worldMm: () => [0, 0], requestRender() {}, applyLocal() {}, setSelected() {},
+    // like app.js: apply, then tell the module the document changed (it must not treat that as a reload)
+    commit(changes, label) { log.commits.push({ changes, label }); for (const c of changes) K.applyChange(doc, c, IU); pcb.onDocChanged(ctx); },
+    toast(m) { log.toasts.push(m); }, setTool(t) { log.tool = t; pcb.onActivate(t, ctx); },
+  };
+  return { ctx, log };
+}
+const ev = (extra) => Object.assign({ button: 0, shiftKey: false, clientX: 0, clientY: 0 }, extra || {});
+
+test("module: route from a pad, add a via with V, Enter clicks, End finishes: one commit", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc);
+  assert.ok(pcb.tools.some((t) => t.id === "route" && t.key === "X"));
+  pcb.onDocChanged(ctx);
+  assert.equal(pcb.onKey("x", ev(), ctx), true); assert.equal(log.tool, "route");
+  assert.equal(pcb.onPointerDown(ev(), [100.2, 49.3], ctx), true);   // snaps onto pad 1 (GND)
+  assert.deepEqual(P.state.route.last, [100, 49.1]); assert.equal(P.state.route.net.name, "GND");
+  pcb.onPointerMove(ev(), [110.1, 52.1], ctx);
+  assert.equal(pcb.onKey("/", ev(), ctx), true); assert.equal(P.state.route.diagFirst, true);   // straight-first by default (start_diagonal false), / forces the other posture
+  pcb.onPointerDown(ev(), [110.1, 52.1], ctx);                          // fixes the leg (grid-snapped to 110, 52) on the route's branch
+  assert.equal(log.commits.length, 0, "nothing reaches the board until the route ends");
+  assert.equal(P.state.route.stages.length, 1); assert.equal(P.state.route.stages[0].ops.filter((o) => o.add && o.add[0] === "segment").length, 2);
+  pcb.onPointerMove(ev(), [120, 52], ctx);
+  assert.equal(pcb.onKey("v", ev(), ctx), true);                        // a via rides the head's end; nothing is fixed yet
+  assert.ok(P.state.route.placingVia); assert.equal(P.state.route.placingVia.toLayer, "B.Cu"); assert.equal(P.state.route.stages.length, 1);
+  assert.equal(pcb.onKey("v", ev(), ctx), true); assert.equal(P.state.route.placingVia, null, "V again takes the via off");
+  pcb.onKey("v", ev(), ctx); pcb.onPointerDown(ev(), [120, 52], ctx);    // the click fixes trace and via, then B.Cu
+  assert.equal(P.state.route.layer, "B.Cu"); assert.equal(P.state.layer, "B.Cu"); assert.equal(P.state.route.stages.length, 2);
+  assert.ok(P.state.route.stages[1].ops.some((o) => o.add && o.add[0] === "via"));
+  pcb.onPointerMove(ev(), [120, 60], ctx);
+  assert.equal(pcb.onKey("Enter", ev(), ctx), true);                    // ACTIONS::cursorClick: fixes and carries on
+  assert.ok(P.state.route); assert.equal(P.state.route.stages.length, 3); assert.equal(log.commits.length, 0);
+  pcb.onPointerMove(ev(), [125, 60], ctx);
+  assert.equal(pcb.onKey("End", ev(), ctx), true);
+  assert.equal(P.state.route, null);
+  assert.equal(log.commits.length, 1, "the whole route is one undo step"); assert.equal(log.commits[0].label, "Route Track");
+  const kinds = log.commits[0].changes.map((c) => c.typeName).sort();
+  assert.deepEqual(kinds, ["PCB_TRACK", "PCB_TRACK", "PCB_TRACK", "PCB_TRACK", "PCB_TRACK", "PCB_VIA"]);
+  const back = log.commits[0].changes.filter((c) => c.typeName === "PCB_TRACK").map((c) => K.kid(doc.items.get(c.id).node, "layer")[1]);
+  assert.equal(back.filter((l) => l === "B.Cu").length, 2);
+  assert.equal(pcb.onKey("PageUp", ev(), ctx), true); assert.equal(P.state.layer, "F.Cu");
+  assert.ok(!log.toasts.some((m) => /Active layer/.test(m)), "no banner: the layer shows in the toolbar combo and the status bar");
+  // a change applied mid-route (own commit or a peer's) keeps the route; a new document object resets it
+  pcb.onPointerDown(ev(), [130, 60], ctx); assert.ok(P.state.route);
+  P.state.sel = new Set(["s-4"]); pcb.onDocChanged(ctx); assert.ok(P.state.route); assert.equal(P.state.sel.size, 1);
+  pcb.onDocChanged(Object.assign({}, ctx, { doc: fixture() })); assert.equal(P.state.route, null); assert.equal(P.state.sel.size, 0);
+});
+
+test("module: selection keys — U expands the run, W changes width, Delete removes, R rotates the app's footprint", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc);
+  pcb.onDocChanged(ctx); pcb.onActivate("select", ctx);   // W edits the selection only with the select tool (ToolStackIsEmpty)
+  P.state.sel = new Set(["s-1"]);
+  assert.equal(pcb.onKey("u", ev(), ctx), true); assert.equal(P.state.sel.size, 4);
+  P.state.sel = new Set(["s-1"]);
+  assert.equal(pcb.onKey("w", ev(), ctx), true);
+  assert.equal(K.kid(doc.items.get("s-1").node, "width")[1], 0.3); assert.equal(log.commits.at(-1).changes[0].typeName, "PCB_TRACK");
+  assert.equal(pcb.onKey("Delete", ev(), ctx), true);
+  assert.equal(doc.items.has("s-1"), false); assert.equal(log.commits.at(-1).changes[0].kind, "REMOVED");
+  // nothing selected: EDIT_TOOL::Remove takes what is under the cursor (here nothing: silent, nothing removed)
+  ctx.cursor = [0, 0]; const n0 = log.commits.length, t0 = log.toasts.length; assert.equal(pcb.onKey("Delete", ev(), ctx), true); assert.equal(log.commits.length, n0); assert.equal(log.toasts.length, t0);
+  ctx.cursor = null;
+  ctx.selected = { id: "fp-1" };
+  assert.equal(pcb.onKey("r", ev(), ctx), true); assert.equal(doc.items.get("fp-1").rot, 0);
+  assert.equal(pcb.onKey("Flip", ev(), ctx), true); assert.equal(doc.items.get("fp-1").layer, "B.Cu");
+  assert.equal(pcb.onKey("R", ev({ shiftKey: true }), ctx), true); assert.equal(log.tool, "grect");
+  pcb.onPointerDown(ev(), [10, 10], ctx); pcb.onPointerDown(ev(), [20, 15], ctx);
+  assert.equal(log.commits.at(-1).label, "rectangle"); assert.equal(doc.items.get(log.commits.at(-1).changes[0].id).kind, "gr_rect");
+});
+
+test("module: D drags the selected segment with the router, a click commits the rebuilt line", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc);
+  pcb.onDocChanged(ctx);
+  P.state.sel = new Set(["s-1"]); ctx.cursor = [112, 50];
+  assert.equal(pcb.onKey("d", ev(), ctx), true); assert.equal(log.tool, "drag"); assert.ok(P.state.drag);
+  assert.equal(pcb.hiddenIds(), null, "nothing is hidden before the first move");
+  pcb.onPointerMove(ev(), [112, 52], ctx);
+  assert.deepEqual([...pcb.hiddenIds()].sort(), ["s-1", "s-2"]);
+  pcb.onPointerDown(ev(), [112, 52], ctx);
+  assert.equal(log.tool, "select"); assert.equal(P.state.drag, null);
+  const c = log.commits.at(-1); assert.equal(c.label, "drag track");
+  assert.deepEqual(c.changes.map((x) => x.kind).sort(), ["ADDED", "ADDED", "ADDED", "REMOVED", "REMOVED"]);
+  const segs = [...doc.items.values()].filter((it) => it.kind === "segment" && K.kid(it.node, "layer")[1] === "F.Cu").map((it) => [P.pt(it.node, "start"), P.pt(it.node, "end")]);
+  for (const want of [[[110, 50], [112, 52]], [[112, 52], [117, 52]], [[117, 52], [118, 53]]]) assert.ok(segs.some((g) => JSON.stringify(g) === JSON.stringify(want)), JSON.stringify(want) + " in " + JSON.stringify(segs));
+  for (const ch of c.changes.filter((x) => x.kind === "ADDED")) { assert.match(ch.sexpr, /\(width 0\.25\)/); assert.match(ch.sexpr, /\(net "GND"\)/); assert.match(ch.sexpr, /\(uuid /); }
+  // G (Drag Free Angle) on the via: its tracks stretch straight; Escape puts everything back
+  P.state.sel = new Set(["v-1"]); ctx.cursor = [118, 53];
+  assert.equal(pcb.onKey("g", ev(), ctx), true); assert.equal(P.state.drag.subs[0].free, true); assert.equal(P.state.drag.subs[0].mode, "via");
+  pcb.onPointerMove(ev(), [119, 55], ctx);
+  assert.deepEqual(P.state.drag.subs[0].sol.lines.find(({ l }) => l.layer === "B.Cu").pts, [[119, 55], [118, 60]]);
+  pcb.cancel(); assert.equal(P.state.drag, null); assert.equal(log.commits.at(-1), c);
+});
+
+test("module: D on a footprint re-routes its attached tracks at 45° (COMPONENT_DRAGGER)", () => {
+  const extra = `  (segment (start 100 49.1) (end 105 49.1) (width 0.25) (layer "F.Cu") (net "GND") (uuid "t-1"))\n)`;
+  const doc = K.parseDoc(FIXTURE.replace(/\)\s*$/, extra), "kicad_pcb"); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  P.state.sel = new Set(); ctx.selected = { id: "fp-1" }; ctx.selection = new Set(["fp-1"]); ctx.cursor = [100, 50];
+  assert.equal(pcb.onKey("d", ev(), ctx), true); const m = P.state.move; assert.ok(m && m.conns.length >= 1);
+  assert.deepEqual(m.conns.find((c) => c.l.ids.includes("t-1")).l.pts, [[100, 49.1], [105, 49.1]]);
+  P.selectMoveTo(ctx, [100, 48]);
+  assert.deepEqual([...pcb.hiddenIds()].includes("t-1"), true);
+  P.finishSelectMove(ctx, true, false);
+  const c = log.commits.at(-1); assert.equal(c.label, "drag");
+  const segs = [...doc.items.values()].filter((it) => it.kind === "segment" && K.str(K.kid(it.node, "net")[1]) === "GND" && K.kid(it.node, "layer")[1] === "F.Cu").map((it) => JSON.stringify([P.pt(it.node, "start"), P.pt(it.node, "end")]));
+  assert.ok(segs.includes(JSON.stringify([[100, 47.1], [102, 49.1]])) && segs.includes(JSON.stringify([[102, 49.1], [105, 49.1]])), segs.join(" "));
+  ctx.selected = null; ctx.selection = new Set();
+});
+
+test("module: a press on an unselected track draws a box (DRAG_SELECTED); on the selection it arms the router drag", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx); pcb.onActivate("select", ctx);
+  P.state.sel = new Set();
+  assert.equal(pcb.onSelectDown(ev(), [112, 50], ctx), "box"); assert.deepEqual([...P.state.sel], ["s-1"]); assert.equal(P.state.pending, null);
+  assert.equal(pcb.onSelectDown(ev({ clientX: 10, clientY: 10 }), [112, 50], ctx), true); assert.ok(P.state.pending);
+  assert.equal(P.startPendingDrag(ctx, P.state.pending), true); P.state.pending = null;
+  assert.equal(P.state.drag.bySelect, true); assert.equal(P.state.drag.subs[0].mode, "segment");
+  P.dragMove(ctx, [112, 52]); P.finishDrag(ctx, true, false);
+  assert.equal(log.commits.at(-1).label, "drag track"); assert.equal(log.tool, "select");
+});
+
+test("drag collisions: walk around keeps the last valid step, a first step in violation needs Ctrl, free angle never commits a short", () => {
+  const doc = K.parseDoc(FIXTURE.replace(/\)\s*$/, `  (segment (start 108 54) (end 121 54) (width 0.25) (layer "F.Cu") (net "/SIG") (uuid "o-1"))\n)`), "kicad_pcb");
+  const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  // a valid step, then one onto the other net's track: the line stays at the last valid place and that is what commits
+  P.state.sel = new Set(["s-1"]); ctx.cursor = [112, 50]; pcb.onKey("d", ev(), ctx);
+  pcb.onPointerMove(ev(), [112, 51], ctx); const d = P.state.drag.subs[0]; assert.equal(d.status, true);
+  const valid = JSON.stringify(d.sol.lines[0].pts);
+  pcb.onPointerMove(ev(), [112, 54], ctx); assert.equal(d.forceMark, false); assert.equal(JSON.stringify(d.sol.lines[0].pts), valid, "the refused step keeps the last valid line");
+  pcb.onPointerDown(ev(), [112, 54], ctx);
+  assert.equal(log.commits.at(-1).label, "drag track");
+  const ids = new Set(log.commits.at(-1).changes.filter((c) => c.kind === "ADDED").map((c) => c.id));
+  assert.ok(minGapTo(doc, ids, "GND") >= 0.2 - 1e-4, "no short: " + minGapTo(doc, ids, "GND"));
+  // the very first step collides: forced mark-obstacles mode, the obstacle shown, no commit without Ctrl
+  const n = log.commits.length; const seg = [...doc.items.values()].find((it) => it.kind === "segment" && P.pt(it.node, "start")[1] === 51 && P.pt(it.node, "end")[1] === 51);
+  assert.ok(seg, "the dragged run's straight part");
+  P.state.sel = new Set([seg.id]); ctx.cursor = [114, 51]; pcb.onKey("d", ev(), ctx);
+  pcb.onPointerMove(ev(), [114, 54], ctx); let dd = P.state.drag.subs[0];
+  assert.equal(dd.forceMark, true); assert.equal(dd.status, false); assert.ok(dd.hits.some((o) => o.id === "o-1"));
+  pcb.onPointerDown(ev(), [114, 54], ctx); assert.equal(log.commits.length, n, "refused without Ctrl");
+  P.state.sel = new Set([seg.id]); pcb.onKey("d", ev(), ctx); pcb.onPointerMove(ev(), [114, 54], ctx);
+  pcb.onPointerDown(ev({ ctrlKey: true }), [114, 54], ctx); assert.equal(log.commits.length, n + 1, "Ctrl+click commits anyway");
+  // free angle in violation: nothing is committed
+  const doc2 = K.parseDoc(FIXTURE.replace(/\)\s*$/, `  (segment (start 108 54) (end 121 54) (width 0.25) (layer "F.Cu") (net "/SIG") (uuid "o-1"))\n)`), "kicad_pcb");
+  const f2 = fakeCtx(doc2); pcb.onDocChanged(f2.ctx);
+  P.state.sel = new Set(["s-1"]); f2.ctx.cursor = [114, 50]; pcb.onKey("g", ev(), f2.ctx);
+  pcb.onPointerMove(ev(), [115, 54], f2.ctx); dd = P.state.drag.subs[0]; assert.equal(dd.status, false);
+  pcb.onPointerDown(ev(), [115, 54], f2.ctx); assert.equal(f2.log.commits.length, 0);
+});
+
+const arcOf = (c) => { const n = K.kid(K.parse(c.changes[0].sexpr), "gr_arc"); return { start: K.kid(n, "start").slice(1), mid: K.kid(n, "mid").slice(1), end: K.kid(n, "end").slice(1), node: n }; };
+const nearPt = (a, b, tol = 1e-5) => Math.abs(a[0] - b[0]) < tol && Math.abs(a[1] - b[1]) < tol;
+const clickAt = (ctx, p, extra) => { pcb.onPointerMove(ev(extra), p, ctx); pcb.onPointerDown(ev(extra), p, ctx); };
+
+test("module: Draw Arcs (Ctrl+Shift+A) in KiCad's default mode, Center, Start, End; / flips the sweep; the tool goes on", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  P.setArcDrawMode(0);
+  assert.ok(pcb.tools.some((t) => t.id === "garc" && t.key === "Ctrl+Shift+A"));
+  assert.equal(pcb.onKey("Arc", ev(), ctx), true); assert.equal(log.tool, "garc");
+  clickAt(ctx, [10, 10]); clickAt(ctx, [15, 10]);                         // the centre, then the start (radius 5)
+  assert.equal(P.state.draw.arc.getStep(), 2);
+  pcb.onPointerMove(ev(), [15, 11], ctx);                                  // a small sweep picks the direction ...
+  clickAt(ctx, [10, 15]);                                                  // ... which holds once it reaches 90 degrees
+  let c = log.commits.at(-1); assert.equal(c.label, "Draw Arc"); assert.equal(c.changes[0].typeName, "PCB_SHAPE");
+  let a = arcOf(c); const h = 5 * Math.SQRT1_2;
+  assert.deepEqual([a.start, a.end], [[15, 10], [10, 15]]); assert.ok(nearPt(a.mid, [10 + h, 10 + h]), JSON.stringify(a.mid));
+  assert.deepEqual(a.node.slice(4, 6), [["stroke", ["width", 0.1], ["type", "default"]], ["layer", "F.SilkS"]]);
+  assert.ok(P.state.sel.has(c.changes[0].id), "the new arc is selected");
+  assert.equal(log.tool, "garc"); assert.ok(P.state.draw && P.state.draw.arc.isReset(), "the next arc starts afresh");
+  // Switch Arc Posture (/): the other way round the circle (270 degrees)
+  clickAt(ctx, [10, 10]); clickAt(ctx, [15, 10]); pcb.onPointerMove(ev(), [15, 11], ctx); pcb.onPointerMove(ev(), [10, 15], ctx);
+  assert.equal(pcb.onKey("/", ev(), ctx), true);
+  clickAt(ctx, [10, 15]); a = arcOf(log.commits.at(-1));
+  assert.deepEqual([a.start, a.end], [[10, 15], [15, 10]]); assert.ok(nearPt(a.mid, [10 - h, 10 - h]), JSON.stringify(a.mid));
+  // a start on the centre is refused and the centre is asked for again (the center mode steps back)
+  clickAt(ctx, [10, 10]); clickAt(ctx, [10, 10]); assert.equal(P.state.draw.arc.getStep(), 0);
+  // Backspace takes back a point; with none, the arc in progress goes
+  clickAt(ctx, [10, 10]); clickAt(ctx, [15, 10]); assert.equal(pcb.onKey("Backspace", ev(), ctx), true); assert.equal(P.state.draw.arc.getStep(), 1);
+  pcb.onKey("Backspace", ev(), ctx); assert.equal(P.state.draw.arc.getStep(), 0);
+});
+
+test("module: arc modes: Start, End, Midpoint / Start, End, Center (/ = major arc) / Start, Direction, End / Tangent chains", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  P.setArcDrawMode(0); pcb.onKey("Arc", ev(), ctx);
+  // a mode action while the tool runs switches the arc in progress (ARC_MODE_SESSION::HandleModeEvent)
+  assert.equal(pcb.actions.drawArcStartEndMid.run(ctx), true); assert.equal(P.arcDrawMode(), 1); assert.equal(log.tool, "garc");
+  assert.equal(pcb.actions.drawArcStartEndMid.check(), true); assert.equal(pcb.actions.drawArcCenter.check(), false);
+  assert.equal(pcb.routerChecks()["PCB_ACTIONS::drawArcStartEndMid"], true);
+  clickAt(ctx, [10, 10]); clickAt(ctx, [20, 10]);
+  clickAt(ctx, [15, 10]); assert.equal(P.state.draw.arc.getStep(), 2, "a midpoint on the chord is no arc: nothing locks in");
+  clickAt(ctx, [17, 15]);                                                  // the cursor is projected onto the chord's bisector
+  // stored with the board's one winding (EDA_SHAPE::SetArcGeometry swaps the ends of an arc drawn the other way)
+  let a = arcOf(log.commits.at(-1)); assert.deepEqual([a.start, a.mid, a.end], [[20, 10], [15, 15], [10, 10]]);
+  // Start, End, Center: the minor arc bulges away from the centre; / gives the major arc
+  pcb.actions.drawArcStartEndCenter.run(ctx);
+  clickAt(ctx, [10, 30]); clickAt(ctx, [20, 30]); clickAt(ctx, [15, 32]);
+  a = arcOf(log.commits.at(-1)); assert.deepEqual([a.start, a.end], [[10, 30], [20, 30]]); const r = Math.hypot(5, 2);
+  assert.ok(nearPt(a.mid, [15, 32 - r]), "minor: " + a.mid);
+  clickAt(ctx, [10, 30]); clickAt(ctx, [20, 30]); pcb.onPointerMove(ev(), [15, 32], ctx); pcb.onKey("/", ev(), ctx); clickAt(ctx, [15, 32]);
+  a = arcOf(log.commits.at(-1)); assert.ok(nearPt(a.mid, [15, 32 + r]), "major: " + a.mid); assert.deepEqual([a.start, a.end], [[20, 30], [10, 30]]);
+  // Start, Direction, End
+  pcb.actions.drawArcStartDirEnd.run(ctx);
+  clickAt(ctx, [0, 50]); clickAt(ctx, [5, 50]); clickAt(ctx, [5, 55]);
+  a = arcOf(log.commits.at(-1)); assert.deepEqual([a.start, a.end], [[0, 50], [5, 55]]); assert.ok(nearPt(a.mid, [5 * Math.SQRT1_2, 55 - 5 * Math.SQRT1_2]), "" + a.mid);
+  // Tangent: from a line on the layer; then each arc leaves from the end of the last
+  pcb.onKey("Escape", ev(), ctx); P.state.draw = null; pcb.onKey("L", ev({ shiftKey: true }), ctx); assert.equal(log.tool, "gline");
+  clickAt(ctx, [30, 70]); clickAt(ctx, [40, 70]); P.state.draw = null;
+  pcb.actions.drawArcTangent.run(ctx); assert.equal(log.tool, "garc"); assert.equal(P.arcDrawMode(), 3);
+  clickAt(ctx, [40, 70]); assert.ok(P.state.draw.clickSeeded, "a click on the line's end seeds the arc");
+  clickAt(ctx, [45, 75]);
+  a = arcOf(log.commits.at(-1)); assert.deepEqual([a.start, a.end], [[40, 70], [45, 75]]); assert.ok(nearPt(a.mid, [40 + 5 * Math.SQRT1_2, 75 - 5 * Math.SQRT1_2]), "" + a.mid);
+  assert.ok(P.state.draw.chainSeeded && P.state.draw.arc.hasTangentSeed(), "the next arc starts tangent at the end");
+  clickAt(ctx, [40, 80]);
+  a = arcOf(log.commits.at(-1)); assert.deepEqual([a.start, a.end], [[45, 75], [40, 80]]); assert.ok(nearPt(a.mid, [40 + 5 * Math.SQRT1_2, 75 + 5 * Math.SQRT1_2]), "" + a.mid);
+  // Cycle Arc Drawing Mode (Alt+/): Tangent -> Start, Direction, End -> Center, Start, End
+  assert.equal(pcb.onKey("/", ev({ altKey: true }), ctx), true); assert.equal(P.arcDrawMode(), 4);
+  pcb.actions.cycleArcDrawMode.run(ctx); assert.equal(P.arcDrawMode(), 0);
+  // Enter keeps the arc drawn so far and ends the tool
+  pcb.actions.drawArcStartEndMid.run(ctx); clickAt(ctx, [10, 90]); clickAt(ctx, [20, 90]); pcb.onPointerMove(ev(), [15, 95], ctx);
+  const n = log.commits.length; pcb.onKey("Enter", ev(), ctx); assert.equal(log.commits.length, n + 1); assert.equal(log.tool, "select");
+});
+
+test("arc construction (KIGEOM::ArcFrom…) and tangent seeds (ArcTangentSeedAt) in internal units", () => {
+  const sol = P.arcFromStartEndCenterDrag([0, 0], [10e6, 0], [5e6, 5e6], false);
+  assert.ok(sol.valid); assert.ok(near(sol.radius, Math.hypot(5e6, 5e6))); assert.ok(sol.mid[1] < 0, "the minor arc bulges away from the centre");
+  assert.equal(P.arcFromStartEndMidDrag([0, 0], [10e6, 0], [3e6, 0]).valid, false, "an apex on the chord");
+  const t = P.arcFromStartTangentEnd([0, 0], [1, 0], [5e6, 5e6]); assert.ok(t.valid && near(t.center[0], 0) && near(t.center[1], 5e6));
+  assert.equal(P.arcFromStartTangentEnd([0, 0], [1, 0], [5e6, 0]).valid, false, "an end straight ahead");
+  // a seed on the middle of a segment knows the axis only; / picks the side
+  const seg = { t: "seg", start: [0, 0], end: [10e6, 0] };
+  const mid = P.arcTangentSeedAt(seg, [5e6, 1e5], 5e5); assert.deepEqual(mid, { start: [5e6, 0], dir: [1, 0], axis: true });
+  const end = P.arcTangentSeedAt(seg, [10e6, 1e5], 5e5); assert.deepEqual(end, { start: [10e6, 0], dir: [1, 0], axis: false });
+  const g = new P.ArcGeom(3); g.setTangentSeed(mid.start, mid.dir, true); g.addPoint([0, 5e6], false);
+  assert.ok(g.sol.valid && g.sol.center[1] > 0); g.toggleClockwise(); assert.ok(g.sol.valid);
+  // an arc's end leaves along its direction of travel
+  const arc = { t: "arc", start: [10e6, 0], mid: [0, 10e6], end: [-10e6, 0], center: [0, 0] };
+  const s = P.arcTangentSeedNear(arc, [-9e6, 0]); assert.deepEqual(s.start, [-10e6, 0]); assert.ok(near(s.dir[1], -1) && near(s.dir[0], 0), JSON.stringify(s.dir));
+});
+
+test("module: graphic polygon (Ctrl+Shift+P) closes on the first corner or Enter; fewer than three corners is refused", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  assert.equal(pcb.onKey("Polygon", ev(), ctx), true); assert.equal(log.tool, "gpoly");
+  for (const p of [[10, 10], [20, 10], [20, 20], [10, 20]]) pcb.onPointerDown(ev(), p, ctx);
+  assert.equal(pcb.onKey("Backspace", ev(), ctx), true); assert.equal(P.state.draw.pts.length, 3, "Backspace drops the last corner");
+  pcb.onPointerDown(ev(), [10, 20], ctx);
+  pcb.onPointerDown(ev(), [10, 10], ctx);                                   // back on the first corner: closed
+  let c = log.commits.at(-1); assert.equal(c.label, "polygon"); assert.equal(c.changes[0].typeName, "PCB_SHAPE");
+  const node = K.kid(K.parse(c.changes[0].sexpr), "gr_poly");
+  assert.deepEqual(node.slice(0, 5), ["gr_poly", ["pts", ["xy", 10, 10], ["xy", 20, 10], ["xy", 20, 20], ["xy", 10, 20]], ["stroke", ["width", 0.1], ["type", "default"]], ["fill", "no"], ["layer", "F.SilkS"]]);
+  assert.equal(node[5][0], "uuid"); assert.equal(node.length, 6);
+  const it = doc.items.get(c.changes[0].id); assert.equal(it.kind, "gr_poly"); assert.equal(it.geom[0].t, "poly"); assert.equal(it.geom[0].close, true); assert.equal(it.geom[0].fill, null);
+  assert.equal(P.state.draw, null);
+  pcb.onPointerDown(ev(), [30, 30], ctx); pcb.onPointerDown(ev(), [40, 30], ctx); pcb.onPointerDown(ev(), [40, 40], ctx);
+  assert.equal(pcb.onKey("Enter", ev(), ctx), true);
+  c = log.commits.at(-1); assert.equal(K.ptsOf(K.kid(K.parse(c.changes[0].sexpr), "gr_poly")).length, 3, "Enter closes too");
+  const n = log.commits.length;
+  pcb.onPointerDown(ev(), [50, 50], ctx); pcb.onPointerDown(ev(), [60, 50], ctx); assert.equal(pcb.onKey("Enter", ev(), ctx), true);
+  assert.equal(log.commits.length, n); assert.ok(log.toasts.at(-1).includes("three corners")); assert.equal(P.state.draw, null);
+});
+
+test("module: the delete tool removes tracks, graphics and footprints under the click and stays armed", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  assert.equal(pcb.tools.find((t) => t.id === "delete").cursor, "REMOVE", "KiCad's delete cursor (KICURSOR::REMOVE)");
+  ctx.setTool("delete"); assert.equal(P.state.modTool, "delete");
+  pcb.onPointerMove(ev(), [112, 50.05], ctx); assert.equal(P.state.hover.del.id, "s-1", "hover shows what the click removes");
+  assert.equal(pcb.onPointerDown(ev(), [112, 50.05], ctx), true);
+  let c = log.commits.at(-1); assert.equal(c.label, "delete"); assert.deepEqual(c.changes.map((x) => [x.kind, x.id, x.typeName]), [["REMOVED", "s-1", "PCB_TRACK"]]);
+  assert.equal(doc.items.has("s-1"), false);
+  pcb.onPointerDown(ev(), [120, 40.02], ctx); assert.equal(log.commits.at(-1).changes[0].id, "g-1");
+  ctx.selected = { id: "fp-1" }; let cleared = false; ctx.setSelected = (sel) => { cleared = sel === null; };
+  pcb.onPointerDown(ev(), [100, 50], ctx);                                   // the footprint body, through K.hitTest
+  c = log.commits.at(-1); assert.deepEqual(c.changes.map((x) => [x.kind, x.id, x.typeName]), [["REMOVED", "fp-1", "FOOTPRINT"]]); assert.ok(cleared, "app.js's selection is dropped with the item");
+  assert.equal(doc.items.has("fp-1"), false);
+  const n = log.commits.length; assert.equal(pcb.onPointerDown(ev(), [200, 200], ctx), true, "an empty click is still the tool's"); assert.equal(log.commits.length, n);
+  assert.equal(log.tool, "delete");
+});
+
+// ---- render options (kicad-canvas.js), driven with a recording 2D-context stub like render.test.js
+function stubCtx(w, h) {
+  const calls = {}, alphas = new Set(); const rec = (n) => { calls[n] = (calls[n] || 0) + 1; };
+  const c = { canvas: { width: w, height: h }, calls, alphas, font: "", textAlign: "", textBaseline: "", fillStyle: "", strokeStyle: "", lineWidth: 1, lineCap: "", lineJoin: "" };
+  let alpha = 1; Object.defineProperty(c, "globalAlpha", { configurable: true, get: () => alpha, set: (v) => { alpha = v; alphas.add(+v.toFixed(3)); } });
+  for (const n of ["setTransform", "fillRect", "strokeRect", "beginPath", "moveTo", "lineTo", "closePath", "arc", "rect", "fill", "stroke", "save", "restore", "translate", "rotate", "scale", "fillText", "strokeText", "setLineDash"]) c[n] = () => rec(n);
+  c.measureText = (t) => ({ width: t.length * 0.7 });
+  return c;
+}
+const ZONED = FIXTURE.replace(/\)\s*$/, "") + ' (zone (net 0) (net_name "") (layer "F.Cu") (uuid "z-1") (hatch edge 0.5) (connect_pads (clearance 0.5)) (min_thickness 0.25) (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))'
+  + ' (polygon (pts (xy 90 60) (xy 120 60) (xy 120 80) (xy 90 80))) (filled_polygon (layer "F.Cu") (pts (xy 91 61) (xy 119 61) (xy 119 79) (xy 91 79)))))';
+const VIEW = { ppm: 8, zoom: 1, panX: 0, panY: 0, x0: 85, y0: 35, dpr: 1 };
+const renderWith = (doc, opts) => { const c = stubCtx(800, 600); K.render(doc, c, VIEW, opts); return c; };
+
+test("render options: geometry carries the tags the sketch modes need", () => {
+  const doc = K.parseDoc(ZONED, "kicad_pcb");
+  assert.ok(doc.items.get("z-1").geom.some((g) => g.zoneFill && g.fill), "zone fill tagged");
+  assert.ok(doc.items.get("z-1").geom.some((g) => !g.zoneFill && g.t === "poly" && !g.fill), "…its outline is not");
+  assert.ok(doc.items.get("v-1").geom.every((g) => g.via) && doc.items.get("v-1").geom.length === 3);
+  assert.ok(doc.items.get("s-1").geom[0].track && doc.items.get("a-1").geom[0].track && doc.items.get("a-1").geom[0].t === "arc");
+  const pads = doc.items.get("fp-1").geom.filter((g) => g.pad); assert.equal(pads.length, 6, "two pads on F.Cu/F.Mask/F.Paste");
+  assert.ok(!doc.items.get("fp-1").geom.some((g) => g.t === "line" && g.pad), "footprint drawings are not pads");
+  assert.ok(!doc.items.get("g-1").geom[0].track && !doc.items.get("g-1").geom[0].pad);
+});
+
+test("render options: zoneOutline drops the copper fill, the outline hatch stays", () => {
+  const doc = K.parseDoc(ZONED, "kicad_pcb");
+  const plain = renderWith(doc, {}), outline = renderWith(doc, { zoneOutline: true });
+  assert.equal(plain.calls.fill - outline.calls.fill, 1, "exactly the filled polygon is skipped");
+  assert.equal(plain.calls.stroke, outline.calls.stroke, "outline and hatch ticks still stroked");
+});
+
+test("render options: outlinePads / outlineTracks / outlineVias stroke instead of fill", () => {
+  const doc = K.parseDoc(ZONED, "kicad_pcb");
+  const plain = renderWith(doc, {});
+  const pads = renderWith(doc, { outlinePads: true });
+  assert.equal(plain.calls.fill - pads.calls.fill, 6, "six pad shapes no longer filled"); assert.equal(pads.calls.stroke - plain.calls.stroke, 6, "…but stroked");
+  const vias = renderWith(doc, { outlineVias: true });
+  assert.equal(plain.calls.fill - vias.calls.fill, 3, "two copper rings and the hole become outlines"); assert.equal(vias.calls.stroke - plain.calls.stroke, 3);
+  const tracks = renderWith(doc, { outlineTracks: true });
+  assert.equal(tracks.calls.stroke, plain.calls.stroke, "every track still one stroke");
+  assert.ok(tracks.calls.arc - plain.calls.arc >= 2 * 4 + 3, "stadium end caps and arc band caps are traced");
+  assert.equal(tracks.calls.fill, plain.calls.fill, "tracks were never filled");
+  const all = renderWith(doc, { outlinePads: true, outlineTracks: true, outlineVias: true });
+  assert.equal(plain.calls.fill - all.calls.fill, 9);
+  const sch = K.parseDoc('(kicad_sch (version 20250114) (generator "t") (paper "A4") (junction (at 2 2) (diameter 0) (color 0 0 0 0) (uuid "j")))');
+  const sview = { ppm: 2, zoom: 1, panX: 0, panY: 0, x0: 0, y0: 0, dpr: 1 };
+  const a = stubCtx(600, 400); K.render(sch, a, sview, {}); const b = stubCtx(600, 400); K.render(sch, b, sview, { outlinePads: true, outlineVias: true, outlineTracks: true, zoneOutline: true, highContrast: true, activeLayer: "F.Cu" });
+  assert.deepEqual(b.calls, a.calls, "board options are ignored on a schematic");
+});
+
+test("render options: highContrast mixes everything off the active layer with the background, holes stay", () => {
+  // PCB_RENDER_SETTINGS::GetColor: color.Mix( background, m_hiContrastFactor ), opaque (no alpha)
+  const doc = K.parseDoc(ZONED, "kicad_pcb");
+  const plain = renderWith(doc, {});
+  const hc = renderWith(doc, { highContrast: true, activeLayer: "B.Cu" });
+  assert.ok(!hc.alphas.has(0.2), "no alpha dimming");
+  assert.equal(hc.calls.fill, plain.calls.fill, "dimming does not drop anything");
+  const only = K.parseDoc('(kicad_pcb (version 20240108) (generator "t") (layers (0 "F.Cu" signal) (2 "B.Cu" signal)) (via (at 100 50) (size 0.8) (drill 0.4) (layers "F.Cu" "B.Cu") (net 0) (uuid "v")))', "kicad_pcb");
+  const fills = []; const c = stubCtx(800, 600); let f = ""; Object.defineProperty(c, "fillStyle", { set: (v) => { f = v; }, get: () => f }); const fill0 = c.fill; c.fill = (...a) => { fills.push(f); return fill0 && fill0(...a); };
+  K.render(only, c, VIEW, { highContrast: true, activeLayer: "F.Cu" });
+  const dimB = K.mixColor(K.pcbColor("B.Cu"), K.PCB_BG, 0.2);
+  assert.ok(fills.includes(dimB) && fills.includes(K.pcbColor("F.Cu")), "only the B.Cu ring is mixed: the F.Cu ring and the hole keep their colours " + JSON.stringify(fills));
+});
+
+test("sample board: rotate/flip invariants hold for every footprint, tracks snap and chain", { skip: !fs.existsSync(SAMPLE) && "sample board not present" }, () => {
+  const doc = K.parseDoc(fs.readFileSync(SAMPLE, "utf8"), "kicad_pcb");
+  assert.equal(P.netStyle(doc), "name");
+  let fps = 0;
+  for (const it of doc.items.values()) {
+    if (it.kind !== "footprint") continue; fps++;
+    const [fx, fy, a0] = K.atOf(it.node); const before = absPads(it.node);
+    const rot = P.rotateFootprintNode(JSON.parse(JSON.stringify(it.node)), 90); const a1 = K.atOf(rot)[2];
+    K.kids(it.node, "pad").forEach((p, i) => assert.equal(angleDiff(K.atOf(K.kids(rot, "pad")[i])[2], a1), angleDiff(K.atOf(p)[2], a0), `${it.ref} pad ${p[1]} angle`));
+    absPads(rot).forEach(([x, y], i) => { const [ex, ey] = rot90(fx, fy, before[i][0], before[i][1]); assert.ok(near(x, ex, 1e-5) && near(y, ey, 1e-5), `${it.ref} rotated pad ${i}`); });
+    const flip = P.flipFootprintNode(JSON.parse(JSON.stringify(it.node)));
+    assert.equal(K.kid(flip, "layer")[1], P.flipLayerName(it.layer));
+    absPads(flip).forEach(([x, y], i) => assert.ok(near(x, 2 * fx - before[i][0], 1e-5) && near(y, before[i][1], 1e-5), `${it.ref} flipped pad ${i}`));
+    assert.deepEqual(canon(P.flipFootprintNode(JSON.parse(JSON.stringify(flip)))), canon(it.node), `${it.ref} flip is an involution`);
+    let four = rot; for (let i = 0; i < 3; i++) four = P.rotateFootprintNode(four, 90);
+    assert.deepEqual(canon(four), canon(it.node), `${it.ref} four turns return`);
+    assert.ok(roundTrips(rot) && roundTrips(flip));
+  }
+  assert.ok(fps > 10);
+  const seg = [...doc.items.values()].find((it) => it.kind === "segment");
+  const s = K.kid(seg.node, "start"), e = K.kid(seg.node, "end");
+  assert.equal(P.hitTestItem(doc, (s[1] + e[1]) / 2, (s[2] + e[2]) / 2, 0.05).id, seg.id);
+  assert.ok(P.connectedRun(doc, [seg.id]).has(seg.id));
+  const snap = P.snapTarget(doc, s[1] + 0.1, s[2] + 0.1, 0.5, K.kid(seg.node, "layer")[1], null);
+  assert.ok(snap && near(snap.x, s[1]) && near(snap.y, s[2]));
+  const fp = [...doc.items.values()].find((it) => it.kind === "footprint" && P.padsOf(it).some((p) => p.net.name));
+  const pad = P.padsOf(fp).find((p) => p.net.name);
+  const cu = pad.layers.find((l) => /\.Cu$/.test(l)); const layer = cu === "*.Cu" || cu === "F&B.Cu" ? "F.Cu" : cu;
+  const ps = P.snapTarget(doc, pad.x + 0.2, pad.y - 0.2, 0.5, layer, null);   // nearest same-net target: the pad, or a track end on it
+  assert.ok(ps && ps.net.name === pad.net.name);
+  const pc = P.snapTarget(doc, pad.x, pad.y, 0.5, layer, null);
+  assert.ok(pc && pc.kind === "pad" && near(pc.x, pad.x) && near(pc.y, pad.y));
+});
+
+// ---- the new board tools: node shapes against pcb_io_kicad_sexpr.cpp, previews, commits, undo safety
+/** An ADDED change re-applies to a fresh copy of the board, the item there re-serialises unchanged, and its inverse removes it. */
+function checkFragment(c, kind) {
+  assert.equal(c.kind, "ADDED");
+  const other = fixture(); assert.ok(K.applyChange(other, c, IU), "re-applies elsewhere");
+  const it = other.items.get(c.id); assert.equal(it.kind, kind); assert.ok(roundTrips(it.node), "file round trip");
+  assert.ok(K.applyChange(other, { id: c.id, kind: "REMOVED", typeName: c.typeName, properties: [] }, IU)); assert.equal(other.items.has(c.id), false, "the undo inverse removes it");
+  return K.kid(K.parse(c.sexpr), kind);
+}
+const lastNode = (log, kind) => checkFragment(log.commits.at(-1).changes[0], kind);
+// the serializer writes a numeric-looking dimension value ("10") bare and the parser hands it back as a number; KiCad's
+// NeedSYMBOLorNUMBER reads it as the text either way, so the value is compared as text
+const withText = (node) => { const gt = K.kid(node, "gr_text"); if (gt) gt[1] = String(gt[1]); return node; };
+
+test("new items take BOARD_DESIGN_SETTINGS' layer-class defaults: line widths, text sizes and thicknesses", () => {
+  assert.deepEqual(["F.SilkS", "F.Cu", "In1.Cu", "Edge.Cuts", "F.CrtYd", "B.Fab", "Dwgs.User"].map(P.gfxWidth), [0.1, 0.2, 0.2, 0.05, 0.05, 0.1, 0.1]);
+  assert.deepEqual(P.textStyle("F.Cu"), { size: 1.5, thick: 0.3 }); assert.deepEqual(P.textStyle("B.SilkS"), { size: 1, thick: 0.1 }); assert.deepEqual(P.textStyle("Dwgs.User"), { size: 1, thick: 0.15 });
+  assert.deepEqual(P.effectsNode("B.SilkS", ["left", "top"]), ["effects", ["font", ["size", 1, 1], ["thickness", 0.1]], ["justify", "left", "top", "mirror"]]);
+  assert.deepEqual(P.effectsNode("Dwgs.User"), ["effects", ["font", ["size", 1, 1], ["thickness", 0.15]]]);
+  assert.deepEqual(K.kid(P.curveNode([[0, 0], [1, 1], [2, 1], [3, 0]], "F.Cu"), "stroke"), ["stroke", ["width", 0.2], ["type", "default"]], "copper graphics take the copper line width");
+});
+
+test("module: Bezier (Ctrl+Shift+B) takes the start, two control points and the end; the node is a gr_curve", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  assert.equal(pcb.onKey("Bezier", ev(), ctx), true); assert.equal(log.tool, "gcurve");
+  pcb.onPointerDown(ev(), [10, 10], ctx); pcb.onPointerDown(ev(), [12, 4], ctx); pcb.onPointerDown(ev(), [18, 4], ctx);
+  assert.equal(pcb.onKey("Backspace", ev(), ctx), true); assert.equal(P.state.draw.pts.length, 2, "Backspace drops the last point");
+  pcb.onPointerDown(ev(), [18, 4], ctx);
+  const n = log.commits.length; pcb.onPointerDown(ev(), [18, 4], ctx); assert.equal(log.commits.length, n, "a repeated point is refused");
+  pcb.onPointerMove(ev(), [20, 10], ctx); assert.deepEqual(P.state.draw.cur, [20, 10]);
+  pcb.onPointerDown(ev(), [20, 10], ctx);
+  const c = log.commits.at(-1); assert.equal(c.label, "curve"); assert.equal(c.changes[0].typeName, "PCB_SHAPE");
+  const node = lastNode(log, "gr_curve");
+  assert.deepEqual(node.slice(0, 4), ["gr_curve", ["pts", ["xy", 10, 10], ["xy", 12, 4], ["xy", 18, 4], ["xy", 20, 10]], ["stroke", ["width", 0.1], ["type", "default"]], ["layer", "F.SilkS"]]);
+  assert.equal(node[4][0], "uuid"); assert.equal(node.length, 5);
+  const it = doc.items.get(c.changes[0].id); assert.equal(it.kind, "gr_curve"); assert.equal(it.geom[0].t, "poly"); assert.equal(it.geom[0].close, false); assert.ok(it.geom[0].pts.length > 4, "flattened curve");
+  assert.equal(P.state.draw, null); assert.equal(log.tool, "gcurve");
+});
+
+test("module: text box takes two corners and the prompt; the node follows the writer's child order", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  let title = null; pcb.setPrompt((t, initial, client, done) => { title = t; done("Hello\nworld"); });
+  ctx.setTool("gtextbox"); pcb.onPointerDown(ev(), [30, 20], ctx); assert.ok(P.state.draw); pcb.onPointerDown(ev(), [10, 12], ctx);
+  assert.equal(title, "Text box");
+  const c = log.commits.at(-1); assert.equal(c.label, "Draw Text Box"); assert.equal(c.changes[0].typeName, "PCB_TEXTBOX");
+  const node = lastNode(log, "gr_text_box");
+  assert.deepEqual(node.slice(0, 6), ["gr_text_box", "Hello\nworld", ["start", 10, 12], ["end", 30, 20], ["margins", 1.0025, 1.0025, 1.0025, 1.0025], ["layer", "F.SilkS"]]);
+  assert.deepEqual(node[6], ["uuid", c.changes[0].id]);
+  assert.deepEqual(node.slice(7), [["effects", ["font", ["size", 1, 1], ["thickness", 0.1]], ["justify", "left", "top"]], ["border", "yes"], ["stroke", ["width", 0.1], ["type", "default"]], ["knockout", "no"]]);
+  const it = doc.items.get(c.changes[0].id); assert.equal(it.kind, "gr_text_box"); assert.ok(it.geom.some((g) => g.t === "poly") && it.geom.some((g) => g.t === "text"), "border and text");
+  // a cancelled prompt leaves nothing behind; a back layer mirrors the text
+  const n = log.commits.length; pcb.setPrompt((t, i, cl, done) => done(null));
+  pcb.onPointerDown(ev(), [40, 40], ctx); pcb.onPointerDown(ev(), [50, 45], ctx); assert.equal(log.commits.length, n); assert.equal(P.state.draw, null);
+  assert.deepEqual(K.kid(K.kid(P.textBoxNode("x", [0, 0], [5, 5], "B.SilkS"), "effects"), "justify"), ["justify", "left", "top", "mirror"]);
+});
+
+test("module: Draw Table sizes the table from the drag as DRAWING_TOOL::DrawTable, opens Table Properties, and writes PCB_TABLE in the writer's order", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx); ctx.gridPitch = 0;
+  let seen = null, reply = (n, done) => done(n);
+  pcb.setNewItemDialogs({ table: (c, node, done) => { seen = node; reply(node, done); return true; } });
+  try {
+    ctx.setTool("table"); pcb.onPointerDown(ev(), [10, 10], ctx); pcb.onPointerMove(ev(), [40, 16], ctx); pcb.onPointerDown(ev(), [40, 16], ctx);
+    assert.ok(seen, "Table Properties opens on the new table");
+    const c = log.commits.at(-1); assert.equal(c.label, "Draw Table"); assert.equal(c.changes[0].typeName, "PCB_TABLE");
+    const node = lastNode(log, "table");
+    assert.deepEqual(node[1], ["uuid", c.changes[0].id]); assert.deepEqual(node[2], ["layer", "F.SilkS"]); assert.deepEqual(node[3], ["column_count", 2]);
+    assert.deepEqual(node.slice(4, 8), [["border", ["external", "yes"], ["header", "yes"], ["stroke", ["width", 0.1], ["type", "default"]]],
+      ["separators", ["rows", "yes"], ["cols", "yes"], ["stroke", ["width", 0.1], ["type", "default"]]], ["column_widths", 15, 15], ["row_heights", 3, 3]]);
+    const cells = node[8]; assert.equal(cells[0], "cells"); assert.equal(cells.length, 5); assert.equal(node.length, 9);
+    const uuids = new Set();
+    cells.slice(1).forEach((cell, i) => {
+      const r = Math.floor(i / 2), col = i % 2;
+      assert.deepEqual(cell.slice(0, 6), ["table_cell", "", ["start", 10 + col * 15, 10 + r * 3], ["end", 25 + col * 15, 13 + r * 3], ["margins", 1.0025, 1.0025, 1.0025, 1.0025], ["span", 1, 1]]);
+      assert.deepEqual(cell[6], ["layer", "F.SilkS"]); assert.equal(cell[7][0], "uuid"); uuids.add(cell[7][1]);
+      assert.deepEqual(cell.slice(8), [["effects", ["font", ["size", 1.27, 1.27]], ["justify", "left"]], ["knockout", "no"]]);
+    });
+    assert.equal(uuids.size, 4, "every cell has its own uuid");
+    assert.deepEqual([...P.state.sel], [c.changes[0].id], "the new table is selected");
+    // Cancel drops it; a drag up and left still hangs one minimum cell from the first click
+    const n = log.commits.length; reply = (nd, done) => done(null);
+    pcb.onPointerDown(ev(), [50, 50], ctx); pcb.onPointerDown(ev(), [60, 55], ctx); assert.equal(log.commits.length, n);
+  } finally { pcb.setNewItemDialogs({ table: null }); pcb.onActivate("select", ctx); }
+  assert.deepEqual(P.tableGrid([20, 20], [10, 10], "F.SilkS", 0), { x: 20, y: 20, cw: 5, ch: 3, rows: 1, cols: 1 });
+  assert.deepEqual(P.tableGrid([0, 0], [10.3, 4.1], "F.SilkS", 0.5), { x: 0, y: 0, cw: 10.5, ch: 4, rows: 1, cols: 1 });
+  assert.deepEqual(K.kid(K.kid(P.tableNode([0, 0], [10, 3], "B.SilkS", 0)[8][1], "effects"), "justify"), ["justify", "left", "mirror"]);
+});
+
+
+// a PNG built from its chunks: 8-bit RGB, a pHYs of 3937 px/m (100 ppi), proper CRCs
+function crc32(buf) { let crc = 0xFFFFFFFF; for (const b of buf) { let c = (crc ^ b) & 0xFF; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; crc = (crc >>> 8) ^ c; } return (crc ^ 0xFFFFFFFF) >>> 0; }
+function pngChunk(type, data) { const len = Buffer.alloc(4); len.writeUInt32BE(data.length); const td = Buffer.concat([Buffer.from(type, "latin1"), data]); const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td)); return Buffer.concat([len, td, crc]); }
+function makePng(w, h, ppm) {
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+  const phys = Buffer.alloc(9); phys.writeUInt32BE(ppm, 0); phys.writeUInt32BE(ppm, 4); phys[8] = 1;
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]), pngChunk("IHDR", ihdr), pngChunk("pHYs", phys), pngChunk("IDAT", zlib.deflateSync(Buffer.alloc((w * 3 + 1) * h))), pngChunk("IEND", Buffer.alloc(0))]);
+}
+
+test("module: a reference image comes from the picker, rides the cursor and lands centred with 76-column data rows", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  const png = makePng(20, 10, 3937); const b64 = png.toString("base64");
+  let opened = 0; pcb.setImagePicker((done) => { opened++; done({ base64: b64, name: "logo.png" }); });
+  ctx.setTool("image");
+  assert.equal(opened, 1, "the file dialog opens with the tool");
+  const img = P.state.image; assert.ok(img); assert.deepEqual([img.info.type, img.info.w, img.info.h, img.info.ppi], ["png", 20, 10, 100]);
+  assert.ok(near(img.w, 5.08) && near(img.h, 2.54), "1000 mils per ppi, so 100 ppi is 0.254 mm a pixel");
+  pcb.onPointerMove(ev(), [50, 50], ctx);
+  assert.equal(pcb.onPointerDown(ev(), [50, 50], ctx), true);
+  const c = log.commits.at(-1); assert.equal(c.label, "Place Image"); assert.equal(c.changes[0].typeName, "PCB_REFERENCE_IMAGE"); assert.equal(P.state.image, null);
+  assert.ok(P.state.sel.has(c.changes[0].id), "PlaceReferenceImage selects the placed image");
+  const node = lastNode(log, "image");
+  assert.deepEqual(node.slice(0, 3), ["image", ["at", 50, 50], ["layer", "F.SilkS"]]);
+  const data = node[3]; assert.equal(data[0], "data"); assert.equal(node[4][0], "uuid"); assert.equal(node.length, 5, "no (scale) at 1");
+  const rows = data.slice(1).map(String); assert.ok(rows.length > 1 && rows.every((r) => r.length <= 76) && rows.slice(0, -1).every((r) => r.length === 76)); assert.equal(rows.join(""), b64);
+  assert.equal(doc.items.get(c.changes[0].id).kind, "image");
+  assert.equal(pcb.onPointerDown(ev(), [60, 60], ctx), true); assert.equal(opened, 2, "the next click asks for a file again");
+  // JPEG headers: JFIF density in dpi, SOF0 size; anything else is refused
+  const jpg = Buffer.from([0xFF, 0xD8, 0xFF, 0xE0, 0, 16, 0x4A, 0x46, 0x49, 0x46, 0, 1, 1, 1, 0, 72, 0, 72, 0, 0, 0xFF, 0xC0, 0, 11, 8, 0, 30, 0, 40, 1, 1, 0x11, 0]);
+  assert.deepEqual(P.imageInfo(new Uint8Array(jpg)), { type: "jpeg", w: 40, h: 30, ppi: 72 });
+  assert.equal(P.imageInfo(new Uint8Array([1, 2, 3, 4, 5])), null);
+  assert.equal(P.imageInfo(P.base64Bytes(b64)).ppi, 100);
+  ctx.setTool("select"); assert.equal(P.state.image, null, "leaving the tool drops the image");
+  pcb.setImagePicker((done) => done({ base64: Buffer.from("GIF89a").toString("base64"), name: "x.gif" }));
+  let msg = null; pcb.setForm((spec) => { msg = spec; return true; });
+  ctx.setTool("image"); assert.equal(P.state.image, null);
+  assert.equal(msg && msg.fields[0].value, "Could not load image from 'x.gif'.", "KiCad's message in a dialog, not a toast");
+  pcb.setForm(null);
+  // REFERENCE_IMAGE::Rotate: the centre turns about the point, the orientation is a (rotate) after the layer
+  const r = P.rotateNode(["image", ["at", 10, 0], ["layer", "F.SilkS"], ["data", "x"]], 0, 0, 90);
+  assert.deepEqual(r.slice(0, 4), ["image", ["at", 0, -10], ["layer", "F.SilkS"], ["rotate", 90]]);
+  P.rotateNode(r, 0, 0, -90); assert.equal(K.kid(r, "rotate"), null, "back at 0: no (rotate) written");
+});
+
+test("module: zone (Alt+Z) closes on the first corner, asks for the net and writes ZONE_SETTINGS' defaults unfilled", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  let asked = null; pcb.setPrompt((t, initial, client, done, options) => { asked = { t, initial, options }; done("GND"); });
+  assert.equal(pcb.onKey("Zone", ev(), ctx), true); assert.equal(log.tool, "zone");
+  for (const p of [[112, 50], [130, 45], [130, 70], [95, 70]]) pcb.onPointerDown(ev(), p, ctx);
+  pcb.onPointerDown(ev(), [112, 50], ctx);
+  assert.equal(asked.t, "Zone net"); assert.equal(asked.initial, "GND", "the copper under the first corner"); assert.deepEqual(asked.options, ["/SIG", "GND"]);
+  const c = log.commits.at(-1); assert.equal(c.label, "zone"); assert.equal(c.changes[0].typeName, "ZONE"); assert.equal(c.changes[0].netName, "GND");
+  const node = lastNode(log, "zone");
+  assert.deepEqual(node.slice(0, 3), ["zone", ["net", "GND"], ["layer", "F.Cu"]]); assert.deepEqual(node[3], ["uuid", c.changes[0].id]);
+  assert.deepEqual(node.slice(4), [["hatch", "edge", 0.5], ["connect_pads", ["clearance", 0.5]], ["min_thickness", 0.25],
+    ["fill", ["thermal_gap", 0.5], ["thermal_bridge_width", 0.5], ["island_removal_mode", 0]],
+    ["polygon", ["pts", ["xy", 112, 50], ["xy", 130, 45], ["xy", 130, 70], ["xy", 95, 70]]]]);
+  const it = doc.items.get(c.changes[0].id); assert.equal(it.kind, "zone"); assert.ok(it.geom.some((g) => g.t === "poly" && !g.fill) && !it.geom.some((g) => g.zoneFill), "outline and hatch, no fill");
+  // the next copper zone takes the next free priority; an empty net means no (net); Enter closes too; B.Cu when active
+  pcb.setPrompt((t, i, cl, done) => done(""));
+  assert.equal(pcb.onKey("PageDown", ev(), ctx), true);
+  for (const p of [[10, 10], [20, 10], [20, 20]]) pcb.onPointerDown(ev(), p, ctx);
+  assert.equal(pcb.onKey("Enter", ev(), ctx), true);
+  const z2 = lastNode(log, "zone");
+  assert.deepEqual(z2[1], ["layer", "B.Cu"]); assert.deepEqual(z2[4], ["priority", 1]); assert.equal(log.commits.at(-1).changes[0].netName, undefined);
+  // a cancelled prompt drops the outline; fewer than three corners is refused
+  const n = log.commits.length; pcb.setPrompt((t, i, cl, done) => done(null));
+  for (const p of [[30, 30], [40, 30], [40, 40]]) pcb.onPointerDown(ev(), p, ctx); pcb.onPointerDown(ev(), [30, 30], ctx);
+  assert.equal(log.commits.length, n); assert.equal(P.state.draw, null);
+  pcb.onPointerDown(ev(), [50, 50], ctx); pcb.onPointerDown(ev(), [60, 50], ctx); assert.equal(pcb.onKey("Enter", ev(), ctx), true); assert.equal(log.commits.length, n);
+  // the legacy net style writes the code
+  const legacy = K.parseDoc(CODE_STYLE, "kicad_pcb");
+  assert.deepEqual(P.zoneNode(legacy, [[0, 0], [1, 0], [1, 1]], "B.Cu", { code: 2, name: "GND" })[1], ["net", 2]);
+  assert.equal(P.zoneNode(legacy, [[0, 0], [1, 0], [1, 1]], "B.Cu", { code: 0, name: "" })[1][0], "layer");
+  P.state.layer = "F.Cu";
+});
+
+test("module: rule area (Ctrl+Shift+K) is a keepout on both outer copper layers with KiCad's default rules", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  assert.equal(pcb.onKey("RuleArea", ev(), ctx), true); assert.equal(log.tool, "rulearea");
+  for (const p of [[10, 10], [20, 10], [20, 20], [10, 20]]) pcb.onPointerDown(ev(), p, ctx);
+  pcb.onPointerDown(ev(), [10, 20], ctx);   // the last corner again closes
+  const c = log.commits.at(-1); assert.equal(c.label, "rule area"); assert.equal(c.changes[0].typeName, "ZONE"); assert.equal(c.changes[0].netName, undefined);
+  const node = lastNode(log, "zone");
+  assert.deepEqual(node[1], ["layers", "F.Cu", "B.Cu"]); assert.deepEqual(node[2], ["uuid", c.changes[0].id]);
+  assert.deepEqual(node.slice(3), [["hatch", "edge", 0.5], ["connect_pads", ["clearance", 0.5]], ["min_thickness", 0.25],
+    ["keepout", ["tracks", "not_allowed"], ["vias", "not_allowed"], ["pads", "not_allowed"], ["copperpour", "allowed"], ["footprints", "allowed"]],
+    ["placement", ["enabled", "no"], ["sheetname", ""]], ["fill", ["thermal_gap", 0.5], ["thermal_bridge_width", 0.5], ["island_removal_mode", 0]],
+    ["polygon", ["pts", ["xy", 10, 10], ["xy", 20, 10], ["xy", 20, 20], ["xy", 10, 20]]]]);
+  const it = doc.items.get(c.changes[0].id); assert.ok(it.geom.some((g) => g.layer === "F.Cu") && it.geom.some((g) => g.layer === "B.Cu"));
+  assert.equal(P.zonePriority(doc), 0, "rule areas hold no priority");
+  assert.deepEqual(P.ruleAreaNode([[0, 0], [1, 0], [1, 1]], ["In1.Cu"])[1], ["layer", "In1.Cu"]);
+});
+
+test("dimension text: GetValueText in mm at four places with zeroes suppressed; aligned text angles; 45° snapping", () => {
+  assert.deepEqual([10, 2.5, 3.14159, 0, 12.34567, 0.00004, 100.5].map(P.dimValueText), ["10", "2.5", "3.1416", "0", "12.3457", "0", "100.5"]);
+  assert.deepEqual([[5, 0], [0, 5], [5, 5], [-5, 5], [0, -5], [-5, 0], [-5, -5]].map(P.readableAngle), [0, 90, 315, 45, 90, 0, -45]);
+  assert.deepEqual([[10, 3], [3, 10], [10, 6], [-6, 10], [6, -10], [0, 0]].map(P.snap45), [[10, 0], [0, 10], [10, 10], [-10, 10], [10, -10], [0, 0]]);
+  assert.deepEqual(P.DIM_CLASS, { aligned: "PCB_DIM_ALIGNED", orthogonal: "PCB_DIM_ORTHOGONAL", center: "PCB_DIM_CENTER", radial: "PCB_DIM_RADIAL", leader: "PCB_DIM_LEADER" });
+  assert.equal(P.EXT_HEIGHT, 0.58642, "int(1.27 mm × sin 27.5°) in nanometres");
+});
+
+test("module: aligned dimension takes two points and the offset; the node carries the writer's format, style and KiCad's text placement", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  ctx.setTool("dimaligned");
+  pcb.onPointerDown(ev(), [10, 10], ctx);
+  const n0 = log.commits.length; pcb.onPointerDown(ev(), [10, 10], ctx); assert.equal(P.state.draw.pts.length, 1, "a zero-length dimension is refused");
+  pcb.onPointerDown(ev(), [20, 10], ctx); assert.deepEqual(P.state.draw.end, [20, 10]);
+  pcb.onPointerMove(ev(), [15, 7], ctx); assert.ok(near(P.state.draw.height, -3), "the cursor's signed distance from the line");
+  pcb.onPointerDown(ev(), [15, 7], ctx);
+  assert.equal(log.commits.length, n0 + 1);
+  const c = log.commits.at(-1); assert.equal(c.label, "Draw Dimension"); assert.equal(c.changes[0].typeName, "PCB_DIM_ALIGNED"); const id = c.changes[0].id;
+  assert.deepEqual(withText(lastNode(log, "dimension")), ["dimension", ["type", "aligned"], ["layer", "F.SilkS"], ["uuid", id], ["pts", ["xy", 10, 10], ["xy", 20, 10]], ["height", -3],
+    ["format", ["prefix", ""], ["suffix", ""], ["units", 3], ["units_format", 0], ["precision", 4], ["suppress_zeroes", "yes"]],
+    ["style", ["thickness", 0.1], ["arrow_length", 1.27], ["text_position_mode", 0], ["arrow_direction", "outward"], ["extension_height", 0.58642], ["extension_offset", 0.5], ["keep_text_aligned", "yes"]],
+    ["gr_text", "10", ["at", 15, 5.9, 0], ["layer", "F.SilkS"], ["uuid", id], ["effects", ["font", ["size", 1, 1], ["thickness", 0.1]]]]]);
+  const it = doc.items.get(id); assert.equal(it.kind, "dimension"); assert.ok(it.geom.filter((g) => g.t === "line").length >= 7, "extension lines, crossbar and arrow barbs");
+  assert.equal(P.state.draw, null); assert.equal(log.tool, "dimaligned");
+  // a slanted one on Dwgs.User: the crossbar sits on the cursor's side, the text turns with it into the readable half
+  P.state.gfxLayer = "Dwgs.User";
+  pcb.onPointerDown(ev(), [0, 0], ctx); pcb.onPointerDown(ev(), [10, 10], ctx); pcb.onPointerMove(ev(), [10, 0], ctx); pcb.onPointerDown(ev(), [10, 0], ctx);
+  const d2 = withText(lastNode(log, "dimension")); const gt = K.kid(d2, "gr_text");
+  assert.ok(near(K.kid(d2, "height")[1], -7.071068, 1e-5));
+  assert.equal(gt[1], "14.1421"); assert.equal(K.kid(gt, "at")[3], 315);
+  assert.ok(near(K.kid(gt, "at")[1], 10.813173, 1e-5) && near(K.kid(gt, "at")[2], -0.813173, 1e-5), "1.15 mm off the crossbar's middle");
+  assert.deepEqual(K.kid(gt, "effects"), ["effects", ["font", ["size", 1, 1], ["thickness", 0.15]]]);
+  assert.deepEqual(K.kid(d2, "style")[1], ["thickness", 0.1]);
+  const g = P.dimGeometry("aligned", { start: [0, 0], end: [10, 10], height: -7.071068 }, "Dwgs.User");
+  assert.ok(near(g.lines[2][0][0], 5, 1e-5) && near(g.lines[2][0][1], -5, 1e-5), "crossbar start on the extension side");
+  P.state.gfxLayer = "F.SilkS";
+});
+
+test("module: orthogonal dimension (Ctrl+Shift+H) measures X or Y by where the third click falls", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  assert.equal(pcb.onKey("Ortho", ev(), ctx), true); assert.equal(log.tool, "dimortho");
+  pcb.onPointerDown(ev(), [10, 10], ctx); pcb.onPointerDown(ev(), [20, 14], ctx);
+  assert.equal(P.state.draw.orientation, "h", "the longer side to start with");
+  pcb.onPointerMove(ev(), [15, 20], ctx); assert.equal(P.state.draw.orientation, "h"); assert.equal(P.state.draw.height, 10);
+  pcb.onPointerMove(ev(), [25, 12], ctx); assert.equal(P.state.draw.orientation, "v", "beside the points: Y"); assert.equal(P.state.draw.height, 15);
+  pcb.onPointerMove(ev(), [15, 12], ctx); assert.equal(P.state.draw.orientation, "v", "inside the points' box the axis stays"); assert.equal(P.state.draw.height, 5);
+  pcb.onPointerMove(ev(), [15, 20], ctx); pcb.onPointerDown(ev(), [15, 20], ctx);
+  const c = log.commits.at(-1); assert.equal(c.changes[0].typeName, "PCB_DIM_ORTHOGONAL");
+  const node = withText(lastNode(log, "dimension"));
+  assert.deepEqual(node.slice(4, 7), [["pts", ["xy", 10, 10], ["xy", 20, 14]], ["height", 10], ["orientation", 0]]);
+  const gt = K.kid(node, "gr_text"); assert.equal(gt[1], "10"); assert.deepEqual(K.kid(gt, "at"), ["at", 15, 18.9, 0]);
+  assert.deepEqual(K.kid(node, "style"), ["style", ["thickness", 0.1], ["arrow_length", 1.27], ["text_position_mode", 0], ["arrow_direction", "outward"], ["extension_height", 0.58642], ["extension_offset", 0.5], ["keep_text_aligned", "yes"]]);
+  // vertical: the text stands up beside the crossbar
+  pcb.onPointerDown(ev(), [30, 10], ctx); pcb.onPointerDown(ev(), [32, 30], ctx); pcb.onPointerMove(ev(), [40, 20], ctx); pcb.onPointerDown(ev(), [40, 20], ctx);
+  const n2 = withText(lastNode(log, "dimension")); const t2 = K.kid(n2, "gr_text");
+  assert.deepEqual([K.kid(n2, "height")[1], K.kid(n2, "orientation")[1], t2[1]], [10, 1, "20"]); assert.deepEqual(K.kid(t2, "at"), ["at", 38.9, 20, 90]);
+});
+
+test("module: centre, radial and leader dimensions — a 45° cross, an R-prefixed radius done at the second click, a leader that opens its properties", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  ctx.setTool("dimcenter"); pcb.onPointerDown(ev(), [10, 10], ctx); pcb.onPointerDown(ev(), [13, 11], ctx);
+  let c = log.commits.at(-1); assert.equal(c.changes[0].typeName, "PCB_DIM_CENTER"); let id = c.changes[0].id;
+  assert.deepEqual(lastNode(log, "dimension"), ["dimension", ["type", "center"], ["layer", "F.SilkS"], ["uuid", id], ["pts", ["xy", 10, 10], ["xy", 13, 10]],
+    ["style", ["thickness", 0.1], ["arrow_length", 1.27], ["text_position_mode", 0], ["extension_offset", 0.5], ["keep_text_aligned", "yes"]]]);
+  assert.equal(doc.items.get(id).geom.length, 2, "two arms");
+  ctx.setTool("dimradial"); pcb.onPointerDown(ev(), [10, 10], ctx); pcb.onPointerDown(ev(), [15, 10], ctx);
+  c = log.commits.at(-1); assert.equal(c.changes[0].typeName, "PCB_DIM_RADIAL", "SET_END finishes a radial dimension"); id = c.changes[0].id;
+  assert.equal(P.state.draw, null);
+  assert.deepEqual(lastNode(log, "dimension"), ["dimension", ["type", "radial"], ["layer", "F.SilkS"], ["uuid", id], ["pts", ["xy", 10, 10], ["xy", 15, 10]], ["leader_length", 3.81],
+    ["format", ["prefix", "R "], ["suffix", ""], ["units", 3], ["units_format", 0], ["precision", 4], ["suppress_zeroes", "yes"]],
+    ["style", ["thickness", 0.1], ["arrow_length", 1.27], ["text_position_mode", 0], ["extension_offset", 0.5], ["keep_text_aligned", "yes"]],
+    ["gr_text", "R 5", ["at", 31.51, 10, 0], ["layer", "F.SilkS"], ["uuid", id], ["effects", ["font", ["size", 1, 1], ["thickness", 0.1]]]]], "the text ten arrow lengths past the knee");
+  assert.deepEqual([...P.selectionIds(ctx)], [id], "the new dimension is selected");
+  // a leader: "Leader" as its text, then Dimension Properties opens on it (OnEditItemRequest)
+  const opened = []; globalThis.KDialogs = { openItem: (c2, it) => { opened.push(it.id); return true; } };
+  ctx.setTool("leader"); pcb.onPointerDown(ev(), [10, 10], ctx); pcb.onPointerDown(ev(), [20, 15], ctx);
+  c = log.commits.at(-1); assert.equal(c.changes[0].typeName, "PCB_DIM_LEADER"); assert.equal(c.label, "Draw Dimension"); id = c.changes[0].id;
+  assert.deepEqual(lastNode(log, "dimension"), ["dimension", ["type", "leader"], ["layer", "F.SilkS"], ["uuid", id], ["pts", ["xy", 10, 10], ["xy", 20, 15]],
+    ["format", ["prefix", ""], ["suffix", ""], ["units", 0], ["units_format", 0], ["precision", 4], ["override_value", "Leader"]],
+    ["style", ["thickness", 0.1], ["arrow_length", 1.27], ["text_position_mode", 0], ["text_frame", 0], ["extension_offset", 0.5]],
+    ["gr_text", "Leader", ["at", 32.7, 15, 0], ["layer", "F.SilkS"], ["uuid", id], ["effects", ["font", ["size", 1, 1], ["thickness", 0.1]]]]]);
+  assert.deepEqual(opened, [id], "the leader's properties open at once"); delete globalThis.KDialogs;
+  const n = log.commits.length;
+  // Enter drops a dimension in progress; a back layer mirrors the value text
+  ctx.setTool("dimaligned"); pcb.onPointerDown(ev(), [1, 1], ctx); pcb.onPointerDown(ev(), [5, 1], ctx);
+  assert.equal(pcb.onKey("Enter", ev(), ctx), true); assert.equal(P.state.draw, null); assert.equal(log.commits.length, n);
+  assert.deepEqual(K.kid(K.kid(P.dimensionNode("aligned", { start: [0, 0], end: [4, 0], height: 2 }, "B.SilkS"), "gr_text"), "effects")[2], ["justify", "mirror"]);
+});
+
+test("deleteChanges returns REMOVED changes for a mixed multi-selection; every new tool is registered with KiCad's hotkey or none", () => {
+  const doc = fixture();
+  const ch = P.deleteChanges(doc, [doc.items.get("s-1"), "v-1", doc.items.get("fp-1"), "g-1", "nope"]);
+  assert.deepEqual(ch.map((c) => [c.kind, c.id, c.typeName]), [["REMOVED", "s-1", "PCB_TRACK"], ["REMOVED", "v-1", "PCB_VIA"], ["REMOVED", "fp-1", "FOOTPRINT"], ["REMOVED", "g-1", "PCB_SHAPE"]]);
+  assert.equal(pcb.deleteChanges, P.deleteChanges); assert.deepEqual(P.deleteChanges(doc, []), []);
+  const keys = Object.fromEntries(pcb.tools.map((t) => [t.id, t.key]));
+  assert.deepEqual(["gcurve", "gtextbox", "table", "image", "zone", "rulearea", "dimaligned", "dimortho", "dimcenter", "dimradial", "leader"].map((id) => keys[id]),
+    ["Ctrl+Shift+B", "", "", "", "Alt+Z", "Ctrl+Shift+K", "", "Ctrl+Shift+H", "", "", ""]);
+  for (const t of pcb.tools) assert.ok(t.label && t.icon && t.cursor, t.id);
+  assert.equal(typeof pcb.setPrompt, "function"); assert.equal(typeof pcb.setImagePicker, "function");
+});
+
+// ================================================================ parity pass: connectivity, DRC, clipboard, placement, cleanup, pads, groups, actions
+require(path.join(__dirname, "..", "props.js"));   // the pad dialog edits pads through props.js's setPad
+const T = (v) => +v.toFixed(5);
+const tn = (a, b, tol) => assert.ok(near(a, b, tol || 1e-5), `${a} ≈ ${b}`);
+const ids = (changes) => changes.map((c) => c.id);
+const kinds = (changes) => changes.map((c) => c.kind);
+const node = (c) => K.parse(c.sexpr)[0] === "kicad_pcb" ? K.parse(c.sexpr).find((x, i) => i > 0 && Array.isArray(x) && x[0] !== "version" && x[0] !== "generator") : K.parse(c.sexpr);
+// a fuller fake ctx: app.js's multi-selection, setSelection, a clipboard and the snapped cursor
+function fullCtx(doc) {
+  const { ctx, log } = fakeCtx(doc); log.clip = ""; log.selection = null; log.highlight = null;
+  Object.assign(ctx, { selection: new Set(), cursor: null, activeLayer: "F.Cu",
+    setSelection(list) { log.selection = Array.from(list); ctx.selection = new Set(list); },
+    setHighlight(s) { log.highlight = s ? new Set(s) : null; },
+    clipboard: { get: () => log.clip, set: (t) => { log.clip = t; } } });
+  pcb.onDocChanged(ctx); return { ctx, log };
+}
+const A = pcb.actions;
+
+test("netlist clusters touching copper per net; the ratsnest spans the clusters with a minimum tree", () => {
+  const doc = fixture(); const nl = P.netlist(doc);
+  const gnd = nl.nets.get("GND"), sig = nl.nets.get("/SIG");
+  assert.equal(gnd.pads.length, 1); assert.equal(gnd.vias.length, 1); assert.equal(gnd.tracks.length, 5, "four segments and an arc");
+  assert.equal(gnd.clusters.length, 4, "pad, the via run, the lone segment, the arc"); assert.equal(gnd.unconnected, 3); assert.equal(sig.unconnected, 0);
+  assert.ok(gnd.clusters.some((c) => c.items.map((i) => i.id).sort().join() === "s-1,s-2,s-3,v-1"), "the via bridges F.Cu and B.Cu");
+  const lines = P.ratsnest(doc, nl);
+  assert.equal(lines.length, 3); assert.ok(lines.every((l) => l.net === "GND" && l.name === "GND"));
+  const padLine = lines.find((l) => l.ids.includes("fp-1")); assert.deepEqual([padLine.a, padLine.b], [[100, 49.1], [110, 50]]); assert.deepEqual(padLine.ids, ["fp-1", "s-1"]);
+  assert.ok(lines.some((l) => near(l.length, 5) && l.ids.includes("s-4") && l.ids.includes("a-1")), "nearest anchors: the segment's end to the arc's start");
+  assert.equal(P.localRatsnest(doc, "fp-1", nl).length, 1); assert.equal(P.localRatsnest(doc, "s-4", nl).length, 2); assert.equal(P.localRatsnest(doc, "a-1", nl).length, 1);
+  // a track from the pad to the run joins their clusters; a filled zone joins whatever sits in its copper
+  P.addedChange(doc, P.segmentNode(doc, [100, 49.1], [110, 50], 0.25, "F.Cu", { code: -1, name: "GND" }));
+  assert.equal(P.ratsnest(doc).length, 2);
+  const z = ["zone", ["net", "GND"], ["layer", "F.Cu"], ["hatch", "edge", 0.5], ["connect_pads", ["clearance", 0.5]], ["min_thickness", 0.25], ["fill", "yes"],
+    ["polygon", ["pts", ["xy", 128, 48], ["xy", 144, 48], ["xy", 144, 52], ["xy", 128, 52]]], ["filled_polygon", ["layer", "F.Cu"], ["pts", ["xy", 128, 48], ["xy", 144, 48], ["xy", 144, 52], ["xy", 128, 52]]]];
+  P.addedChange(doc, z); const nl2 = P.netlist(doc);
+  assert.equal(nl2.nets.get("GND").clusters.length, 2); assert.equal(P.ratsnest(doc, nl2).length, 1);
+  assert.equal(P.netItemIds(doc, "GND", nl2).size, 9, "footprint, six tracks, via and zone");
+  // a net-less track takes the net of what it touches (KiCad's propagation); one touching two nets is a short
+  const doc2 = fixture(); P.addedChange(doc2, P.segmentNode(doc2, [100, 49.1], [100, 50.9], 0.25, "F.Cu", { code: 0, name: "" }));
+  const nl3 = P.netlist(doc2); assert.equal(nl3.nets.get("GND").shorts.length + nl3.nets.get("/SIG").shorts.length, 1, "the bridge shorts GND to /SIG");
+});
+
+test("netInspector counts pads, vias, routed length (arcs by arc length) and missing connections per net", () => {
+  const rows = P.netInspector(fixture());
+  assert.deepEqual(rows.map((r) => r.name), ["/SIG", "GND"]);
+  const gnd = rows[1]; assert.equal(gnd.padCount, 1); assert.equal(gnd.viaCount, 1); assert.equal(gnd.unconnected, 3);
+  tn(gnd.trackLength, 5 + Math.hypot(3, 3) + 7 + 5 + Math.PI, 1e-4);
+  assert.deepEqual(rows[0], { name: "/SIG", code: 0, padCount: 1, viaCount: 0, trackLength: 0, zoneCount: 0, unconnected: 0 });
+});
+
+const DRC_BOARD = `(kicad_pcb (version 20260728) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (44 "Edge.Cuts" user) (37 "F.SilkS" user) (43 "F.CrtYd" user))
+  (footprint "Test:R" (layer "F.Cu") (uuid "fp-1") (at 100 50 -90)
+    (property "Reference" "R1" (at 0 -1.5 -90) (layer "F.SilkS") (uuid "p-1") (effects (font (size 1 1) (thickness 0.15))))
+    (fp_rect (start -1.5 -1) (end 1.5 1) (stroke (width 0.05) (type default)) (fill no) (layer "F.CrtYd") (uuid "c-1"))
+    (pad "1" smd roundrect (at -0.9 0 -90) (size 1 1.2) (layers "F.Cu" "F.Mask" "F.Paste") (roundrect_rratio 0.25) (net "GND") (uuid "pad-1"))
+    (pad "2" smd roundrect (at 0.9 0 -90) (size 1 1.2) (layers "F.Cu" "F.Mask" "F.Paste") (roundrect_rratio 0.25) (net "/SIG") (uuid "pad-2")))
+  (footprint "Test:R" (layer "F.Cu") (uuid "fp-2") (at 102.2 50)
+    (property "Reference" "R2" (at 0 -1.5) (layer "F.SilkS") (uuid "p-2") (effects (font (size 1 1) (thickness 0.15))))
+    (fp_rect (start -1.5 -1) (end 1.5 1) (stroke (width 0.05) (type default)) (fill no) (layer "F.CrtYd") (uuid "c-2"))
+    (pad "1" smd rect (at -0.9 0) (size 1 1.2) (layers "F.Cu" "F.Mask" "F.Paste") (net "GND") (uuid "pad-3")))
+  (footprint "Test:R" (layer "F.Cu") (uuid "fp-3") (at 105.2 50)
+    (property "Reference" "R3" (at 0 -1.5) (layer "F.SilkS") (uuid "p-3") (effects (font (size 1 1) (thickness 0.15))))
+    (fp_rect (start -1.5 -1) (end 1.5 1) (stroke (width 0.05) (type default)) (fill no) (layer "F.CrtYd") (uuid "c-3"))
+    (pad "1" smd rect (at -0.9 0) (size 1 1.2) (layers "F.Cu" "F.Mask" "F.Paste") (net "/SIG") (uuid "pad-4")))
+  (footprint "Test:R" (layer "F.Cu") (uuid "fp-4") (at 200 200)
+    (property "Reference" "R4" (at 0 -1.5) (layer "F.SilkS") (uuid "p-4") (effects (font (size 1 1) (thickness 0.15))))
+    (pad "1" smd rect (at 0 0) (size 1 1.2) (layers "F.Cu" "F.Mask" "F.Paste") (net "GND") (uuid "pad-5")))
+  (segment (start 110 50) (end 115 50) (width 0.25) (layer "F.Cu") (net "GND") (uuid "s-1"))
+  (segment (start 110 50.35) (end 115 50.35) (width 0.25) (layer "F.Cu") (net "/SIG") (uuid "s-2"))
+  (segment (start 100 40.3) (end 105 40.3) (width 0.25) (layer "F.Cu") (net "GND") (uuid "s-3"))
+  (segment (start 120 45) (end 120 45) (width 0.25) (layer "F.Cu") (net "GND") (uuid "s-0"))
+  (via (at 125 60) (size 0.8) (drill 0.8) (layers "F.Cu" "B.Cu") (net "GND") (uuid "v-bad"))
+  (gr_rect (start 90 40) (end 150 90) (stroke (width 0.05) (type default)) (fill no) (layer "Edge.Cuts") (uuid "edge"))
+)`;
+test("DRC: clearance, board edge, missing connections, dangling and zero-length tracks, annular width, courtyards and the outline", () => {
+  const doc = K.parseDoc(DRC_BOARD, "kicad_pcb"); const m = P.drc(doc);
+  const by = (code) => m.filter((x) => x.code === code);
+  const clr = by("clearance"); assert.equal(clr.length, 1); assert.equal(clr[0].text, "Clearance violation (netclass 'Default' clearance 0.2000 mm; actual 0.1000 mm)");
+  assert.deepEqual(clr[0].ids.sort(), ["s-1", "s-2"]); assert.equal(clr[0].severity, "error"); assert.ok(clr[0].x > 110 && clr[0].x < 115 && near(clr[0].y, 50.175, 1e-3));
+  const edge = by("copper_edge_clearance"); assert.equal(edge.length, 1); assert.deepEqual(edge[0].ids, ["edge", "s-3"], "SetItems( edge, item )"); assert.ok(/edge clearance 0\.5000 mm; actual 0\.1750 mm/.test(edge[0].text), "Edge.Cuts lines are measured at zero width");
+  assert.equal(by("unconnected_items").length, P.ratsnest(doc).length); assert.ok(by("unconnected_items").every((x) => x.severity === "error" && /Missing connection/.test(x.text)));
+  assert.equal(by("zero_length").length, 0, "KiCad has no zero-length track check");
+  const dang = by("track_dangling"); assert.deepEqual(dang.map((x) => x.ids[0]).sort(), ["s-1", "s-2", "s-3"], "one marker per loose track"); assert.ok(dang.every((x) => x.severity === "warning"));
+  const ann = by("annular_width"); assert.equal(ann.length, 1); assert.deepEqual([ann[0].ids[0], ann[0].x, ann[0].y], ["v-bad", 125, 60]);
+  assert.deepEqual(by("via_dangling").map((x) => x.ids[0]), ["v-bad"]);
+  const cy = by("courtyards_overlap"); assert.equal(cy.length, 1, "R1 and R2 overlap; R2 and R3 only share an edge"); assert.deepEqual(cy[0].ids, ["fp-1", "fp-2"]);
+  assert.equal(by("outside_outline").length, 0, "KiCad's code is copper_outside_board");
+  const out = by("copper_outside_board"); assert.deepEqual(out.map((x) => x.ids[0]), ["fp-4"]); assert.equal(out[0].severity, "warning"); assert.equal(out[0].text, "Copper outside board outline");
+  assert.equal(by("invalid_outline").length, 0); assert.equal(by("shorting_items").length, 0);
+  assert.ok(m.every((x) => typeof x.x === "number" && typeof x.y === "number" && x.text && Array.isArray(x.ids)));
+  // a .kicad_pro's rules: a looser clearance and edge clearance pass, ignored rules vanish, severities follow the project
+  const pro = { board: { design_settings: { rules: { min_clearance: 0.05, min_copper_edge_clearance: 0.1, min_track_width: 0.3 }, rule_severities: { courtyards_overlap: "ignore", track_dangling: "error" } } },
+    net_settings: { classes: [{ name: "Default", clearance: 0.05, track_width: 0.2, via_diameter: 0.6, via_drill: 0.3 }, { name: "Power", clearance: 0.4, track_width: 0.5, via_diameter: 0.8, via_drill: 0.4 }], netclass_patterns: [{ pattern: "GND", netclass: "Power" }] } };
+  const s = P.designSettings(pro); assert.equal(s.clearance, 0.05); assert.equal(s.edgeClearance, 0.1); assert.equal(P.netclassOf(s, "GND").track_width, 0.5); assert.equal(P.netClearance(s, "/SIG"), 0.05);
+  const m2 = P.drc(doc, s);
+  assert.equal(m2.filter((x) => x.code === "courtyards_overlap").length, 0); assert.ok(m2.filter((x) => x.code === "track_dangling").every((x) => x.severity === "error"));
+  assert.equal(m2.filter((x) => x.code === "copper_edge_clearance").length, 0);
+  const c2 = m2.filter((x) => x.code === "clearance"); assert.equal(c2.length, 2, "GND's 0.4 mm class now also catches R1's /SIG pad against R2's GND pad");
+  assert.ok(c2.every((x) => /netclass 'Power' clearance 0\.4000 mm/.test(x.text)), "the stricter class of the pair names the rule"); assert.ok(c2.some((x) => /actual 0\.2028 mm/.test(x.text) && x.ids.join() === "fp-1,fp-2"));
+  assert.equal(m2.filter((x) => x.code === "track_width").length, 4, "the four 0.25 mm tracks under a 0.3 mm minimum, the zero-length one too (TRACK_WIDTH checks every track)");
+  // a legacy board's (setup …) block and a broken outline
+  const legacy = P.designSettings('(kicad_pcb (version 20171130) (setup (trace_clearance 0.3) (edge_clearance 0.2)) (net_class Default "" (clearance 0.3) (trace_width 0.35) (via_dia 0.9) (via_drill 0.45) (add_net GND)))');
+  assert.equal(legacy.clearance, 0.3); assert.equal(legacy.edgeClearance, 0.2); assert.equal(P.netclassOf(legacy, "GND").via_diameter, 0.9);
+  const open = fixture(); assert.equal(P.boardOutline(open).outline, null); assert.ok(P.boardOutline(open).hasEdges);
+  assert.ok(P.drc(open).some((x) => x.code === "invalid_outline"));
+  assert.ok(P.boardOutline(doc).outline.length === 4 && near(P.boardOutline(doc).area, 3000));
+  assert.deepEqual(P.inspectClearance(doc, "s-1", "s-2"), { gap: 0.1, required: 0.2, sameNet: false, nets: ["GND", "/SIG"] });
+});
+
+test("clipboard: copy writes KiCad's kicad_pcb clipboard document; paste lands at the cursor with fresh uuids, kept nets and unique references", () => {
+  const doc = fixture(); const text = P.clipboardText(doc, ["fp-1", "s-1"], [100, 50]);
+  const tree = K.parse(text); assert.equal(tree[0], "kicad_pcb"); assert.equal(K.kid(tree, "generator")[1], "kicad-collab-web"); assert.equal(K.kid(tree, "version")[1], P.BOARD_VERSION);
+  assert.deepEqual(K.kid(tree, "layers").slice(1, 3), [[0, "F.Cu", "signal"], [2, "B.Cu", "signal"]], "copper first, in stack order");
+  assert.deepEqual(K.kids(tree, "net"), [["net", 0, ""], ["net", 1, "GND"], ["net", 2, "/SIG"]]);
+  const fp = K.kid(tree, "footprint"), seg = K.kid(tree, "segment"); assert.deepEqual(K.atOf(fp).slice(0, 2), [0, 0], "the reference point sits at the origin"); assert.deepEqual(K.kid(seg, "start").slice(1), [10, 0]);
+  assert.equal(K.uuidOf(fp), "fp-1", "copies keep their ids; paste mints new ones");
+  const r = P.pasteChanges(doc, text, [200, 100]);
+  assert.equal(r.changes.length, 2); assert.ok(r.changes.every((c) => c.kind === "ADDED")); assert.ok(!r.ids.includes("fp-1") && !r.ids.includes("s-1"));
+  const nfp = doc.items.get(r.ids[0]), nseg = doc.items.get(r.ids[1]);
+  assert.equal(nfp.kind, "footprint"); assert.deepEqual([nfp.x, nfp.y, nfp.rot], [200, 100, -90]); assert.equal(nfp.ref, "R1", "a plain paste keeps the reference (PASTE_MODE::KEEP_ANNOTATIONS)");
+  assert.equal(doc.items.get(P.pasteChanges(doc, text, [0, 0], { annotations: "unique" }).ids[0]).ref, "R2", "unique: R1 is taken");
+  assert.ok(!K.kids(nfp.node, "pad").some((p) => K.uuidOf(p) === "pad-1" || K.uuidOf(p) === "pad-2"), "pads get fresh ids too");
+  assert.deepEqual(K.kid(K.kids(nfp.node, "pad")[0], "net"), ["net", "GND"]); assert.equal(r.changes[0].padNets["1"], "GND");
+  assert.deepEqual(K.kid(nseg.node, "start").slice(1), [210, 100]); assert.deepEqual(K.kid(nseg.node, "net"), ["net", "GND"]); assert.equal(r.changes[1].netName, "GND");
+  assert.equal(P.pasteChanges(doc, text, [0, 0], { annotations: "keep" }).changes.length && [...doc.items.values()].filter((it) => it.ref === "R1").length, 3);
+  const cleared = P.pasteChanges(doc, text, [0, 0], { annotations: "clear" }); assert.equal(doc.items.get(cleared.ids[0]).ref, "REF**");
+  assert.deepEqual(P.pasteChanges(doc, "not a board", [0, 0]), { changes: [], ids: [] });
+  // a group travels with its members and comes back pointing at the copies
+  const g = P.groupChanges(doc, ["s-4", "a-1"], "pair"); const gid = g[0].id;
+  const t2 = P.clipboardText(doc, ["s-4"], [0, 0]); assert.ok(/\(group "pair"/.test(t2) && /\(arc /.test(t2), "the group and its other member come along");
+  const r2 = P.pasteChanges(doc, t2, [0, 0]); const ng = r2.ids.map((id) => doc.items.get(id)).find((it) => it.kind === "group");
+  assert.ok(ng && ng.id !== gid); assert.deepEqual(P.groupMembers(ng.node).sort(), r2.ids.filter((id) => id !== ng.id).sort());
+  // into a numbered-net board the names become that board's codes; unknown names go unconnected
+  const coded = K.parseDoc(CODE_STYLE.replace("(segment", '(footprint "X" (layer "F.Cu") (uuid "cfp") (at 0 0) (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 2 "GND") (uuid "cpad")))\n  (segment'), "kicad_pcb");
+  const r3 = P.pasteChanges(coded, text, [5, 5]); const cfp = coded.items.get(r3.ids[0]), cseg = coded.items.get(r3.ids[1]);
+  assert.deepEqual(K.kid(K.kids(cfp.node, "pad")[0], "net"), ["net", 2, "GND"]); assert.deepEqual(K.kid(K.kids(cfp.node, "pad")[1], "net"), ["net", 0, ""]); assert.deepEqual(K.kid(cseg.node, "net"), ["net", 2]);
+  // duplicate: same place, new ids
+  const d = P.duplicateChanges(fixture(), ["s-1"]); assert.equal(d.ids.length, 1); assert.notEqual(d.ids[0], "s-1"); assert.deepEqual(K.kid(node(d.changes[0]), "start").slice(1), [110, 50]);
+  const arr = P.arrayChanges(fixture(), ["s-1"], { type: "grid", nx: 3, ny: 2, dx: 10, dy: 5, hThenV: true }); assert.equal(arr.ids.length, 6, "five copies and the original");
+  assert.equal(P.referencePoint(doc, ["s-1"], [114, 51])[0], 115, "the item anchor nearest the cursor");
+});
+
+test("align and distribute move by bounding boxes like ALIGN_DISTRIBUTE_TOOL; the delta math matches kimath", () => {
+  assert.deepEqual(P.distributeDeltasGaps([[0, 2], [3, 5], [10, 12]]), [0, 2, 0]); assert.deepEqual(P.distributeDeltasPoints([0, 3, 10]), [0, 2, 0]); assert.deepEqual(P.distributeDeltasGaps([[0, 1], [5, 6]]), [0, 0]);
+  const doc = fixture(); const a = P.addedChange(doc, P.rectNode([0, 0], [2, 2], "F.SilkS")).id, b = P.addedChange(doc, P.rectNode([3, 5], [5, 7], "F.SilkS")).id, c = P.addedChange(doc, P.rectNode([10, 1], [12, 3], "F.SilkS")).id;
+  const start = (id) => pt(doc.items.get(id).node, "start");
+  const apply = (ch) => { for (const x of ch) assert.ok(K.applyChange(doc, x, IU)); return ch; };
+  assert.equal(apply(P.alignChanges(doc, [a, b, c], "left")).length, 2); assert.deepEqual([start(b)[0], start(c)[0]], [0, 0]);
+  apply(P.alignChanges(doc, [a, b, c], "top")); assert.deepEqual([start(b)[1], start(c)[1]], [0, 0]);
+  apply(P.alignChanges(doc, [a, b, c], "right")); assert.deepEqual(start(a), [0, 0], "all share the rightmost edge already: nothing moves");
+  const doc2 = fixture(); const ids2 = [P.addedChange(doc2, P.rectNode([0, 0], [2, 2], "F.SilkS")).id, P.addedChange(doc2, P.rectNode([3, 5], [5, 7], "F.SilkS")).id, P.addedChange(doc2, P.rectNode([10, 1], [12, 3], "F.SilkS")).id];
+  const ch = P.distributeChanges(doc2, ids2, "x", false); assert.equal(ch.length, 1); assert.equal(ch[0].id, ids2[1]); assert.deepEqual(K.kid(node(ch[0]), "start").slice(1), [5, 5]);
+  assert.deepEqual(P.distributeChanges(doc2, ids2.slice(0, 2), "x", false), [], "three items at least");
+  const cy = P.alignChanges(doc2, ids2, "centerY", [4, 6]); assert.equal(cy.length, 2, "the item under the cursor is the target"); assert.ok(cy.every((x) => x.id !== ids2[1]));
+});
+function pt(n, key) { const k = K.kid(n, key); return [k[1], k[2]]; }
+
+test("swap layers: tracks move between copper layers, through vias and footprints stay (GLOBAL_EDIT_TOOL::SwapLayers)", () => {
+  const doc = fixture();
+  const ch = P.swapLayerChanges(doc, { "F.Cu": "B.Cu", "B.Cu": "F.Cu" });
+  const ids = ch.map((c) => c.id).sort();
+  assert.deepEqual(ids, ["a-1", "s-1", "s-2", "s-3", "s-4"], "the through via and the footprint are left alone");
+  assert.equal(K.kid(node(ch.find((c) => c.id === "s-3")), "layer")[1], "F.Cu");
+  assert.deepEqual(P.swapLayerChanges(doc, { "F.Cu": "F.Cu" }), [], "an identity map changes nothing");
+});
+test("move exactly, position relative, rotate / flip / mirror about the selection centre, swap and pack", () => {
+  const doc = fixture();
+  const me = P.moveExactChanges(doc, ["s-4"], { dx: 1, dy: 2, rotation: 0 }); assert.deepEqual([pt(node(me[0]), "start"), pt(node(me[0]), "end")], [[131, 52], [136, 52]]);
+  const me2 = P.moveExactChanges(doc, ["s-4"], { dx: 1, dy: 2, rotation: 180, about: "center" }); assert.deepEqual([pt(node(me2[0]), "start"), pt(node(me2[0]), "end")], [[136, 52], [131, 52]]);
+  const pr = P.positionRelativeChanges(doc, ["s-4", "a-1"], [0, 0], 10, 20); assert.equal(pr.length, 2); assert.deepEqual(pt(node(pr.find((c) => c.id === "s-4")), "start"), [10, 20]); assert.deepEqual(pt(node(pr.find((c) => c.id === "a-1")), "start"), [20, 20]);
+  assert.deepEqual(P.selectionCenter([doc.items.get("s-1"), doc.items.get("s-4")]), [122.5, 50]); assert.deepEqual(P.selectionCenter([doc.items.get("fp-1")]), [100, 50], "a lone item turns about its anchor");
+  const rot = P.rotateChanges(doc, ["s-1", "s-4"], 122.5, 50, 90); const r1 = node(rot.find((c) => c.id === "s-1"));
+  assert.deepEqual([pt(r1, "start"), pt(r1, "end")], [[122.5, 62.5], [122.5, 57.5]], "+90 is counter-clockwise on screen");
+  const rt = P.addedChange(doc, P.textNode("t", 10, 10, "F.SilkS")).id; const rr = node(P.rotateChanges(doc, [rt], 10, 10, 45)[0]); assert.deepEqual(K.kid(rr, "at"), ["at", 10, 10, 45]);
+  const rect = P.addedChange(doc, P.rectNode([0, 0], [4, 2], "F.SilkS")).id; const rp = node(P.rotateChanges(doc, [rect], 2, 1, 30)[0]); assert.equal(rp[0], "gr_poly"); assert.equal(K.ptsOf(rp).length, 4, "an off-axis rectangle becomes a polygon");
+  assert.equal(node(P.rotateChanges(doc, [rect], 2, 1, 90)[0])[0], "gr_rect");
+  const fl = P.flipChanges(doc, ["fp-1", "s-1"], 105); const fs = node(fl.find((c) => c.id === "s-1")), ff = node(fl.find((c) => c.id === "fp-1"));
+  assert.deepEqual([pt(fs, "start"), pt(fs, "end"), K.kid(fs, "layer")[1]], [[100, 50], [95, 50], "B.Cu"]); assert.deepEqual([K.atOf(ff)[0], K.atOf(ff)[1], K.kid(ff, "layer")[1]], [110, 50, "B.Cu"]);
+  assert.deepEqual(P.mirrorChanges(doc, ["fp-1"], 100, 50, "h"), [], "footprints refuse to mirror");
+  const mv = node(P.mirrorChanges(doc, ["s-4"], 132.5, 50, "v")[0]); assert.deepEqual(pt(mv, "start"), [130, 50]); const mh = node(P.mirrorChanges(doc, [rt], 10, 10, "h")[0]); assert.ok(K.kid(K.kid(mh, "effects"), "justify").includes("mirror"));
+  const sw = P.swapChanges(doc, ["s-1", "s-4"]); assert.deepEqual(pt(node(sw.find((c) => c.id === "s-1")), "start"), [130, 50]); assert.deepEqual(pt(node(sw.find((c) => c.id === "s-4")), "start"), [110, 50]);
+  const doc2 = K.parseDoc(DRC_BOARD, "kicad_pcb"); const pk = P.packChanges(doc2, ["fp-1", "fp-2", "fp-3", "fp-4"]); assert.ok(pk.length >= 3);
+  const boxes = pk.map((c) => { K.applyChange(doc2, c, IU); return doc2.items.get(c.id).bbox; }); for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++) assert.ok(boxes[i][2] <= boxes[j][0] + 1e-6 || boxes[j][2] <= boxes[i][0] + 1e-6 || boxes[i][3] <= boxes[j][1] + 1e-6 || boxes[j][3] <= boxes[i][1] + 1e-6, "packed footprints do not overlap");
+});
+
+test("cleanup tracks & vias plans KiCad's options: null, duplicate, contained and collinear segments, tracks in pads, shorts, dangling ends", () => {
+  const doc = fixture(); const seg = (a, b, net) => P.addedChange(doc, P.segmentNode(doc, a, b, 0.25, "F.Cu", net || { code: -1, name: "GND" })).id;
+  const z = seg([50, 50], [50, 50]), d1 = seg([60, 50], [65, 50]), d2 = seg([60, 50], [65, 50]), c1 = seg([70, 50], [75, 50]), c2 = seg([75, 50], [80, 50]), big = seg([90, 50], [100, 50]), inner = seg([92, 50], [95, 50]);
+  const v = P.addedChange(doc, P.viaNode(doc, 75, 50, 0.8, 0.4, { code: -1, name: "GND" })).id;
+  const inPad = seg([99.8, 49.1], [100.2, 49.1]); const short = seg([100, 49.1], [100, 50.9]); const stub = seg([100, 49.1], [100, 45]);
+  const plan = P.cleanupPlan(doc, { dangling: false, danglingVias: false });
+  const code = (id) => plan.items.filter((i) => i.ids.includes(id)).map((i) => i.code);
+  assert.deepEqual(code(z), ["null_segment"]); assert.deepEqual(code(d2), ["duplicate_track"]); assert.deepEqual(code(inner), ["contained_track"]);
+  assert.deepEqual(code(inPad), ["track_in_pad"]); assert.deepEqual(code(short), ["shorting_track"]);
+  assert.ok(!plan.remove.has(c1) && !plan.remove.has(c2), "a via at the joint keeps the collinear pair apart");
+  assert.ok(plan.remove.has(z) && plan.remove.has(d2) && plan.remove.has(inner) && !plan.remove.has(d1) && !plan.remove.has(big) && !plan.remove.has(stub));
+  // without the via the pair merges into one segment; the lone stub then dangles
+  K.applyChange(doc, P.removedChange(doc.items.get(v)), IU);
+  const plan2 = P.cleanupPlan(doc, { dangling: false, danglingVias: false }); const merged = plan2.replace.find((r) => r.item.id === c1);
+  assert.ok(merged && plan2.remove.has(c2)); assert.deepEqual([pt(merged.node, "start"), pt(merged.node, "end")], [[70, 50], [80, 50]]);
+  assert.ok(plan2.items.some((i) => i.code === "merge_collinear" && i.ids.includes(c1) && i.ids.includes(c2)));
+  const plan3 = P.cleanupPlan(doc, {});
+  assert.ok(plan3.remove.has(stub) && plan3.items.some((i) => i.code === "dangling_track" && i.ids[0] === stub));
+  assert.ok(plan3.remove.has(c1) && plan3.remove.has(d1), "the merged segment and the lone duplicate touch nothing and go with the dangling pass");
+  assert.equal(plan3.replace.length, 0, "a merged segment that is then removed is not also replaced");
+  const ch = P.cleanupChanges(doc, plan3); assert.ok(ch.every((c) => c.kind === "REMOVED" || c.kind === "MODIFIED")); for (const c of ch) assert.ok(K.applyChange(doc, c, IU));
+  assert.equal(P.cleanupPlan(doc, {}).items.length, 0, "a second pass finds nothing");
+  // width edits, netclass sizes, layer moves, breaking a track
+  const w = P.trackEditChanges(fixture(), ["s-1", "v-1"], { width: 0.5, viaSize: 1, viaDrill: 0.5, viaType: "through" }); assert.equal(K.kid(node(w[0]), "width")[1], 0.5); assert.deepEqual([K.kid(node(w[1]), "size")[1], K.kid(node(w[1]), "drill")[1]], [1, 0.5]);
+  const nc = P.trackEditChanges(fixture(), ["s-1", "v-1"], { netclass: true }, P.designSettings({ net_settings: { classes: [{ name: "Default", clearance: 0.2, track_width: 0.3, via_diameter: 0.7, via_drill: 0.35 }] } }));
+  assert.equal(K.kid(node(nc[0]), "width")[1], 0.3); assert.equal(K.kid(node(nc[1]), "size")[1], 0.7);
+  const bl = node(P.trackEditChanges(fixture(), ["v-1"], { viaType: "blind", viaLayers: ["F.Cu", "B.Cu"] })[0]); assert.equal(bl[1], "blind");
+  assert.equal(K.kid(node(P.trackLayerChanges(fixture(), ["s-1"], 1)[0]), "layer")[1], "B.Cu");
+  const br = P.breakTrackChanges(fixture(), [112, 50.05]); assert.deepEqual(kinds(br), ["MODIFIED", "ADDED"]); assert.deepEqual(pt(node(br[0]), "end"), [112, 50]); assert.deepEqual(pt(node(br[1]), "start"), [112, 50]); assert.notEqual(br[1].id, "s-1");
+  assert.deepEqual(P.breakTrackChanges(fixture(), [110, 50]), [], "not at an end");
+  const nl = P.netlist(fixture()); assert.deepEqual([...P.connectedCopperIds(nl, new Set(["s-1"]))].sort(), ["s-1", "s-2", "s-3", "v-1"], "unroute takes the whole run");
+});
+
+test("groups: KiCad's (group …) node, membership queries, ungroup and member edits; locks land where each writer puts them", () => {
+  const doc = fixture(); const g = P.groupChanges(doc, ["v-1", "s-1"], ""); assert.equal(g.length, 1); assert.equal(g[0].kind, "ADDED"); assert.equal(g[0].typeName, "PCB_GROUP");
+  const gn = K.kid(K.parse(g[0].sexpr), "group"); assert.deepEqual(gn, ["group", "", ["uuid", g[0].id], ["members", "s-1", "v-1"]], "members sorted, name first, then the uuid");
+  assert.equal(P.groupOf(doc, "s-1").id, g[0].id); assert.equal(P.groupOf(doc, "s-2"), null);
+  assert.deepEqual([...P.expandGroups(doc, ["s-1"])].sort(), [g[0].id, "s-1", "v-1"].sort()); assert.deepEqual([...P.expandGroups(doc, [g[0].id])].sort(), [g[0].id, "s-1", "v-1"].sort());
+  const add = P.groupMembersChanges(doc, doc.items.get(g[0].id), ["s-2"], []); assert.deepEqual(K.kid(node(add[0]), "members").slice(1), ["s-1", "s-2", "v-1"]);
+  assert.equal(P.groupMembersChanges(doc, doc.items.get(g[0].id), [], ["s-1", "v-1"])[0].kind, "REMOVED", "an emptied group goes");
+  const un = P.ungroupChanges(doc, ["v-1"]); assert.deepEqual(un.map((c) => [c.kind, c.id, c.typeName]), [["REMOVED", g[0].id, "PCB_GROUP"]]);
+  assert.deepEqual(P.groupChanges(doc, [g[0].id], ""), [], "a group of groups is refused");
+  const at = (n) => n.findIndex((c) => Array.isArray(c) && c[0] === "locked");
+  const seg = P.setLocked(clone(doc.items.get("s-1").node), true); assert.equal(at(seg), 4); assert.equal(seg[5][0], "layer"); assert.ok(P.isLocked(seg));
+  const fp = P.setLocked(clone(doc.items.get("fp-1").node), true); assert.equal(at(fp), 2); assert.equal(fp[3][0], "layer");
+  const gl = P.setLocked(clone(doc.items.get("g-1").node), true); assert.equal(gl[at(gl) - 1][0], "stroke"); assert.equal(gl[at(gl) + 1][0], "layer");
+  const tx = P.setLocked(P.textNode("x", 1, 1, "F.SilkS"), true); assert.equal(at(tx), 2); assert.equal(tx[3][0], "at");
+  const via = P.setLocked(clone(doc.items.get("v-1").node), true); assert.equal(via[at(via) + 1][0], "net");
+  assert.equal(at(P.setLocked(seg, false)), -1); assert.equal(P.lockChanges(doc, ["s-1"], false).length, 0, "already unlocked");
+  assert.equal(P.lockChanges(doc, ["s-1", "fp-1"], true).length, 2);
+});
+function clone(n) { return JSON.parse(JSON.stringify(n)); }
+
+test("conversions, selection helpers, statistics and the small edits", () => {
+  const doc = fixture(); const rect = P.addedChange(doc, P.rectNode([10, 10], [14, 12], "F.SilkS")).id;
+  const lines = P.convertChanges(doc, [rect], "lines"); assert.deepEqual(kinds(lines), ["ADDED", "ADDED", "ADDED", "ADDED", "REMOVED"]); assert.ok(lines.slice(0, 4).every((c) => node(c)[0] === "gr_line"));
+  const doc2 = fixture(); const r2 = P.addedChange(doc2, P.rectNode([10, 10], [14, 12], "F.SilkS")).id;
+  const poly = P.convertChanges(doc2, [r2], "poly"); assert.equal(node(poly[0])[0], "gr_poly"); assert.deepEqual(K.ptsOf(node(poly[0])), [[10, 10], [14, 10], [14, 12], [10, 12]]); assert.equal(poly[1].kind, "REMOVED");
+  const l = [P.lineNode([0, 0], [4, 0], "F.SilkS"), P.lineNode([4, 0], [2, 3], "F.SilkS"), P.lineNode([2, 3], [0, 0], "F.SilkS")].map((n) => P.addedChange(doc2, n).id);
+  const tri = P.convertChanges(doc2, l, "poly"); assert.equal(K.ptsOf(node(tri[0])).length, 3, "a closed chain of lines becomes one polygon");
+  const cu = P.addedChange(doc2, P.rectNode([20, 20], [30, 30], "F.Cu")).id; const zn = P.convertChanges(doc2, [cu], "zone", { net: { code: -1, name: "GND" } });
+  assert.equal(node(zn[0])[0], "zone"); assert.deepEqual(K.kid(node(zn[0]), "net"), ["net", "GND"]); assert.deepEqual(K.kid(node(zn[0]), "layer"), ["layer", "F.Cu"]); assert.equal(K.ptsOf(K.kid(node(zn[0]), "polygon")).length, 4); assert.equal(zn[0].netName, "GND");
+  const ko = P.convertChanges(doc2, [P.addedChange(doc2, P.rectNode([40, 40], [45, 45], "F.Cu")).id], "keepout"); assert.ok(K.kid(node(ko[0]), "keepout")); assert.deepEqual(K.kid(node(ko[0]), "layer"), ["layer", "F.Cu"]);
+  const cl = P.addedChange(doc2, P.lineNode([110, 50], [110, 55], "F.Cu")).id; const tr = P.convertChanges(doc2, [cl], "tracks"); assert.equal(node(tr[0])[0], "segment"); assert.deepEqual(K.kid(node(tr[0]), "net"), ["net", "GND"], "the copper it starts on gives the net"); assert.equal(K.kid(node(tr[0]), "width")[1], 0.2, "the copper line width becomes the track width");
+  assert.deepEqual([...P.idsOnLayer(fixture(), "B.Cu")].sort(), ["s-3", "v-1"]); assert.deepEqual([...P.idsOnLayer(fixture(), "F.SilkS")], ["fp-1"]);
+  const all = [...fixture().items.keys()]; assert.ok(!P.filterIds(fixture(), all, { footprints: false }).includes("fp-1")); assert.deepEqual(P.filterIds(fixture(), all, { tracks: false, vias: false, graphics: false }), ["fp-1"]);
+  const st = P.boardStatistics(fixture()); assert.equal(st.footprints.total, 1); assert.equal(st.pads.smd, 2); assert.equal(st.vias.through, 1); assert.equal(st.tracks.count, 5); tn(st.tracks.length, 21.242641 + Math.PI, 1e-4);
+  const st2 = P.boardStatistics(K.parseDoc(DRC_BOARD, "kicad_pcb")); assert.deepEqual([st2.width, st2.height, st2.area, st2.drills], [60, 50, 3000, 1]);
+  const t = P.addedChange(doc2, P.textNode("j", 1, 1, "B.SilkS")).id; assert.deepEqual(K.kid(K.kid(node(P.justifyChanges(doc2, [t], "right")[0]), "effects"), "justify"), ["justify", "right", "bottom", "mirror"]);
+  assert.deepEqual(K.kid(K.kid(node(P.justifyChanges(doc2, [t], "center")[0]), "effects"), "justify"), ["justify", "bottom", "mirror"]);
+  const z1 = P.addedChange(doc2, P.zoneNode(doc2, [[0, 0], [1, 0], [1, 1]], "F.Cu", { code: -1, name: "GND" })).id;
+  assert.deepEqual(K.kid(doc2.items.get(z1).node, "priority"), ["priority", 1], "the zone from the rectangle took 0, so the new one gets the next free priority");
+  assert.deepEqual(K.kid(node(P.zonePriorityChanges(doc2, [z1], "raise")[0]), "priority"), ["priority", 2]); assert.equal(K.kid(node(P.zonePriorityChanges(doc2, [z1], "bottom")[0]), "priority"), null); assert.equal(P.zonePriorityChanges(doc2, [zn[0].id], "lower").length, 0);
+  assert.deepEqual(K.kid(node(P.footprintAttrChanges(doc2, ["fp-1"], "dnp")[0]), "attr"), ["attr", "dnp"]);
+});
+
+test("pads: padAt hit-tests pads in board space; the pad dialog commits a MODIFIED footprint through props.setPad", () => {
+  const doc = fixture(); const hit = P.padAt(doc, 100, 49.1); assert.ok(hit && hit.item.id === "fp-1" && hit.index === 0 && hit.pad.number === "1");
+  assert.equal(P.padAt(doc, 100.4, 51.2).index, 1); assert.equal(P.padAt(doc, 100, 50), null, "between the pads"); assert.equal(P.padAt(doc, 100, 49.1, "B.Cu"), null);
+  const { ctx, log } = fullCtx(doc); let spec = null; pcb.setForm((s) => { spec = s; return true; });
+  assert.ok(pcb.padProperties(ctx, doc.items.get("fp-1"), 0)); assert.ok(/Pad Properties — R1 pad 1/.test(spec.title));
+  const f = Object.fromEntries(spec.fields.map((x) => [x.k, x.value])); assert.deepEqual([f.number, f.type, f.shape, f.w, f.h, f.rot, f.net, f.layers], ["1", "smd", "roundrect", 1, 1.2, 0, "GND", "F.Cu F.Mask F.Paste"]);
+  spec.apply({ number: "1", type: "smd", shape: "oval", w: 1.2, h: 1.6, rot: 0, drill: "", layers: "F.Cu F.Paste F.Mask", net: "/SIG", maskMargin: 0.05, rratio: NaN });
+  const c = log.commits.at(-1); assert.equal(c.label, "pad"); assert.deepEqual([c.changes[0].kind, c.changes[0].typeName, c.changes[0].padNets["1"]], ["MODIFIED", "FOOTPRINT", "/SIG"]);
+  const pad = K.kids(doc.items.get("fp-1").node, "pad")[0];
+  assert.deepEqual(pad.slice(0, 6), ["pad", "1", "smd", "oval", ["at", -0.9, 0, -90], ["size", 1.2, 1.6]]); assert.deepEqual(K.kid(pad, "layers").slice(1), ["F.Cu", "F.Paste", "F.Mask"]);
+  assert.deepEqual(K.kid(pad, "net"), ["net", "/SIG"]); assert.deepEqual(K.kid(pad, "solder_mask_margin"), ["solder_mask_margin", 0.05]); assert.equal(K.kid(pad, "roundrect_rratio"), null, "no corner ratio on an oval");
+  assert.equal(pad.indexOf(K.kid(pad, "solder_mask_margin")), pad.indexOf(K.kid(pad, "net")) + 1); assert.equal(pad[pad.length - 1][0], "uuid");
+  assert.equal(P.padsOf(doc.items.get("fp-1"))[0].shape, "oval"); assert.equal(doc.items.get("fp-1").geom.filter((g) => g.pad && g.layer === "F.Cu")[0].w, 1.2);
+  pcb.setForm(null);
+});
+
+test("actions: the map carries KiCad's ids and hotkeys; copy / paste / cut / duplicate / group / align / rotate / DRC / net inspector run through ctx", () => {
+  const keys = Object.fromEntries(Object.values(A).map((a) => [a.id, a.key]));
+  assert.deepEqual(["copy", "cut", "paste", "pasteSpecial", "duplicate", "selectConnection", "selectUnconnected", "grabUnconnected", "moveExactly", "positionRelative", "rotateSelection", "flipSelection", "toggleLock", "highlightNet", "clearHighlight", "swap", "pack", "trackWidthInc", "trackWidthDec", "viaSizeInc", "viaSizeDec", "deleteFull"].map((id) => keys[id]),
+    ["Ctrl+C", "Ctrl+X", "Ctrl+V", "Ctrl+Shift+V", "Ctrl+D", "U", "O", "Shift+O", "Shift+M", "Shift+P", "R", "F", "L", "`", "~", "Alt+S", "P", "W", "Shift+W", "'", "\\", "Shift+Delete"]);
+  for (const id of ["selectNet", "alignLeft", "alignRight", "alignTop", "alignBottom", "alignCenterX", "alignCenterY", "distributeH", "distributeV", "swapLayers", "changeTrackWidth", "cleanupTracks", "runDRC", "netInspector", "showRatsnest", "group", "ungroup", "mirrorH", "mirrorV", "convertToPoly", "convertToTracks", "boardStatistics", "unrouteSelected", "breakTrack", "createArray", "selectAllOnLayer", "lock", "unlock", "showNetInspector", "rotateCcw", "rotateCw", "flip", "moveExact", "localRatsnestTool"])
+    assert.ok(A[id] && A[id].label && typeof A[id].run === "function" && typeof A[id].key === "string", id);
+  assert.ok(Object.isFrozen(A));
+  const doc = fixture(); const { ctx, log } = fullCtx(doc);
+  // copy takes the anchor nearest the cursor as the reference; paste puts it under the cursor and selects the copies
+  ctx.selection = new Set(["s-1"]); ctx.cursor = [110, 50];
+  assert.equal(pcb.onKey("Copy", ev(), ctx), true); assert.ok(/^\(kicad_pcb \(version/.test(log.clip) && /\(segment \(start 0 0\) \(end 5 0\)/.test(log.clip));
+  ctx.cursor = [200, 100]; assert.equal(pcb.onKey("Paste", ev(), ctx), true);
+  let c = log.commits.at(-1); assert.equal(c.label, "paste"); assert.equal(c.changes[0].kind, "ADDED"); assert.deepEqual(log.selection, [c.changes[0].id]); assert.deepEqual(pt(doc.items.get(c.changes[0].id).node, "start"), [200, 100]);
+  // the paste hangs on the cursor until a click places it (dropped where it is here)
+  assert.deepEqual(P.state.move && P.state.move.placing, [c.changes[0].id]); P.state.move = null;
+  ctx.selection = new Set(["s-4"]); assert.equal(pcb.runAction("duplicate", ctx), true); c = log.commits.at(-1); assert.equal(c.label, "duplicate"); assert.notEqual(c.changes[0].id, "s-4"); assert.deepEqual(pt(doc.items.get(c.changes[0].id).node, "start"), [130, 50]);
+  assert.deepEqual(P.state.move && P.state.move.placing, [c.changes[0].id]); P.state.move = null;
+  ctx.selection = new Set(["a-1"]); assert.equal(pcb.onKey("Cut", ev(), ctx), true); c = log.commits.at(-1); assert.deepEqual(c.changes.map((x) => [x.kind, x.id]), [["REMOVED", "a-1"]]); assert.ok(/\(arc /.test(log.clip)); assert.deepEqual(log.selection, []);
+  ctx.selection = new Set(["s-1", "s-2"]); assert.equal(pcb.runAction("group", ctx), true); c = log.commits.at(-1); assert.equal(c.changes[0].typeName, "PCB_GROUP"); const gid = c.changes[0].id;
+  ctx.selection = new Set(["s-1"]); assert.equal(pcb.runAction("ungroup", ctx), true); assert.deepEqual(log.commits.at(-1).changes.map((x) => [x.kind, x.id]), [["REMOVED", gid]]);
+  // R turns a multi-selection about its centre, F flips it; Shift+M moves exactly through the (stubbed) dialog
+  ctx.selection = new Set(["s-1", "s-4"]); assert.equal(pcb.onKey("r", ev(), ctx), true); assert.equal(log.commits.at(-1).label, "rotate"); assert.equal(log.commits.at(-1).changes.length, 2); assert.deepEqual(pt(doc.items.get("s-1").node, "start"), [122.5, 62.5]);
+  assert.equal(pcb.onKey("Flip", ev(), ctx), true); assert.equal(K.kid(doc.items.get("s-4").node, "layer")[1], "B.Cu");
+  pcb.setForm((spec) => { assert.equal(spec.title, "Move Item"); spec.apply({ dx: 1, dy: 0, rotation: 0, about: "center" }); return true; });
+  ctx.selection = new Set(["s-3"]); assert.equal(pcb.onKey("M", ev({ shiftKey: true }), ctx), true); assert.equal(log.commits.at(-1).label, "Move Exactly"); assert.deepEqual(pt(doc.items.get("s-3").node, "start"), [119, 53]);
+  pcb.setForm((spec) => { spec.apply({ ref: "origin", px: 0, py: 0, dx: 5, dy: 6 }); return true; }); assert.equal(pcb.onKey("P", ev({ shiftKey: true }), ctx), true); assert.deepEqual(pt(doc.items.get("s-3").node, "start"), [5, 6]);
+  pcb.setForm((spec) => { spec.apply({ netclass: false, width: 0.4, viaSize: 0.9, viaDrill: 0.45, viaType: "through", l0: "F.Cu", l1: "B.Cu" }); return true; });
+  ctx.selection = new Set(["s-3", "v-1"]); assert.equal(pcb.runAction("changeTrackWidth", ctx), true); assert.equal(K.kid(doc.items.get("s-3").node, "width")[1], 0.4); assert.equal(K.kid(doc.items.get("v-1").node, "size")[1], 0.9);
+  // alignment needs two items; locks toggle; select net and connection grow the selection
+  const rects = [P.addedChange(doc, P.rectNode([0, 0], [2, 2], "F.SilkS")).id, P.addedChange(doc, P.rectNode([3, 5], [5, 7], "F.SilkS")).id]; ctx.selection = new Set(rects);
+  assert.equal(pcb.runAction("alignLeft", ctx), true); assert.equal(log.commits.at(-1).label, "align to left"); assert.deepEqual(pt(doc.items.get(rects[1]).node, "start"), [0, 5]);
+  ctx.selection = new Set(["s-4"]); assert.equal(pcb.onKey("l", ev(), ctx), true); assert.ok(P.isLocked(doc.items.get("s-4").node)); assert.equal(pcb.onKey("l", ev(), ctx), true); assert.ok(!P.isLocked(doc.items.get("s-4").node));
+  ctx.selection = new Set(["v-1"]); assert.equal(pcb.runAction("selectNet", ctx), true); assert.ok(log.selection.includes("s-4") && log.selection.includes("v-1") && !log.selection.includes("fp-1"), "the net's copper, not its footprints");
+  ctx.selection = new Set(["v-1"]); assert.equal(pcb.runAction("selectConnection", ctx), true); assert.deepEqual(log.selection.sort(), ["s-2", "v-1"], "s-1 was turned and s-3 moved away above");
+  ctx.selection = new Set(["s-2"]); assert.equal(pcb.runAction("highlightNet", ctx), true); assert.ok(log.highlight.has("fp-1#0") && !log.highlight.has("fp-1") && log.highlight.has("s-2") && log.highlight.has("v-1"), "the net's pad, not its whole footprint");
+  assert.equal(pcb.onKey("~", ev(), ctx), true); assert.equal(log.highlight, null);
+  // DRC keeps its markers on the module until the document changes; the net inspector is a dialog
+  let title = null; pcb.setForm((spec) => { title = spec.title; return true; });
+  assert.equal(pcb.runDRC(ctx), true); assert.equal(title, "DRC Control"); assert.ok(pcb.markers.length > 0 && pcb.markers.every((m) => m.code && m.text));
+  assert.equal(pcb.runAction("netInspector", ctx), true); assert.equal(title, "Net Inspector");
+  assert.equal(pcb.runAction("boardStatistics", ctx), true); assert.equal(title, "Board Statistics");
+  pcb.onDocChanged(ctx); assert.ok(pcb.markers.length > 0, "an edit keeps the markers"); pcb.onDocChanged(Object.assign({}, ctx, { doc: fixture() })); assert.equal(pcb.markers.length, 0, "a new document clears them");
+  // Shift+Delete removes the connected run; view-only refuses edits
+  pcb.onDocChanged(ctx); P.state.sel = new Set(["s-2"]); ctx.selection = new Set(); assert.equal(pcb.onKey("Delete", ev({ shiftKey: true }), ctx), true); assert.equal(log.commits.at(-1).label, "delete full track"); assert.ok(!doc.items.has("s-2") && !doc.items.has("v-1"));
+  ctx.viewOnly = true; ctx.selection = new Set(["s-4"]); const n = log.commits.length; assert.equal(pcb.runAction("duplicate", ctx), true); assert.equal(log.commits.length, n); assert.ok(log.toasts.at(-1).includes("View-only"));
+  ctx.viewOnly = false; pcb.setForm(null);
+  // the overlay draws the ratsnest and the markers without a DOM
+  P.state.showRatsnest = true; pcb.runDRC(ctx); const c2 = stubCtx(800, 600); pcb.drawOverlay(c2, VIEW, ctx); assert.ok(c2.calls.stroke > 0 && c2.calls.fill > 0, "ratsnest strokes, marker pins filled");
+});
+
+// The three things a board fragment cannot carry inside its s-expression, plus the one
+// thing the s-expression must carry and the web reader used to throw away.
+test("board changes: kicad_pcb wrapper, pad nets, group membership and a quoted group name", () => {
+  const doc = fixture();
+
+  // PCB_IO_KICAD_SEXPR::Parse (pcb_io_kicad_sexpr_parser.cpp) has cases only for kicad_pcb
+  // and footprint at top level; a bare (segment …) throws "Unknown token" and the op is dropped.
+  const seg = K.replaceChange(doc, doc.items.get("s-1"));
+  assert.ok(seg.sexpr.startsWith("(kicad_pcb (version 20260728) (generator "), seg.sexpr.slice(0, 60));
+  assert.ok(K.parseAll(seg.sexpr).length === 1 && K.kid(K.parse(seg.sexpr), "segment"), "one document holding the item");
+  assert.equal(seg.netName, "GND", "the desktop re-resolves the net by name");
+
+  // A footprint parses bare, but its pads come back with no net at all (the parse board is
+  // temporary), so SwapItemData would orphan every pad without this map.
+  const fp = K.replaceChange(doc, doc.items.get("fp-1"));
+  assert.deepEqual(fp.padNets, { 1: "GND", 2: "/SIG" });
+
+  // A board that names nets only in its table: the number in the fragment means nothing on
+  // the receiver, so the name has to be looked up here.
+  const coded = K.parseDoc(CODE_STYLE, "kicad_pcb");
+  assert.equal(K.replaceChange(coded, coded.items.get("cs-1")).netName, "GND");
+
+  // parseItemSexpr strips a parsed group's members; membership is rebuilt from this list.
+  const withGroup = K.parseDoc(FIXTURE.replace(/\n\)$/, '\n  (group "PowerStage" (uuid "grp-1") (members "s-1" "s-2"))\n)'), "kicad_pcb");
+  const g = K.replaceChange(withGroup, withGroup.items.get("grp-1"));
+  assert.deepEqual(g.groupMembers, ["s-1", "s-2"]);
+  // parseGROUP accepts only T_STRING (or locked) for the name: an identifier-shaped name
+  // must not come back bare, or the whole fragment is rejected.
+  assert.ok(g.sexpr.includes('(group "PowerStage"'), g.sexpr);
+  // the tools layer builds group edits through its own change builder; it must carry the list too
+  assert.deepEqual(P.groupMembersChanges(withGroup, withGroup.items.get("grp-1"), ["s-3"], [])[0].groupMembers, ["s-1", "s-2", "s-3"]);
+});
+
+// The desktop ghosts its router legs to us live; the reverse showed a bare cursor until the
+// track was committed, so the two directions looked like different products.
+test("ghostSegs: the in-flight route leg is offered to peers as mm segments", () => {
+  const doc = fixture(); const { ctx } = fakeCtx(doc);
+  pcb.onDocChanged(ctx);
+  assert.deepEqual(pcb.ghostSegs(ctx), [], "nothing in flight");
+  assert.equal(pcb.onKey("x", ev(), ctx), true);
+  assert.equal(pcb.onPointerDown(ev(), [100.2, 49.3], ctx), true);   // snaps onto pad 1
+  pcb.onPointerMove(ev(), [110, 52], ctx);
+  const segs = pcb.ghostSegs(ctx);
+  assert.ok(segs.length >= 1 && segs.length <= 2, JSON.stringify(segs));
+  for (const s of segs) { assert.equal(s.length, 5); assert.equal(s[4], P.state.route.width); }
+  assert.deepEqual(segs[0].slice(0, 2), P.state.route.last);
+  assert.deepEqual(segs[segs.length - 1].slice(2, 4), P.state.route.target);
+  pcb.onActivate("select", ctx);   // leaving the tool drops the unfixed leg
+  assert.equal(P.state.route, null);
+  assert.deepEqual(pcb.ghostSegs(ctx), [], "leaving the tool clears it, so peers stop drawing the stale leg");
+});
+
+// ---- the interactive router: KiCad's default Walk around mode, net highlight, leading ratsnest line, posture
+const ROUTER_BOARD = `(kicad_pcb (version 20260728) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (44 "Edge.Cuts" user))
+  (footprint "T:A" (layer "F.Cu") (uuid "fa") (at 10 10)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "A") (uuid "pa1")))
+  (footprint "T:B" (layer "F.Cu") (uuid "fb") (at 30 10)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "A") (uuid "pb1")))
+  (footprint "T:C" (layer "F.Cu") (uuid "fc") (at 20 10)
+    (pad "1" smd rect (at 0 0) (size 2 2) (layers "F.Cu") (net "B") (uuid "pc1")))
+  (footprint "T:H" (layer "F.Cu") (uuid "fh") (at 80 10)
+    (pad "" np_thru_hole circle (at 0 0) (size 2 2) (drill 2) (layers "*.Cu" "*.Mask") (uuid "ph1")))
+  (segment (start 65 10.35) (end 75 10.35) (width 0.2) (layer "F.Cu") (net "B") (uuid "sb1"))
+)`;
+const routerDoc = () => K.parseDoc(ROUTER_BOARD, "kicad_pcb");
+/** The smallest copper gap between the route's new segments and the other net's copper. */
+function minGapTo(doc, ids, netKey) {
+  const conds = P.conductors(doc); let gap = Infinity;
+  for (const c of conds) { if (!ids.has(c.id)) continue; for (const o of conds) { if (o.net === netKey || ids.has(o.id) || o.kind === "zone") continue; if (![...c.layers].some((l) => o.layers.has(l))) continue; gap = Math.min(gap, P.shapeGap(c.shape, o.shape)); } }
+  return gap;
+}
+function routerCtx(doc) { const f = fakeCtx(doc); f.log.highlight = []; f.ctx.setHighlight = (ids) => f.log.highlight.push(ids ? new Set(ids) : null); return f; }
+
+test("router: the head walks around another net's pad at clearance and the route ends on the same-net pad", () => {
+  const doc = routerDoc(); const { ctx, log } = routerCtx(doc); pcb.onDocChanged(ctx);
+  pcb.onKey("x", ev(), ctx); pcb.onPointerDown(ev(), [10, 10], ctx);
+  const rt = P.state.route; assert.ok(rt); assert.equal(rt.netKey, "A"); assert.equal(rt.diagFirst, false, "straight first (start_diagonal false)");
+  // the routed net is highlighted: its pads ("footprint#pad"), not the other net's
+  const hl = log.highlight.at(-1); assert.ok(hl.has("fa#0") && hl.has("fb#0") && !hl.has("fc#0") && !hl.has("fa"));
+  pcb.onPointerMove(ev(), [30, 10], ctx);
+  assert.equal(rt.reached, true); assert.deepEqual(rt.target, [30, 10]);
+  assert.ok(rt.head.length > 2, "a straight run through pad C would short: the head turns around it " + JSON.stringify(rt.head));
+  for (let i = 0; i + 1 < rt.head.length; i++) { const d = P.dir8(rt.head[i], rt.head[i + 1]); assert.ok(d >= 0); }   // every segment on a 45° direction
+  pcb.onPointerDown(ev(), [30, 10], ctx);
+  assert.equal(P.state.route, null, "landing on the same net's pad finishes the route");
+  const ids = new Set(log.commits[0].changes.map((c) => c.id));
+  assert.ok(minGapTo(doc, ids, "A") >= 0.2 - 1e-4, "keeps the netclass clearance from pad C: " + minGapTo(doc, ids, "A"));
+  assert.equal(log.highlight.at(-1), null, "the highlight goes when routing ends");
+});
+
+test("router: clicking on another net's pad never ends or shorts the route; a route without a net snaps to nothing", () => {
+  const doc = routerDoc(); const { ctx, log } = routerCtx(doc); pcb.onDocChanged(ctx);
+  pcb.onKey("x", ev(), ctx); pcb.onPointerDown(ev(), [10, 10], ctx);
+  pcb.onPointerMove(ev(), [20, 10], ctx);   // the centre of pad C (net B)
+  const rt = P.state.route; assert.equal(rt.reached, false); assert.equal(P.state.hover.snap, null, "other nets' pads are no end items");
+  assert.ok(rt.target[0] < 19, "the head stops short of pad C's clearance: " + rt.target);
+  pcb.onPointerDown(ev(), [20, 10], ctx);
+  assert.ok(P.state.route, "the route carries on");
+  pcb.onKey("End", ev(), ctx);
+  const ids = new Set(log.commits[0].changes.map((c) => c.id)); assert.ok(minGapTo(doc, ids, "A") >= 0.2 - 1e-4);
+  pcb.cancel();
+  // started in empty space: no net, nothing to snap to, every netted item is an obstacle
+  pcb.onActivate("route", ctx); pcb.onPointerDown(ev(), [20, 20], ctx);
+  const orphan = P.state.route; assert.equal(orphan.netKey, "");
+  pcb.onPointerMove(ev(), [30, 10], ctx); assert.equal(P.state.hover.snap, null);
+  assert.equal(orphan.reached, false, "the orphan route cannot land on net A's pad");
+  pcb.cancel();
+});
+
+test("router: start point checks — DRC violation, non-plated hole", () => {
+  const doc = routerDoc(); const { ctx, log } = routerCtx(doc); pcb.onDocChanged(ctx);
+  pcb.onKey("x", ev(), ctx);
+  pcb.onPointerDown(ev(), [70, 10], ctx);   // 0.15 mm from net B's track: inside the 0.2 mm clearance
+  assert.equal(P.state.route, null); assert.equal(log.toasts.at(-1), "The routing start point violates DRC.");
+  assert.deepEqual(P.state.violations.obs.map((o) => o.id), ["sb1"], "the obstacle in violation is shown");
+  pcb.onPointerDown(ev(), [80, 10], ctx);
+  assert.equal(P.state.route, null); assert.equal(log.toasts.at(-1), "Cannot start routing from a non-plated hole.");
+  assert.equal(log.commits.length, 0);
+});
+
+test("router: the leading ratsnest line runs from the head to the nearest unconnected anchor of the net", () => {
+  const doc = routerDoc(); const { ctx } = routerCtx(doc); pcb.onDocChanged(ctx);
+  pcb.onKey("x", ev(), ctx); pcb.onPointerDown(ev(), [10, 10], ctx);
+  pcb.onPointerMove(ev(), [12, 14], ctx);
+  assert.deepEqual(P.state.route.ratline, [[12, 14], [30, 10]]);
+  pcb.cancel();
+  const unrouted = routerDoc(); const c2 = routerCtx(unrouted).ctx; pcb.onDocChanged(c2);
+  pcb.onActivate("route", c2); pcb.onPointerDown(ev(), [20, 20], c2); pcb.onPointerMove(ev(), [22, 22], c2);
+  assert.equal(P.state.route.ratline, null, "no ratsnest for a route without a net"); pcb.cancel();
+});
+
+test("router: the mouse trail picks the posture, / forces the other one until the next fix", () => {
+  const t1 = P.newTracer(0.2, -1); for (const p of [[0, 0], [2, 2], [5, 5], [10, 5], [15, 5]]) P.trailAdd(t1, p);
+  assert.equal(P.dir8([0, 0], [1, 1]), 1); assert.equal(P.tracerPosture(t1, [15, 5]) % 2, 1, "a trail that went diagonal first");
+  const t2 = P.newTracer(0.2, -1); for (const p of [[0, 0], [5, 0], [10, 0], [15, 5]]) P.trailAdd(t2, p);
+  assert.equal(P.tracerPosture(t2, [15, 5]) % 2, 0, "a trail that went straight first");
+  const t3 = P.newTracer(0.2, 0); P.trailAdd(t3, [0, 0]); assert.equal(P.tracerPosture(t3, [10, 3]), 0, "after a fix the next leg carries on the last direction");
+  P.tracerFlip(t3, 0); assert.equal(P.tracerPosture(t3, [10, 3]) % 2, 1);
+  assert.equal(P.saturated("#C83434"), "rgb(200, 0, 0)");
+});
+
+test("router: walkaround keeps every obstacle's clearance and stops at the nearest reachable point", () => {
+  const doc = routerDoc(); const s = P.designSettings(null);
+  const O = P.routeObstacles(doc, s, "A", "F.Cu", null);
+  assert.ok(O.list.some((o) => o.id === "fc") && !O.list.some((o) => o.id === "fa"), "other nets are obstacles, the routed net is not");
+  assert.ok(O.list.some((o) => o.kind === "hole"), "a non-plated hole is an obstacle");
+  const res = P.walkHead(O, [10, 10], [30, 10], 0.1, false, -1);
+  assert.equal(res.reached, true); assert.ok(P.pathClear(O, res.pts, 0.1));
+  const blocked = P.walkHead(O, [10, 10], [20, 10], 0.1, false, -1);
+  assert.equal(blocked.reached, false); assert.ok(P.pathClear(O, blocked.pts, 0.1));
+  const end = blocked.pts.at(-1); assert.ok(Math.hypot(end[0] - 20, end[1] - 10) < 1.4 + 0.1, "near pad C's clearance edge: " + end);
+});
+
+test("router: V attaches a via that follows the head; a click cannot place it inside another net's clearance", () => {
+  const doc = routerDoc(); const { ctx, log } = routerCtx(doc); pcb.onDocChanged(ctx);
+  pcb.onKey("x", ev(), ctx); pcb.onPointerDown(ev(), [10, 10], ctx);
+  pcb.onPointerMove(ev(), [70, 10.75], ctx);   // 0.4 mm from net B's track centre: room for a 0.2 mm track, not for a 0.6 mm via
+  assert.equal(P.state.route.reached, true);
+  pcb.onKey("v", ev(), ctx);
+  assert.ok(P.state.route.placingVia); assert.deepEqual(P.state.route.viaBad.map((o) => o.id), ["sb1"], "the via's collision is marked");
+  pcb.onPointerDown(ev(), [70, 10.75], ctx);
+  assert.equal(P.state.route.stages.length, 0, "no via, no segments"); assert.equal(P.state.route.layer, "F.Cu");
+  pcb.onPointerMove(ev(), [70, 12], ctx); assert.equal(P.state.route.viaBad, null);
+  pcb.onPointerDown(ev(), [70, 12], ctx);
+  assert.equal(P.state.route.stages.length, 1); assert.equal(P.state.route.layer, "B.Cu");
+  pcb.onKey("End", ev(), ctx);
+  assert.equal(log.commits.length, 1); assert.ok(log.commits[0].changes.some((c) => c.typeName === "PCB_VIA"));
+  pcb.cancel();
+});
+
+test("message panel: the board summary, a track, a via, a pad and a footprint as pcbnew's GetMsgPanelInfo", () => {
+  const doc = fixture(); const s = P.designSettings(null);
+  const cols = (ids, opts) => P.msgPanelInfo(doc, ids, Object.assign({ settings: s }, opts));
+  const val = (list, title) => { const c = list.find((x) => x.title === title); return c ? c.value : undefined; };
+  // BOARD::GetMsgPanelInfo: Pads / Vias / Track Segments / Nets / Unrouted, also for a multi-selection
+  const board = cols([]);
+  assert.deepEqual(board.map((c) => c.title), ["Pads", "Vias", "Track Segments", "Nets", "Unrouted"]);
+  assert.equal(val(board, "Pads"), "2"); assert.equal(val(board, "Vias"), "1"); assert.equal(val(board, "Track Segments"), "5"); assert.equal(val(board, "Nets"), "2");
+  assert.equal(val(board, "Unrouted"), String(P.ratsnest(doc).length));
+  assert.deepEqual(cols(["s-1", "s-2"]).map((c) => c.title), board.map((c) => c.title));
+  // PCB_TRACK: Type, Net, Resolved Netclass, Layer, Width, Segment Length, Routed Length, Copper Area, Min Clearance
+  const tr = cols(["s-2"]);
+  assert.deepEqual(tr.slice(0, 7).map((c) => c.title), ["Type", "Net", "Resolved Netclass", "Layer", "Width", "Segment Length", "Routed Length"]);
+  assert.equal(val(tr, "Type"), "Track"); assert.equal(val(tr, "Net"), "GND"); assert.equal(val(tr, "Resolved Netclass"), "Default");
+  assert.equal(val(tr, "Width"), "0.2500 mm"); assert.equal(val(tr, "Segment Length"), (3 * Math.SQRT2).toFixed(4) + " mm");
+  assert.equal(val(tr, "Routed Length"), (5 + 3 * Math.SQRT2 + 7).toFixed(4) + " mm", "the run through the via");
+  const clr = tr.find((c) => /^Min Clearance: /.test(c.title)); assert.equal(clr.title, "Min Clearance: 0.2000 mm"); assert.equal(clr.value, "(from netclass 'Default')");
+  assert.equal(val(cols(["s-2"], { units: "mil" }), "Width"), "9.84 mils");
+  // PCB_VIA
+  const v = cols(["v-1"]); assert.equal(val(v, "Type"), "Through Via"); assert.equal(val(v, "Layer"), "F.Cu - B.Cu"); assert.equal(val(v, "Diameter"), "0.8000 mm"); assert.equal(val(v, "Hole"), "0.4000 mm");
+  // PAD (a pad picked on its own: "footprintId#padIndex")
+  const pd = cols(["fp-1#1"]); assert.equal(val(pd, "Footprint"), "R1"); assert.equal(val(pd, "Pad"), "2"); assert.equal(val(pd, "Net"), "/SIG"); assert.equal(val(pd, "Layer"), "F.Cu", "LayerMaskDescribe: the one copper layer");
+  assert.equal(val(pd, "Rounded rectangle"), "SMD"); assert.equal(val(pd, "Width"), "1.0000 mm"); assert.equal(val(pd, "Height"), "1.2000 mm");
+  // FOOTPRINT: reference over value, side, rotation
+  const fp = cols(["fp-1"]); assert.deepEqual(fp[0], { title: "R1", value: "10k" }); assert.equal(val(fp, "Board Side"), "Front");
+  // the router's panel while a track is routed
+  const rt = cols([], { route: { net: { name: "GND" }, width: 0.25, connected: null } });
+  assert.deepEqual(rt.slice(0, 3), [{ title: "Routing Track: GND", value: "Resolved Netclass: Default" }, { title: "Corner Style", value: "45-degree" }, { title: "Mode", value: "Walk around" }]);
+  assert.ok(rt.some((c) => c.title === "Track Width: 0.2500 mm"));
+  // layers by the board's own names (BOARD::GetLayerName)
+  const named = K.parseDoc(FIXTURE.replace('(0 "F.Cu" signal)', '(0 "F.Cu" signal "top_layer")'), "kicad_pcb");
+  assert.equal(val(P.msgPanelInfo(named, ["s-1"], { settings: s }), "Layer"), "top_layer"); assert.equal(P.boardLayerName(named, "B.Cu"), "B.Cu");
+});
+
+test("net highlight names the net's pads one by one: footprintId#padIndex", () => {
+  const doc = fixture(); const ids = P.netHighlightIds(doc, "GND");
+  assert.ok(ids.has("fp-1#0") && !ids.has("fp-1#1") && !ids.has("fp-1"), "pad 1 is GND, pad 2 is /SIG");
+  for (const id of ["s-1", "s-2", "s-3", "s-4", "a-1", "v-1"]) assert.ok(ids.has(id));
+});
+
+test("message panel: a highlighted net with nothing selected shows NETINFO_ITEM's columns", () => {
+  const doc = fixture(); const cols = P.msgPanelInfo(doc, [], { settings: P.designSettings(null), net: "GND" });
+  assert.deepEqual(cols.slice(0, 4).map((c) => c.title), ["Net Name", "Net Code", "Pads", "Vias"]);
+  assert.equal(cols[0].value, "GND"); assert.equal(cols[2].value, "1"); assert.equal(cols[3].value, "1");
+  assert.equal(cols.find((c) => c.title === "On Board").value, (5 + 3 * Math.SQRT2 + 7).toFixed(4) + " mm");
+  assert.equal(P.msgPanelInfo(doc, ["s-1"], { net: "GND" })[0].value, "Track", "a selection wins");
+});
+
+test("dynamic ratsnest: one line per net from the moving pads to the nearest stationary anchor (ComputeLocalRatsnest)", () => {
+  const doc = fixture();
+  // the footprint at its place: its GND pad sits away from s-1's start, so a line runs from the pad to the nearest GND anchor
+  const lines = P.dynamicRatsnest(doc, new Set(["fp-1"]));
+  assert.equal(lines.length, 1, "GND only: /SIG has no stationary anchor");
+  const pad = P.padsOf(doc.items.get("fp-1")).find((p) => p.net.name === "GND");
+  assert.deepEqual(lines[0].a, [pad.x, pad.y]); assert.deepEqual(lines[0].b, [110, 50], "the nearest GND anchor is s-1's start");
+  assert.equal(lines[0].net, "GND");
+  // moving every GND item: nothing left to connect to
+  assert.equal(P.dynamicRatsnest(doc, new Set(["fp-1", "s-1", "s-2", "s-3", "s-4", "a-1", "v-1"])).length, 0);
+  assert.equal(P.dynamicRatsnest(doc, new Set()).length, 0);
+});
+
+test("selection modifiers as SELECTION_TOOL::setModifiersState: Shift adds, Ctrl toggles, Ctrl+Shift removes", () => {
+  assert.equal(P.selMode(ev()), null); assert.equal(P.selMode(ev({ shiftKey: true })), "add");
+  assert.equal(P.selMode(ev({ ctrlKey: true })), "toggle"); assert.equal(P.selMode(ev({ metaKey: true })), null, "MD_CTRL is Control off macOS: the Super key toggles nothing");
+  assert.equal(P.selMode(ev({ ctrlKey: true, shiftKey: true })), "remove");
+  const doc = fixture(); const { ctx } = fakeCtx(doc); pcb.onDocChanged(ctx); P.state.sel.clear();
+  pcb.onSelectDown(ev(), [112, 50], ctx); assert.deepEqual([...P.state.sel], ["s-1"]);
+  pcb.onSelectDown(ev({ ctrlKey: true }), [132, 50], ctx); assert.deepEqual([...P.state.sel].sort(), ["s-1", "s-4"], "Ctrl+click adds an unselected item");
+  pcb.onSelectDown(ev({ ctrlKey: true }), [112, 50], ctx); assert.deepEqual([...P.state.sel], ["s-4"], "Ctrl+click on a selected item takes it out");
+  pcb.onSelectDown(ev({ shiftKey: true }), [132, 50], ctx); assert.deepEqual([...P.state.sel], ["s-4"], "Shift+click only adds");
+  pcb.onSelectDown(ev({ shiftKey: true }), [112, 50], ctx); assert.deepEqual([...P.state.sel].sort(), ["s-1", "s-4"]);
+  pcb.onSelectDown(ev({ ctrlKey: true, shiftKey: true }), [132, 50], ctx); assert.deepEqual([...P.state.sel], ["s-1"], "Ctrl+Shift+click removes");
+  pcb.onSelectDown(ev({ ctrlKey: true, shiftKey: true }), [132, 50], ctx); assert.deepEqual([...P.state.sel], ["s-1"], "and never adds");
+});
+
+test("item descriptions as pcbnew's GetItemDescription (Clarify Selection rows)", () => {
+  const doc = fixture();
+  assert.equal(P.itemDescription(doc, "s-1", "mm"), "Track [GND] on F.Cu, length 5.0000 mm");
+  assert.equal(P.itemDescription(doc, "v-1", "mm"), "Via [GND] on F.Cu - B.Cu");
+  assert.equal(P.itemDescription(doc, "fp-1", "mm"), "Footprint R1");
+  assert.equal(P.itemDescription(doc, "fp-1#1", "mm"), "Pad 2 [/SIG] of R1 on F.Cu");
+  assert.equal(P.itemDescription(doc, "g-1", "mm"), "Segment on Edge.Cuts");
+  assert.ok(/^Track \(arc\) \[GND\] on F\.Cu, length /.test(P.itemDescription(doc, "a-1", "mm")));
+  const named = K.parseDoc(FIXTURE.replace('(2 "B.Cu" signal)', '(2 "B.Cu" signal "bottom_layer")'), "kicad_pcb");
+  assert.equal(P.itemDescription(named, "v-1", "mm"), "Via [GND] on F.Cu - bottom_layer", "the board's layer names");
+});
+
+const PE_FIXTURE = FIXTURE.replace(/\)\s*$/, `
+  (gr_rect (start 10 10) (end 20 16) (stroke (width 0.1) (type default)) (fill none) (layer "F.SilkS") (uuid "r-1"))
+  (gr_circle (center 30 30) (end 32 30) (stroke (width 0.1) (type default)) (fill none) (layer "F.SilkS") (uuid "c-1"))
+  (gr_arc (start 40 40) (mid 41 41) (end 42 40) (stroke (width 0.1) (type default)) (layer "F.SilkS") (uuid "ar-1"))
+  (gr_poly (pts (xy 0 0) (xy 4 0) (xy 4 4) (xy 0 4)) (stroke (width 0.1) (type default)) (fill none) (layer "F.SilkS") (uuid "pl-1"))
+  (zone (net 0) (net_name "") (layer "F.Cu") (uuid "z-1") (hatch edge 0.5) (connect_pads (clearance 0.5)) (min_thickness 0.25) (fill (thermal_gap 0.5) (thermal_bridge_width 0.5))
+    (polygon (pts (xy 50 50) (xy 60 50) (xy 60 60) (xy 50 60))))
+)`);
+
+test("point editor: KiCad's edit points per shape, and dragging one reshapes only that coordinate", () => {
+  const doc = K.parseDoc(PE_FIXTURE, "kicad_pcb"); const keys = (id) => P.editPoints(doc.items.get(id)).map((h) => h.key);
+  assert.deepEqual(keys("g-1"), ["start", "end"]);
+  assert.deepEqual(keys("r-1"), ["r0", "r1", "r2", "r3", "e0", "e1", "e2", "e3"], "rectangle: corners, then edge midpoints");
+  assert.deepEqual(keys("c-1"), ["center", "end"]);
+  assert.deepEqual(keys("ar-1"), ["start", "mid", "end", "center"], "an arc: ends, mid and the centre handle");
+  assert.deepEqual(P.editPoints(doc.items.get("ar-1")).at(-1).p, [41, 40]);
+  assert.deepEqual(keys("z-1"), ["c0", "c1", "c2", "c3", "m0", "m1", "m2", "m3"]);
+  assert.ok(P.editPoints(doc.items.get("z-1")).filter((h) => h.key[0] === "m").every((h) => h.circle), "midpoints are drawn as circles");
+  assert.deepEqual(P.editPoints(doc.items.get("s-1")), [], "tracks have no point editor (the router drags them)");
+  const pt = (n, k) => { const x = K.kid(n, k); return [K.num(x[1]), K.num(x[2])]; };
+  const rect = doc.items.get("r-1").node;
+  let n = P.editPointNode(rect, "gr_rect", "r2", [25, 18]); assert.deepEqual([pt(n, "start"), pt(n, "end")], [[10, 10], [25, 18]]);
+  n = P.editPointNode(rect, "gr_rect", "e0", [99, 7]); assert.deepEqual([pt(n, "start"), pt(n, "end")], [[10, 7], [20, 16]], "the top edge moves only Y");
+  n = P.editPointNode(doc.items.get("c-1").node, "gr_circle", "center", [31, 31]); assert.deepEqual([pt(n, "center"), pt(n, "end")], [[31, 31], [33, 31]], "the centre carries the radius along");
+  n = P.editPointNode(doc.items.get("c-1").node, "gr_circle", "end", [30, 35]); assert.deepEqual(pt(n, "center"), [30, 30]);
+  n = P.editPointNode(doc.items.get("z-1").node, "zone", "m1", [62, 55]);
+  assert.deepEqual(K.kids(K.kid(K.kid(n, "polygon"), "pts"), "xy").map((x) => [K.num(x[1]), K.num(x[2])]), [[50, 50], [62, 50], [62, 60], [50, 60]], "a midpoint drags the whole edge");
+  assert.equal(K.serialize(n).replace(/\(pts[^]*$/, ""), K.serialize(doc.items.get("z-1").node).replace(/\(pts[^]*$/, ""), "everything but the outline is untouched");
+  assert.ok(roundTrips(n));
+});
+
+test("point editor: an arc's handles in the three arc editing modes (EDA_ARC_POINT_EDIT_BEHAVIOR) and Cycle Arc Editing Mode", () => {
+  const r2 = 10 * Math.SQRT1_2;
+  const arc = ["gr_arc", ["start", 10, 0], ["mid", r2, r2], ["end", 0, 10], ["stroke", ["width", 0.1], ["type", "default"]], ["layer", "F.SilkS"], ["uuid", "a"]];
+  const geo = (n) => ["start", "mid", "end"].map((k) => { const x = K.kid(n, k); return [K.num(x[1]), K.num(x[2])]; });
+  const close = (a, b) => a.every((p, i) => Math.abs(p[0] - b[i][0]) < 1e-5 && Math.abs(p[1] - b[i][1]) < 1e-5);
+  const edit = (mode, key, p, raw) => { P.setArcEditMode(mode); return geo(P.editPointNode(arc, "gr_arc", key, p, raw || p)); };
+  // keep centre, adjust radius: an end sets the radius and the other end follows; the mid sets it too; the centre moves the arc
+  assert.ok(close(edit(0, "start", [20, 0]), [[20, 0], [20 * Math.SQRT1_2, 20 * Math.SQRT1_2], [0, 20]]));
+  assert.ok(close(edit(0, "mid", [9, 9], [3, 4]), [[5, 0], [5 * Math.SQRT1_2, 5 * Math.SQRT1_2], [0, 5]]), "the mid follows the cursor itself, not the grid");
+  assert.ok(close(edit(0, "center", [1, 2]), [[11, 2], [r2 + 1, r2 + 2], [1, 12]]));
+  // keep centre and radius: an end slides round the circle
+  assert.ok(close(edit(2, "end", [-30, 0]), [[10, 0], [0, 10], [-10, 0]]));
+  assert.ok(close(edit(2, "center", [1, 2]), [[11, 2], [r2 + 1, r2 + 2], [1, 12]]));
+  // keep endpoints: the centre slides along the chord's bisector; the mid along its ray; an end keeps the other end's tangent
+  let g = edit(1, "center", [3, 1]); assert.ok(close([g[0], g[2]], [[10, 0], [0, 10]])); const c = K.arcFrom3(...g); assert.ok(Math.abs(c.x - 2) < 1e-6 && Math.abs(c.y - 2) < 1e-6);
+  g = edit(1, "mid", [20, 20], [20, 20]); assert.ok(close([g[0], g[2]], [[10, 0], [0, 10]])); assert.ok(Math.abs(g[1][0] - 20) < 1e-6 && Math.abs(g[1][1] - 20) < 1e-6);
+  g = edit(1, "end", [0, 12]); const t = K.arcFrom3(...g);
+  assert.ok(close([g[0], g[2]], [[10, 0], [0, 12]]) && Math.abs(t.x + 2.2) < 1e-4 && Math.abs(t.y) < 1e-4, "the centre stays on the start's radius: " + JSON.stringify(t));
+  // an arc saved the other way round keeps the handle under the cursor
+  P.setArcEditMode(0);
+  const rev = ["gr_arc", ["start", 0, 10], ["mid", r2, r2], ["end", 10, 0], ["layer", "F.SilkS"]];
+  assert.ok(close(geo(P.editPointNode(rev, "gr_arc", "end", [20, 0], [20, 0])), [[20, 0], [20 * Math.SQRT1_2, 20 * Math.SQRT1_2], [0, 20]]));
+  // Cycle Arc Editing Mode: keep centre -> keep centre and radius -> keep endpoints -> keep centre; the modes are check items
+  const doc = K.parseDoc(PE_FIXTURE, "kicad_pcb"); const { ctx } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  const seq = []; for (let i = 0; i < 3; i++) { pcb.runAction("cycleArcEditMode", ctx); seq.push(P.arcEditMode()); } assert.deepEqual(seq, [2, 1, 0]);
+  assert.equal(pcb.actions.cycleArcEditMode.key, "Ctrl+Space");
+  pcb.runAction("pointEditorArcKeepEndpoint", ctx); assert.equal(P.arcEditMode(), 1); assert.equal(pcb.routerChecks()["ACTIONS::pointEditorArcKeepEndpoint"], true);
+  P.setArcEditMode(0);
+});
+
+test("point editor: Create Corner and Remove Corner (PCB_POINT_EDITOR::addCorner / removeCorner)", () => {
+  const doc = K.parseDoc(PE_FIXTURE, "kicad_pcb"); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx); P.state.sel.clear();
+  const zpts = () => K.kids(K.kid(K.kid(doc.items.get("z-1").node, "polygon"), "pts"), "xy").map((x) => [K.num(x[1]), K.num(x[2])]);
+  ctx.selection = new Set(["z-1"]); ctx.cursor = [55, 49.9];
+  assert.equal(P.canAddCorner(doc.items.get("z-1")), true); assert.equal(P.canAddCorner(doc.items.get("c-1")), false);
+  assert.equal(pcb.runAction("pointEditorAddCorner", ctx), true); assert.equal(log.commits.at(-1).label, "add corner");
+  assert.deepEqual(zpts(), [[50, 50], [55, 50], [60, 50], [60, 60], [50, 60]], "the corner lands on the nearest edge, after its first corner");
+  assert.equal(P.canRemoveCorner(doc, "z-1", [55, 50]), true); assert.equal(P.canRemoveCorner(doc, "z-1", [57, 55]), false, "nothing under the cursor");
+  ctx.cursor = [60, 60]; assert.equal(pcb.runAction("pointEditorRemoveCorner", ctx), true);
+  assert.deepEqual(zpts(), [[50, 50], [55, 50], [60, 50], [50, 60]]);
+  ctx.cursor = [50, 60]; pcb.runAction("pointEditorRemoveCorner", ctx); assert.deepEqual(zpts(), [[50, 50], [55, 50], [60, 50]]);
+  const before = log.commits.length; ctx.cursor = [50, 50]; pcb.runAction("pointEditorRemoveCorner", ctx);
+  assert.equal(log.commits.length, before, "a triangle keeps its three corners"); assert.equal(P.canRemoveCorner(doc, "z-1", null), false);
+  // a line splits in two at the cursor
+  ctx.selection = new Set(["g-1"]); ctx.cursor = [100, 40]; assert.equal(pcb.runAction("pointEditorAddCorner", ctx), true);
+  const ch = log.commits.at(-1).changes; assert.equal(ch.length, 2);
+  const lines = [...doc.items.values()].filter((it) => it.kind === "gr_line" && K.str(K.kid(it.node, "layer")[1]) === "Edge.Cuts").map((it) => [K.num(K.kid(it.node, "start")[1]), K.num(K.kid(it.node, "end")[1])]).sort((a, b) => a[0] - b[0]);
+  assert.deepEqual(lines, [[90, 100], [100, 140]]);
+  assert.notEqual(ch[1].id, "g-1", "the new half has its own uuid");
+  ctx.selection = null;
+});
+
+// ---- review fixes: net-less pads, component drag clearance, arcs on a dragged via, locked neighbours, mid-track ends,
+// the dragger's optimizer, multi-drag peers, drag ghosts
+const RV_HDR = `(kicad_pcb (version 20260728) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (44 "Edge.Cuts" user))
+`;
+test("router: a pad without a net is an obstacle to every routed net (ITEM::collideSimple); a free pad is not", () => {
+  const src = RV_HDR + `  (footprint "Test:R" (layer "F.Cu") (uuid "fp-1") (at 100 50)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "A") (uuid "pad-1"))
+    (pad "2" smd rect (at 20 0) (size 1 1) (layers "F.Cu") (net "A") (uuid "pad-2")))
+  (footprint "MountingHole" (layer "F.Cu") (uuid "fp-2") (at 110 50)
+    (pad "1" thru_hole circle (at 0 0) (size 3 3) (drill 2) (layers "*.Cu" "*.Mask") (uuid "pad-m")))
+)`;
+  const doc = K.parseDoc(src, "kicad_pcb"); const { ctx, log } = routerCtx(doc); pcb.onDocChanged(ctx); P.state.layer = "F.Cu";
+  pcb.onKey("x", ev(), ctx); pcb.onPointerDown(ev(), [100, 50], ctx); pcb.onPointerMove(ev(), [120, 50], ctx);
+  const rt = P.state.route; assert.ok(rt.head.length > 2, "the head goes round the mounting hole pad: " + JSON.stringify(rt.head));
+  pcb.onPointerDown(ev(), [120, 50], ctx); assert.equal(P.state.route, null);
+  const ids = new Set(log.commits.at(-1).changes.map((c) => c.id));
+  assert.ok(minGapTo(doc, ids, "A") >= 0.2 - 1e-4, "clear of the net-less pad: " + minGapTo(doc, ids, "A"));
+  // PAD::IsFreePad: pin type free on its own unconnected-( net collides with nothing
+  const free = { node: K.parse(`(pad "3" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "unconnected-(U1-NC-Pad3)") (pintype "free"))`), net: { name: "unconnected-(U1-NC-Pad3)" } };
+  assert.equal(P.isFreePad(free), true);
+  assert.equal(P.isFreePad({ node: free.node, net: { name: "A" } }), false);
+});
+
+const CD_SRC = (other) => RV_HDR + `  (footprint "Test:R" (layer "F.Cu") (uuid "fp-1") (at 100 50)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "A") (uuid "pad-1"))
+    (pad "2" smd rect (at 2 0) (size 1 1) (layers "F.Cu") (net "B") (uuid "pad-2")))
+  (segment (start 100 50) (end 90 50) (width 0.25) (layer "F.Cu") (net "A") (uuid "t1"))
+${other}
+)`;
+function componentDrag(src, to) {
+  const doc = K.parseDoc(src, "kicad_pcb"); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  P.state.sel = new Set(); ctx.selected = { id: "fp-1" }; ctx.selection = new Set(["fp-1"]); ctx.cursor = [100, 50];
+  pcb.onKey("d", ev(), ctx); P.selectMoveTo(ctx, to); P.finishSelectMove(ctx, true, false);
+  ctx.selected = null; ctx.selection = new Set();
+  return { doc, log };
+}
+test("component drag: clearance is checked where the footprint was dropped — its own pads never refuse, a moved pad on another net's track does", () => {
+  // the footprint's own other-net pad at its old place is no obstacle
+  let { doc, log } = componentDrag(CD_SRC(""), [104, 50]);
+  assert.equal(log.commits.length, 1, log.toasts.join()); assert.deepEqual(log.toasts, []);
+  assert.deepEqual(P.padsOf(doc.items.get("fp-1")).map((p) => [p.x, p.y]), [[104, 50], [106, 50]]);
+  // pad 2 (net B) dropped onto net C's track is refused
+  ({ doc, log } = componentDrag(CD_SRC(`  (segment (start 99 65) (end 120 65) (width 0.25) (layer "F.Cu") (net "C") (uuid "t2"))`), [98, 65]));
+  assert.equal(log.commits.length, 0); assert.deepEqual(log.toasts, ["Track violates DRC."]);
+  assert.deepEqual(P.padsOf(doc.items.get("fp-1")).map((p) => [p.x, p.y]), [[100, 50], [102, 50]]);
+  // a footprint with no attached tracks is checked too (COMPONENT_DRAGGER's dragged items are its pads)
+  const bare = RV_HDR + `  (footprint "Test:R" (layer "F.Cu") (uuid "fp-1") (at 100 50)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "A") (uuid "pad-1")))
+  (segment (start 95 60) (end 105 60) (width 0.25) (layer "F.Cu") (net "C") (uuid "t2"))
+)`;
+  ({ log } = componentDrag(bare, [100, 60]));
+  assert.equal(log.commits.length, 0); assert.deepEqual(log.toasts, ["Track violates DRC."]);
+});
+
+test("via drag: an arc ending on the via stays and a 45° stub joins it to the via's new place (ARC_T links of the joint)", () => {
+  const src = RV_HDR + `  (via (at 118 53) (size 0.8) (drill 0.4) (layers "F.Cu" "B.Cu") (net "GND") (uuid "v-1"))
+  (arc (start 118 53) (mid 119 54) (end 120 53) (width 0.25) (layer "F.Cu") (net "GND") (uuid "a-1"))
+  (segment (start 118 53) (end 118 60) (width 0.25) (layer "B.Cu") (net "GND") (uuid "s-3"))
+)`;
+  const doc = K.parseDoc(src, "kicad_pcb"); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  P.state.sel = new Set(["v-1"]); ctx.cursor = [118, 53];
+  pcb.onKey("d", ev(), ctx); assert.equal(P.state.drag.subs[0].lines.length, 2);
+  pcb.onPointerMove(ev(), [118, 56], ctx); pcb.onPointerDown(ev(), [118, 56], ctx);
+  const ch = log.commits.at(-1).changes; assert.ok(!ch.some((c) => c.id === "a-1"), "the arc itself is not touched");
+  assert.deepEqual(P.pt(doc.items.get("a-1").node, "start"), [118, 53]); assert.deepEqual(P.pt(doc.items.get("v-1").node, "at"), [118, 56]);
+  const fronts = [...doc.items.values()].filter((it) => it.kind === "segment" && K.kid(it.node, "layer")[1] === "F.Cu").map((it) => [P.pt(it.node, "start"), P.pt(it.node, "end")]);
+  assert.deepEqual(fronts, [[[118, 56], [118, 53]]], "the stub runs from the via to the arc");
+});
+
+test("AssembleLine stops at a locked segment; new segments take the dragged segment's own lock state", () => {
+  const hdr = RV_HDR + `  (footprint "Test:R" (layer "F.Cu") (uuid "fp-1") (at 100 50)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "A") (uuid "pad-1"))
+    (pad "2" smd rect (at 20 0) (size 1 1) (layers "F.Cu") (net "A") (uuid "pad-2")))
+`;
+  let doc = K.parseDoc(hdr + `  (segment (start 100 50) (end 110 50) (width 0.25) (layer "F.Cu") (net "A") (uuid "s1"))
+  (segment (start 110 50) (end 115 50) (width 0.25) (layer "F.Cu") (locked yes) (net "A") (uuid "s2"))
+  (segment (start 115 50) (end 120 50) (width 0.25) (layer "F.Cu") (net "A") (uuid "s3"))
+)`, "kicad_pcb");
+  assert.deepEqual(P.assembleLine(doc, doc.items.get("s1")).ids, ["s1"]);
+  assert.deepEqual(P.assembleLine(doc, doc.items.get("s2")).ids, ["s1", "s2", "s3"], "from a locked seed the unlocked neighbours follow (JOINT::NextSegment)");
+  let { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  P.state.sel = new Set(["s1"]); ctx.cursor = [105, 50];
+  pcb.onKey("d", ev(), ctx); pcb.onPointerMove(ev(), [105, 47], ctx); pcb.onPointerDown(ev(), [105, 47], ctx);
+  let ch = log.commits.at(-1).changes; assert.ok(doc.items.has("s2"), "the locked neighbour survives");
+  assert.ok(!ch.some((c) => c.id === "s2" || c.id === "s3"));
+  for (const c of ch.filter((x) => x.kind === "ADDED")) assert.doesNotMatch(c.sexpr, /locked/);
+  // the line's first segment is locked: the dragged (unlocked) part does not inherit it
+  doc = K.parseDoc(hdr + `  (segment (start 100 50) (end 105 50) (width 0.25) (layer "F.Cu") (locked yes) (net "A") (uuid "s1"))
+  (segment (start 105 50) (end 112 50) (width 0.25) (layer "F.Cu") (net "A") (uuid "s2"))
+  (segment (start 112 50) (end 120 50) (width 0.25) (layer "F.Cu") (net "A") (uuid "s3"))
+)`, "kicad_pcb");
+  ({ ctx, log } = fakeCtx(doc)); pcb.onDocChanged(ctx);
+  P.state.sel = new Set(["s3"]); ctx.cursor = [116, 50];
+  pcb.onKey("d", ev(), ctx); pcb.onPointerMove(ev(), [116, 53], ctx); pcb.onPointerDown(ev(), [116, 53], ctx);
+  ch = log.commits.at(-1).changes; assert.ok(ch.some((c) => c.kind === "ADDED"));
+  for (const c of ch.filter((x) => x.kind === "ADDED")) assert.doesNotMatch(c.sexpr, /locked/);
+  assert.ok(doc.items.has("s1"));
+});
+
+test("router: landing on the body of a same-net track ends the route there and splits the track (splitAdjacentSegments)", () => {
+  const src = RV_HDR + `  (footprint "Test:R" (layer "F.Cu") (uuid "fp-1") (at 100 50)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "A") (uuid "pad-1")))
+  (segment (start 120 40) (end 120 60) (width 0.25) (layer "F.Cu") (net "A") (uuid "t1"))
+)`;
+  const doc = K.parseDoc(src, "kicad_pcb"); const { ctx, log } = routerCtx(doc); pcb.onDocChanged(ctx); P.state.layer = "F.Cu";
+  pcb.onKey("x", ev(), ctx); pcb.onPointerDown(ev(), [100, 50], ctx);
+  pcb.onPointerMove(ev(), [120.05, 50], ctx); assert.deepEqual(P.state.route.target, [120, 50]);
+  pcb.onPointerDown(ev(), [120.05, 50], ctx);
+  assert.equal(P.state.route, null, "the route ends on the track");
+  const ch = log.commits.at(-1).changes;
+  assert.ok(ch.some((c) => c.kind === "MODIFIED" && c.id === "t1"));
+  assert.deepEqual(P.pt(doc.items.get("t1").node, "end"), [120, 50]);
+  const tails = [...doc.items.values()].filter((it) => it.kind === "segment" && JSON.stringify(P.pt(it.node, "start")) === "[120,50]" && JSON.stringify(P.pt(it.node, "end")) === "[120,60]");
+  assert.equal(tails.length, 1);
+});
+
+test("drag optimizer (MERGE_SEGMENTS | MERGE_COLINEAR, preserved anchor): no stub back over the pad, no micro-jogs", () => {
+  let doc = K.parseDoc(RV_HDR + `  (footprint "Test:R" (layer "F.Cu") (uuid "fp-1") (at 100 50)
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "A") (uuid "pad-1"))
+    (pad "2" smd rect (at 20 0) (size 1 1) (layers "F.Cu") (net "A") (uuid "pad-2")))
+  (segment (start 100 50) (end 110 50) (width 0.25) (layer "F.Cu") (net "A") (uuid "s1"))
+  (segment (start 110 50) (end 110 60) (width 0.25) (layer "F.Cu") (net "A") (uuid "s2"))
+  (segment (start 110 60) (end 120 60) (width 0.25) (layer "F.Cu") (net "A") (uuid "s3"))
+  (segment (start 120 60) (end 120 50) (width 0.25) (layer "F.Cu") (net "A") (uuid "s4"))
+)`, "kicad_pcb");
+  let { ctx } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  let d = P.dragStart(ctx, doc.items.get("s2"), [110, 55], false); P.dragTo(ctx, d, [98, 55]);
+  const pts = d.sol.lines[0].pts; assert.deepEqual(pts[0], [100, 50]); assert.deepEqual(pts.at(-1), [120, 50]);
+  assert.ok(!pts.some((p) => p[1] === 50 && p[0] < 100), "no segment doubling back along y=50 past the pad: " + JSON.stringify(pts));
+  doc = K.parseDoc(RV_HDR + `  (segment (start 204.73401 119.39001) (end 204.724 119.38) (width 0.25) (layer "F.Cu") (net "A") (uuid "m0"))
+  (segment (start 204.724 119.38) (end 193.04 119.38) (width 0.25) (layer "F.Cu") (net "A") (uuid "m1"))
+  (segment (start 193.04 119.38) (end 190.5 121.92) (width 0.25) (layer "F.Cu") (net "A") (uuid "m2"))
+  (segment (start 190.5 121.92) (end 189.23 121.92) (width 0.25) (layer "F.Cu") (net "A") (uuid "m3"))
+)`, "kicad_pcb");
+  ({ ctx } = fakeCtx(doc)); pcb.onDocChanged(ctx);
+  d = P.dragStart(ctx, doc.items.get("m1"), [199, 119.38], false);
+  for (let dy = -1; dy >= -6; dy--) {
+    P.dragTo(ctx, d, [199, 119.38 + dy]); const q = d.sol.lines[0].pts;
+    for (let i = 0; i + 1 < q.length; i++) assert.ok(Math.hypot(q[i + 1][0] - q[i][0], q[i + 1][1] - q[i][1]) > 0.1, "dy " + dy + ": " + JSON.stringify(q));
+    assert.deepEqual(q[0], [204.73401, 119.39001]); assert.deepEqual(q.at(-1), [189.23, 121.92]);
+  }
+  // LINE::ChangedArea: the box of what differs, grown by the width; nothing changed gives null
+  assert.equal(P.changedArea([[0, 0], [10, 0]], [[0, 0], [10, 0]], 0.25), null);
+  assert.deepEqual(P.changedArea([[0, 0], [2, 2], [8, 2], [10, 0]], [[0, 0], [10, 0]], 0.25), [1.75, 1.75, 8.25, 2.25]);
+});
+
+test("multi-drag: followers of another net meet the lines already moved, not their old places; the drag ghosts to peers", () => {
+  const doc = K.parseDoc(RV_HDR + `  (segment (start 100 50) (end 110 50) (width 0.25) (layer "F.Cu") (net "A") (uuid "s1"))
+  (segment (start 100 51) (end 110 51) (width 0.25) (layer "F.Cu") (net "B") (uuid "s2"))
+)`, "kicad_pcb");
+  const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  P.state.sel = new Set(["s1", "s2"]); ctx.cursor = [105, 50];
+  pcb.onKey("d", ev(), ctx); assert.equal(P.state.drag.subs.length, 2);
+  pcb.onPointerMove(ev(), [105, 52], ctx);
+  for (const d of P.state.drag.subs) assert.equal(d.status, true);
+  assert.deepEqual(P.state.drag.subs.map((d) => d.sol.lines[0].pts[1][1]), [52, 53], "both lines move up together, 1 mm apart");
+  assert.ok(pcb.ghostSegs().length >= 2, "the drag in progress is offered to peers");
+  pcb.onPointerDown(ev(), [105, 52], ctx); assert.equal(log.commits.at(-1).label, "drag track");
+  assert.deepEqual(pcb.ghostSegs(), []);
+});
+
+// ---- KiCad's hover selection, turns in flight, Mirror, Duplicate / Paste Special and locks (edit_tool.cpp)
+const LOCKED_MSG = "Selection contains locked items. Enable 'Override locks' to operate on them.";
+test("hover selection: R / F / L / Ctrl+C / Del act on the item under the cursor and leave nothing selected; an empty spot does nothing silently", () => {
+  const doc = fixture(); const { ctx, log } = fullCtx(doc);
+  ctx.cursor = [132, 50]; log.selection = null;
+  assert.equal(pcb.runAction("rotateSelection", ctx), true); assert.equal(log.commits.at(-1).label, "rotate");
+  assert.deepEqual([pt(doc.items.get("s-4").node, "start"), pt(doc.items.get("s-4").node, "end")], [[130, 50], [130, 45]], "a lone segment turns about its start (GetPosition)");
+  assert.deepEqual(log.selection, [], "the hover selection is cleared afterwards");
+  ctx.cursor = [130, 47]; assert.equal(pcb.runAction("flipSelection", ctx), true); assert.equal(K.kid(doc.items.get("s-4").node, "layer")[1], "B.Cu");
+  ctx.cursor = [130, 47]; assert.equal(pcb.runAction("toggleLock", ctx), true); assert.ok(P.isLocked(doc.items.get("s-4").node));
+  ctx.cursor = [130, 47]; assert.equal(pcb.runAction("copy", ctx), true); assert.ok(/\(segment /.test(log.clip) && !/locked/.test(log.clip), "a clipboard copy drops the lock (CLIPBOARD_IO)");
+  // the locked segment: KiCad's warning, nothing turns
+  const n = log.commits.length; ctx.cursor = [130, 47];
+  assert.equal(pcb.runAction("rotateSelection", ctx), true); assert.equal(log.commits.length, n); assert.equal(log.toasts.at(-1), LOCKED_MSG);
+  assert.equal(pcb.onKey("Delete", ev(), ctx), true); assert.equal(log.commits.length, n); assert.ok(doc.items.has("s-4"));
+  // nothing there: nothing happens and nothing is said
+  const t = log.toasts.length; ctx.cursor = [0, 0];
+  for (const id of ["rotateSelection", "flipSelection", "mirrorH", "move", "copy", "duplicate", "swap", "pack", "toggleLock"]) assert.equal(pcb.runAction(id, ctx), true, id);
+  assert.equal(log.commits.length, n); assert.equal(log.toasts.length, t); assert.equal(P.state.move, null);
+  // Del on an unlocked item under the cursor removes it
+  ctx.cursor = [141, 51]; assert.equal(pcb.onKey("Delete", ev(), ctx), true); assert.ok(!doc.items.has("a-1"));
+});
+
+test("hover selection with several candidates asks Clarify Selection and runs the action on the pick", () => {
+  const doc = fixture(); const { ctx, log } = fullCtx(doc); let asked = null;
+  ctx.cursor = [118, 53]; ctx.candidatesAt = () => ["v-1", "s-2", "s-3"];
+  ctx.clarify = (ids, then) => { asked = ids; ctx.selection = new Set(["v-1"]); then(ctx); };
+  assert.equal(pcb.runAction("rotateSelection", ctx), true); assert.deepEqual(asked, ["v-1", "s-2", "s-3"]);
+  assert.equal(log.commits.at(-1).label, "rotate"); assert.deepEqual(log.commits.at(-1).changes.map((c) => c.id), ["v-1"]); assert.deepEqual(log.selection, [], "the pick was a hover selection");
+  // a pad stands for its footprint, a group member for its group
+  ctx.candidatesAt = () => ["fp-1#0", "fp-1"]; ctx.selection = new Set(); ctx.cursor = [100, 49];
+  assert.equal(pcb.runAction("flipSelection", ctx), true); assert.equal(doc.items.get("fp-1").layer, "B.Cu");
+});
+
+test("locks: any locked item in the selection makes Rotate / Move / Mirror / Delete do nothing, with KiCad's warning", () => {
+  const doc = fixture(); const { ctx, log } = fullCtx(doc);
+  ctx.selection = new Set(["s-4"]); pcb.runAction("toggleLock", ctx); const n = log.commits.length;
+  ctx.selection = new Set(["s-4", "a-1"]);
+  for (const id of ["rotateSelection", "flipSelection", "mirrorV", "cut"]) { log.toasts.length = 0; assert.equal(pcb.runAction(id, ctx), true); assert.deepEqual(log.toasts, [LOCKED_MSG], id); }
+  assert.equal(pcb.runAction("move", ctx), true); assert.equal(P.state.move, null);
+  assert.equal(log.commits.length, n, "a-1 was not edited on its own either");
+  assert.deepEqual(P.unlockedIds(ctx, ["a-1"]), ["a-1"]);
+});
+
+test("Rotate / Flip / Mirror during a Move turn the move about the cursor; the click commits one Move step, Escape restores everything", () => {
+  const doc = fixture(); const { ctx, log } = fullCtx(doc); ctx.snapOn = false;
+  const s4 = K.serialize(doc.items.get("s-4").node);
+  ctx.selection = new Set(["s-4"]); ctx.cursor = [130, 50];
+  assert.equal(pcb.runAction("move", ctx), true); assert.ok(P.state.move && P.state.move.sticky);
+  P.selectMoveTo(ctx, [140, 60]); const n = log.commits.length;
+  assert.equal(pcb.runAction("rotateSelection", ctx), true); assert.equal(log.commits.length, n, "no separate undo entry while moving");
+  assert.deepEqual([pt(doc.items.get("s-4").node, "start"), pt(doc.items.get("s-4").node, "end")], [[140, 60], [140, 55]], "turned about the cursor");
+  P.selectMoveTo(ctx, [150, 60]); assert.deepEqual(pt(doc.items.get("s-4").node, "end"), [150, 55], "the turn moves on with the cursor");
+  P.finishSelectMove(ctx, true, false);
+  assert.equal(log.commits.length, n + 1); assert.equal(log.commits.at(-1).label, "move");
+  assert.deepEqual([pt(doc.items.get("s-4").node, "start"), pt(doc.items.get("s-4").node, "end")], [[150, 60], [150, 55]]);
+  // Escape after a turn and a flip: the true originals come back
+  const before = K.serialize(doc.items.get("s-4").node); ctx.cursor = [150, 60];
+  pcb.runAction("move", ctx); P.selectMoveTo(ctx, [160, 70]); pcb.runAction("rotateSelection", ctx); pcb.runAction("flipSelection", ctx); pcb.runAction("mirrorH", ctx);
+  assert.equal(K.kid(doc.items.get("s-4").node, "layer")[1], "B.Cu");
+  const m = log.commits.length; pcb.cancel(); assert.equal(K.serialize(doc.items.get("s-4").node), before); assert.equal(log.commits.length, m);
+  assert.notEqual(before, s4);
+  // Ctrl+D: the copies follow the cursor; a turn in flight lands in the one Duplicate step
+  ctx.selection = new Set(["a-1"]); ctx.cursor = [140, 50]; assert.equal(pcb.runAction("duplicate", ctx), true); const dup = P.state.move.placing[0];
+  P.selectMoveTo(ctx, [140, 60]); pcb.runAction("rotateSelection", ctx); P.finishSelectMove(ctx, true, false);
+  assert.deepEqual(pt(doc.items.get(dup).node, "start"), [140, 60]); assert.deepEqual(pt(doc.items.get(dup).node, "end"), [140, 58]);
+});
+
+test("Mirror: graphics and tracks in place about the modification point; footprints are skipped with KiCad's message", () => {
+  const doc = fixture(); const { ctx, log } = fullCtx(doc);
+  ctx.selection = new Set(["s-2"]); assert.equal(pcb.runAction("mirrorH", ctx), true); assert.equal(log.commits.at(-1).label, "mirror");
+  assert.deepEqual([pt(doc.items.get("s-2").node, "start"), pt(doc.items.get("s-2").node, "end")], [[115, 50], [112, 53]], "about the segment's start");
+  ctx.selection = new Set(["fp-1"]); const n = log.commits.length; assert.equal(pcb.runAction("mirrorV", ctx), true); assert.equal(log.commits.length, n);
+  assert.equal(log.toasts.at(-1), "Footprints cannot be mirrored. Use Flip to move them to the other side of the board.");
+  const g = P.groupChanges(doc, ["fp-1", "s-4"], ""); K.applyChange(doc, g[0], IU); ctx.selection = new Set([g[0].id]);
+  assert.equal(pcb.runAction("mirrorH", ctx), true); assert.equal(log.commits.length, n); assert.equal(log.toasts.at(-1), "Groups containing footprints or other items that cannot be mirrored were skipped.");
+});
+
+test("Duplicate keeps references, locks and nets, and a copy joins its original's group; Escape puts the group back", () => {
+  const doc = fixture(); const { ctx, log } = fullCtx(doc);
+  ctx.selection = new Set(["fp-1"]); pcb.runAction("toggleLock", ctx);
+  const g = P.groupChanges(doc, ["s-4", "a-1"], "pair"); ctx.commit(g, "group"); const gid = g[0].id;
+  ctx.selection = new Set(["fp-1"]); P.state.sel.clear(); assert.equal(pcb.runAction("duplicate", ctx), true);
+  const c = log.commits.at(-1); assert.equal(c.label, "duplicate"); const nfp = doc.items.get(c.changes[0].id);
+  assert.equal(nfp.ref, "R1", "BOARD_ITEM::Duplicate keeps the reference"); assert.ok(P.isLocked(nfp.node), "and the lock"); assert.notEqual(nfp.id, "fp-1");
+  P.finishSelectMove(ctx, true, false);
+  // a member of a group whose group is not duplicated: the copy joins the group in the same commit
+  const r = P.duplicateChanges(doc, ["s-4"]); assert.equal(r.ids.length, 1);
+  const mod = r.changes.find((x) => x.id === gid); assert.ok(mod && mod.kind === "MODIFIED" && mod.groupMembers.includes(r.ids[0]) && mod.groupMembers.includes("s-4"));
+  // a whole group: a new group around copies of its members
+  const r2 = P.duplicateChanges(doc, [gid, "s-4", "a-1"]); const ng = r2.changes.find((x) => x.typeName === "PCB_GROUP");
+  assert.equal(r2.changes.length, 3); assert.ok(ng.kind === "ADDED" && ng.id !== gid && ng.groupMembers.length === 2 && !ng.groupMembers.includes("s-4"));
+  // Escape on a placement whose copy joined a group: the copy goes and the group is as it was
+  ctx.selection = new Set(["a-1"]); const members = K.serialize(K.kid(doc.items.get(gid).node, "members"));
+  P.state.sel.clear(); ctx.selection = new Set(["a-1"]);
+  // a-1 is in the group: its group is selected too in the app, so select the bare member through the module instead
+  pcb.runAction("duplicate", ctx); assert.ok(P.state.move.placing.length >= 1); pcb.cancel();
+  assert.equal(K.serialize(K.kid(doc.items.get(gid).node, "members")), members);
+});
+
+test("Paste Special: KiCad's three reference modes (keep preselected) and Clear net assignments", () => {
+  const doc = fixture(); const { ctx, log } = fullCtx(doc);
+  ctx.selection = new Set(["fp-1", "s-1", "v-1"]); ctx.cursor = [100, 50]; pcb.runAction("copy", ctx);
+  let spec = null; pcb.setForm((s) => { spec = s; return true; });
+  assert.equal(pcb.runAction("pasteSpecial", ctx), true);
+  const f = spec.fields[0]; assert.equal(f.type, "radio"); assert.equal(f.value, "keep"); assert.equal(f.label, "Reference Designators");
+  assert.deepEqual(f.options.map((o) => o[1]), ["Assign unique reference designators to pasted symbols", "Keep existing reference designators, even if they are duplicated", "Clear reference designators on all pasted symbols"]);
+  assert.equal(spec.fields[1].label, "Clear net assignments");
+  ctx.cursor = [200, 100]; spec.apply({ annotations: "keep", clearNets: true });
+  const ids = P.state.move.placing; P.state.move = null;
+  const items = ids.map((id) => doc.items.get(id));
+  const fp = items.find((it) => it.kind === "footprint"); assert.equal(fp.ref, "R1");
+  assert.ok(!K.kids(fp.node, "pad").some((p) => K.kid(p, "net")), "pads lose their nets");
+  for (const it of items.filter((x) => x.kind !== "footprint")) assert.deepEqual(K.kid(it.node, "net"), ["net", ""]);
+  pcb.setForm(null);
+});
+
+test("Interactive Delete: a locked item stays and 'Item locked.' pops up; several candidates brighten nothing", () => {
+  const doc = fixture(); const { ctx, log } = fullCtx(doc);
+  ctx.selection = new Set(["s-4"]); pcb.runAction("toggleLock", ctx); ctx.selection = new Set();
+  pcb.onActivate("delete", ctx); const n = log.commits.length;
+  pcb.onPointerDown(ev(), [132, 50], ctx); assert.equal(log.commits.length, n); assert.ok(doc.items.has("s-4")); assert.equal(P.state.popup.text, "Item locked.");
+  pcb.onPointerDown(ev(), [141, 51], ctx); assert.ok(!doc.items.has("a-1")); assert.equal(log.toasts.filter((t) => /Deleted/.test(t)).length, 0, "nothing said");
+  ctx.candidatesAt = () => ["s-2", "v-1"]; pcb.onPointerMove(ev(), [118, 53], ctx); assert.equal(P.state.hover.del, null);
+  ctx.candidatesAt = () => ["v-1"]; pcb.onPointerMove(ev(), [118, 53], ctx); assert.equal(P.state.hover.del.id, "v-1");
+  P.state.popup = null;
+});
+
+test("grid helper: BestDragOrigin takes the moved items' anchor nearest the mouse; the move snaps to other items' anchors (Shift: grid only, Ctrl: no grid)", () => {
+  const doc = fixture(); const { ctx, log } = fullCtx(doc);
+  // a footprint: the pad the mouse is in, else its position
+  assert.deepEqual(P.bestDragOrigin(doc, ["fp-1"], [100.1, 49.2], 0.25), [100, 49.1], "pad 1's centre under the mouse");
+  assert.deepEqual(P.bestDragOrigin(doc, ["fp-1"], [101.5, 50.2], 0.25), [100, 50], "the footprint position");
+  assert.deepEqual(P.bestDragOrigin(doc, ["s-4"], [134, 50.3], 0.25), [135, 50], "a track's nearer end");
+  // magnetic: a graphic line's end within 25 px (one grid step at most) wins over the grid; tracks do not capture outside the track tool
+  ctx.pxPerMm = 100; ctx.gridPitch = 0.25;
+  assert.deepEqual(P.snapCursor(ctx, [140.1, 40.05], null, {}).p, [140, 40], "Edge.Cuts line end");
+  assert.deepEqual(P.snapCursor(ctx, [140.1, 40.05], null, { shiftKey: true }).p, [140, 40], "Shift: the grid point (here the same)");
+  assert.deepEqual(P.snapCursor(ctx, [139.9, 40.12], null, { shiftKey: true }).p, [140, 40]);
+  assert.deepEqual(P.snapCursor(ctx, [139.93, 40.12], null, { shiftKey: true, ctrlKey: true }).p, [139.93, 40.12], "Shift+Ctrl: free (DisableGridSnapping is MD_CTRL)");
+  assert.deepEqual(P.snapCursor(ctx, [139.93, 40.12], null, { shiftKey: true, altKey: true }).p, [140, 40], "Alt does nothing to the grid");
+  assert.equal(P.snapCursor(ctx, [110.05, 50.05], null, {}).anchor, null, "a track end does not capture the cursor in a move");
+  assert.deepEqual(P.snapCursor(ctx, [115.04, 40.02], null, {}).p, [115, 40], "the line's middle");
+  // M on the footprint grabbed near its position: the position follows the snapped cursor
+  ctx.snapOn = true; ctx.selection = new Set(["fp-1"]); ctx.cursor = [100.4, 50.3];
+  pcb.runAction("move", ctx); assert.deepEqual(P.state.move.start, [100, 50]);
+  P.selectMoveTo(ctx, [104.1, 52.4]); assert.deepEqual([doc.items.get("fp-1").x, doc.items.get("fp-1").y], [104, 52.5]);
+  pcb.cancel(); assert.deepEqual([doc.items.get("fp-1").x, doc.items.get("fp-1").y], [100, 50]);
+});
+
+test("Add Text: Text Properties first on a new text with the layer's defaults; OK carries it on the cursor, a click places it ('Draw Text'), Escape or a blank text adds nothing", () => {
+  const doc = fixture(); const { ctx, log } = fullCtx(doc); let seen = null, reply = null;
+  pcb.setNewItemDialogs({ gr_text: (c, node, done) => { seen = node; reply(node, done); return true; } });
+  pcb.onActivate("gtext", ctx); P.state.gfxLayer = "B.SilkS";
+  reply = (node, done) => { node[1] = "HELLO"; done(node); };
+  const n = log.commits.length; pcb.onPointerDown(ev(), [10, 20], ctx);
+  assert.equal(seen[0], "gr_text"); assert.deepEqual(K.atOf(seen).slice(0, 2), [10, 20]); assert.equal(K.kid(seen, "layer")[1], "B.SilkS");
+  assert.deepEqual(K.kid(K.kid(seen, "effects"), "justify").slice(1), ["left", "bottom", "mirror"], "left / bottom, mirrored on a back layer");
+  assert.equal(log.commits.at(-1).label, "Draw Text"); const id = log.commits.at(-1).changes[0].id; assert.deepEqual(log.selection, [id]);
+  assert.ok(P.state.move && P.state.move.placing[0] === id, "the text follows the cursor");
+  P.selectMoveTo(ctx, [15, 25]); P.finishSelectMove(ctx, true, false);
+  assert.deepEqual(K.atOf(doc.items.get(id).node).slice(0, 2), [15, 25]); assert.equal(doc.items.get(id).node[1], "HELLO");
+  // Escape while it follows the cursor: gone again
+  pcb.onPointerDown(ev(), [30, 30], ctx); const id2 = P.state.move.placing[0]; pcb.cancel(); assert.ok(!doc.items.has(id2));
+  // Cancel, or nothing printable: nothing at all
+  const m = log.commits.length; reply = (node, done) => done(null); pcb.onPointerDown(ev(), [40, 40], ctx);
+  reply = (node, done) => { node[1] = "  \\n "; done(node); }; pcb.onPointerDown(ev(), [40, 40], ctx); assert.equal(log.commits.length, m); assert.equal(P.state.move, null);
+  // a position changed in the dialog: placed there at once
+  reply = (node, done) => { node[1] = "AT"; K.setAt(node, 50, 60, 0); done(node); }; pcb.onPointerDown(ev(), [40, 40], ctx);
+  assert.equal(P.state.move, null); assert.deepEqual(K.atOf(doc.items.get(log.commits.at(-1).changes[0].id).node).slice(0, 2), [50, 60]);
+  pcb.setNewItemDialogs({ gr_text: null }); pcb.onActivate("select", ctx);
+});
+
+test("Line Modes: lines, polygons and zones follow the angle snap mode (Ctrl frees them), rectangles and circles constrain only with Ctrl; Shift+Space cycles; Backspace takes the last line back; Ctrl++ / Ctrl+- step the width", () => {
+  const doc = fixture(); const { ctx, log } = fullCtx(doc); const cfg = [];
+  ctx.commit = (changes, label, opts) => { log.commits.push({ changes, label, opts }); for (const c of changes) K.applyChange(doc, c, IU); pcb.onDocChanged(ctx); };
+  // GetVectorSnapped45 / 90
+  assert.deepEqual(P.snap45([10, 3]), [10, 0]); assert.deepEqual(P.snap45([10, 6]), [10, 10]); assert.deepEqual(P.snapVec45([10, 3], true), [10, 10], "a rectangle is only ever a square");
+  assert.deepEqual(P.snap90([10, 6]), [10, 0]); assert.deepEqual(P.snap90([3, -6]), [0, -6]);
+  P.setAngleSnap(ctx, "free"); assert.equal(P.angleSnapMode(), "free");
+  pcb.onActivate("gline", ctx); P.state.gfxLayer = "F.SilkS";
+  pcb.onPointerDown(ev(), [10, 10], ctx); pcb.onPointerMove(ev(), [20, 13], ctx);
+  assert.deepEqual(P.state.draw.cur, [20, 13], "free: the cursor as it is");
+  // PCB_VIEWER_TOOLS::NextLineMode: DIRECT -> DEG45 -> DEG90 -> DIRECT
+  A.lineModeNext.run(ctx); assert.equal(P.angleSnapMode(), "45"); assert.deepEqual(P.state.draw.cur, [20, 10], "the new mode applies to the line at once");
+  A.lineModeNext.run(ctx); assert.equal(P.angleSnapMode(), "90"); pcb.onPointerMove(ev(), [20, 16], ctx); assert.deepEqual(P.state.draw.cur, [20, 10], "H / V only");
+  A.lineModeNext.run(ctx); assert.equal(P.angleSnapMode(), "free");
+  A.lineMode45.run(ctx); assert.equal(P.angleSnapMode(), "45"); pcb.onPointerMove(ev(), [20, 16], ctx); assert.deepEqual(P.state.draw.cur, [20, 20], "GetVectorSnapped45 keeps the longer axis");
+  pcb.onPointerMove(ev({ ctrlKey: true }), [20, 16], ctx); assert.deepEqual(P.state.draw.cur, [20, 16], "Ctrl draws at any angle");
+  // the click takes the constrained point, and the line goes on from there
+  pcb.onPointerDown(ev(), [20, 17], ctx); const l1 = log.commits.at(-1).changes[0].id;
+  assert.deepEqual(K.kid(doc.items.get(l1).node, "end").slice(1), [20, 20]);
+  // Ctrl++ twice then Ctrl+- once: one step wider than the layer's default for the next line
+  const w0 = +K.kid(K.kid(doc.items.get(l1).node, "stroke"), "width")[1];
+  A.incWidth.run(ctx); A.incWidth.run(ctx); A.decWidth.run(ctx);
+  pcb.onPointerDown(ev(), [30, 17], ctx); const l2 = log.commits.at(-1).changes[0].id;
+  assert.ok(Math.abs(+K.kid(K.kid(doc.items.get(l2).node, "stroke"), "width")[1] - (w0 + 0.1)) < 1e-9);
+  // Backspace: l2 goes (its undo step dropped) and the line is drawn again from its start; again: l1; then the tool ends the line
+  pcb.onKey("Backspace", ev(), ctx); assert.ok(!doc.items.has(l2)); assert.deepEqual(log.commits.at(-1).opts, { amend: true, discard: true });
+  assert.deepEqual(P.state.draw.start, [20, 20]);
+  pcb.onKey("Backspace", ev(), ctx); assert.ok(!doc.items.has(l1)); assert.deepEqual(P.state.draw.start, [10, 10]);
+  pcb.onKey("Backspace", ev(), ctx); assert.equal(P.state.draw, null);
+  // rectangles: free unless Ctrl, which squares them
+  pcb.onActivate("grect", ctx); pcb.onPointerDown(ev(), [0, 0], ctx); pcb.onPointerMove(ev(), [10, 4], ctx); assert.deepEqual(P.state.draw.cur, [10, 4]);
+  pcb.onPointerMove(ev({ ctrlKey: true }), [10, 4], ctx); assert.deepEqual(P.state.draw.cur, [10, 10]);
+  // the polygon tool constrains from its last corner
+  pcb.onActivate("gpoly", ctx); pcb.onPointerDown(ev(), [0, 0], ctx); pcb.onPointerDown(ev(), [10, 1], ctx); assert.deepEqual(P.state.draw.pts.at(-1), [10, 0]);
+  // POLYGON_GEOM_MANAGER: the cursor is reached through a leader with one 45° bend, and a loop line of the same kind closes
+  pcb.onPointerMove(ev(), [12, 9], ctx); assert.deepEqual(P.state.draw.cur, [12, 9]);
+  assert.deepEqual(P.state.draw.leader, [[10, 0], [12, 2], [12, 9]]); assert.deepEqual(P.state.draw.loop, [[12, 9], [9, 9], [0, 0]]);
+  pcb.onKey("Enter", ev(), ctx);
+  const poly = log.commits.at(-1).changes[0].id; assert.equal(log.commits.at(-1).label, "polygon");
+  assert.deepEqual(K.kid(doc.items.get(poly).node, "pts").slice(1).map((x) => x.slice(1)), [[0, 0], [10, 0], [12, 2], [12, 9], [9, 9]], "the leader's and the loop's bends are corners too");
+  // H/V: one bend on the horizontal first
+  A.lineMode90.run(ctx); pcb.onActivate("gpoly", ctx); pcb.onPointerDown(ev(), [0, 0], ctx); pcb.onPointerMove(ev(), [5, 3], ctx);
+  assert.deepEqual(P.state.draw.leader, [[0, 0], [5, 0], [5, 3]]);
+  pcb.onPointerDown(ev(), [5, 3], ctx); assert.deepEqual(P.state.draw.pts, [[0, 0], [5, 0], [5, 3]]);
+  pcb.onKey("Backspace", ev(), ctx); assert.deepEqual(P.state.draw.pts, [[0, 0], [5, 0]], "Backspace drops the last corner");
+  A.lineMode45.run(ctx);
+  // the tool's width resets with the next tool; the mode stays
+  pcb.onActivate("select", ctx); assert.equal(P.state.strokeW, null); assert.equal(P.angleSnapMode(), "45");
+  A.lineModeFree.run(ctx); assert.equal(P.angleSnapMode(), "free");
+  assert.equal(P.dimensionLabel("l", 12.3456), "l: 12.346 mm"); assert.equal(P.dimensionLabel("θ", 45, true), "θ: 45.0°");
+  void cfg;
+});
+
+test("Draw Zone / Rule Area: the properties dialog opens on a template at the first click (active layer, highlighted net, a unique priority); OK draws with its settings, Cancel ends it", () => {
+  const doc = fixture(); const { ctx, log } = fullCtx(doc); let seen = null, reply = null;
+  pcb.setNewItemDialogs({ zone: (c, node, done) => { seen = node; reply(node, done); return true; } });
+  P.setAngleSnap(ctx, "free");
+  P.state.highlightNet = P.netTable(doc).key({ code: -1, name: "GND" });
+  pcb.onActivate("zone", ctx); pcb.setLayer(ctx, "B.Cu");
+  reply = (node, done) => { K.kid(node, "min_thickness")[1] = 0.3; done(node); };
+  pcb.onPointerDown(ev(), [0, 0], ctx);
+  assert.equal(seen[0], "zone"); assert.equal(P.netOf(seen).name, "GND", "the highlighted net"); assert.ok(!K.kid(seen, "name"));
+  for (const p of [[10, 0], [10, 10]]) pcb.onPointerDown(ev(), p, ctx);
+  pcb.onPointerDown(ev(), [0, 0], ctx);   // the first corner again closes it
+  const z = doc.items.get(log.commits.at(-1).changes[0].id); assert.equal(log.commits.at(-1).label, "zone");
+  assert.equal(K.kid(z.node, "min_thickness")[1], 0.3, "the dialog's settings"); assert.equal(P.netOf(z.node).name, "GND");
+  assert.deepEqual(K.kid(K.kid(z.node, "polygon"), "pts").slice(1).map((x) => x.slice(1)), [[0, 0], [10, 0], [10, 10]]);
+  // Cancel: nothing is drawn and the next click asks again
+  const n = log.commits.length; reply = (node, done) => done(null);
+  pcb.onPointerDown(ev(), [20, 20], ctx); assert.equal(P.state.draw, null); assert.equal(log.commits.length, n);
+  // a rule area gets the keepout template
+  pcb.onActivate("rulearea", ctx); reply = (node, done) => done(node); pcb.onPointerDown(ev(), [0, 0], ctx);
+  assert.ok(K.kid(seen, "keepout")); assert.equal(P.state.draw.template[0], "zone");
+  pcb.setNewItemDialogs({ zone: null }); pcb.onActivate("select", ctx); P.state.highlightNet = null;
+});
+
+// ---- dimension point editors (pcb_point_editor.cpp *_DIMENSION_POINT_EDIT_BEHAVIOR) and PCB_DIM_*::Update
+const DIM = (type, body, text, at, extra) => `(dimension (type ${type}) (layer "F.SilkS") (uuid "d-${type}") ${body}
+    ${type === "center" ? "" : `(format (prefix "${type === "radial" ? "R " : ""}") (suffix "") (units 2) (units_format ${type === "aligned" ? 1 : 0}) (precision 4)${type === "leader" ? ' (override_value "NOTE")' : " (suppress_zeroes yes)"})`}
+    (style (thickness 0.15) (arrow_length 1.27) (text_position_mode 0)${type === "aligned" || type === "orthogonal" ? " (arrow_direction outward) (extension_height 0.58642)" : ""}${type === "leader" ? " (text_frame 0)" : ""} (extension_offset 0.5)${type === "leader" ? "" : " (keep_text_aligned yes)"}${extra || ""})
+    ${type === "center" ? "" : `(gr_text "${text}" (at ${at}) (layer "F.SilkS") (uuid "d-${type}") (effects (font (size 1 1) (thickness 0.15))))`})`;
+const DIM_FIXTURE = FIXTURE.replace(/\)\s*$/, `
+  ${DIM("aligned", "(pts (xy 0 0) (xy 20 0)) (height 3)", "20 mm", "10 1.85 0")}
+  ${DIM("orthogonal", "(pts (xy 0 10) (xy 10 14)) (height 5) (orientation 0)", "10", "5 13.85 0")}
+  ${DIM("radial", "(pts (xy 50 50) (xy 53 54)) (leader_length 3.81)", "R 5", "70 56 0")}
+  ${DIM("leader", "(pts (xy 80 80) (xy 85 75))", "NOTE", "95 75 0")}
+  ${DIM("center", "(pts (xy 60 60) (xy 61 61))")}
+)`);
+
+test("dimensions: Update() rebuilds the text and its place as pcbnew does, in nanometres", () => {
+  // qa/data/pcbnew/issue20249: inches, bare suffix, the default pen (size / 8) in the offset
+  const inch = K.parse(`(dimension (type aligned) (layer "F.SilkS") (uuid "x") (pts (xy 0 0) (xy 20 0)) (height 3)
+    (format (prefix "") (suffix "") (units 0) (units_format 1) (precision 4)) (style (thickness 0.15) (arrow_length 1.27) (text_position_mode 0) (arrow_direction outward) (extension_height 0.58642) (extension_offset 0) (keep_text_aligned yes))
+    (gr_text "?" (at 0 0 0) (layer "F.SilkS") (uuid "x") (effects (font (size 1.27 1.27)))))`);
+  let m = P.dimUpdate(P.dimRead(inch)); assert.equal(m.text, "0.7874 in"); assert.deepEqual(m.textPos, [10e6, 1571250]);
+  // pns_regressions video-v10: a vertical aligned dimension with a negative height
+  const vert = K.parse(`(dimension (type aligned) (layer "Dwgs.User") (uuid "y") (pts (xy 224.028 134.366) (xy 224.028 154.94)) (height -3.175)
+    (format (prefix "") (suffix "") (units 2) (units_format 1) (precision 4)) (style (thickness 0.2) (arrow_length 1.27) (text_position_mode 0) (arrow_direction outward) (extension_height 0.58642) (extension_offset 0) (keep_text_aligned yes))
+    (gr_text "?" (at 0 0 0) (layer "Dwgs.User") (uuid "y") (effects (font (size 1.524 1.524) (thickness 0.2)))))`);
+  m = P.dimUpdate(P.dimRead(vert)); assert.equal(m.text, "20.5740 mm"); assert.deepEqual([m.textPos, m.textAngle], [[225479000, 144653000], 90]);
+  // VECTOR2I / 2 rounds half away from zero (issue22475: an odd crossbar length)
+  const odd = K.parse(`(dimension (type aligned) (layer "F.SilkS") (uuid "z") (pts (xy 123.5 73.581281) (xy 123.5 96.045)) (height 0)
+    (format (prefix "") (suffix "") (units 2) (units_format 1) (precision 4)) (style (thickness 0.15) (arrow_length 1.27) (text_position_mode 0) (arrow_direction outward) (extension_height 0.58642) (extension_offset 0.5) (keep_text_aligned yes))
+    (gr_text "?" (at 0 0 0) (layer "F.SilkS") (uuid "z") (effects (font (size 1 1) (thickness 0.15)))))`);
+  assert.equal(P.dimUpdate(P.dimRead(odd)).textPos[1], 84813141);
+  m = P.dimRead(inch); m.precision = 8; m.unitsMode = 1; m.unitsFormat = 2; m.prefix = "W="; assert.equal(P.dimUpdate(m).text, "W=787.4 (mils)", "V.VVV precisions drop places per unit; parenthesised units");
+});
+
+test("dimension point editor: handles per type, and each drag as UpdateItem does it", () => {
+  const doc = K.parseDoc(DIM_FIXTURE, "kicad_pcb"), node = (t) => doc.items.get("d-" + t).node;
+  const keys = (t) => P.editPoints(doc.items.get("d-" + t)).map((h) => h.key);
+  assert.deepEqual(keys("aligned"), ["start", "end", "text", "cbstart", "cbend"]);
+  assert.deepEqual(keys("orthogonal"), ["start", "end", "text", "cbstart", "cbend"]);
+  assert.deepEqual(keys("radial"), ["start", "end", "text", "knee"]);
+  assert.deepEqual(keys("leader"), ["start", "end", "text"]);
+  assert.deepEqual(keys("center"), ["start", "end"]);
+  const at = (n) => { const a = K.kid(K.kid(n, "gr_text"), "at"); return [K.num(a[1]), K.num(a[2]), K.num(a[3])]; };
+  const num = (n, k) => K.num(K.kid(n, k)[1]), text = (n) => K.str(K.kid(n, "gr_text")[1]), mode = (n) => K.num(K.kid(K.kid(n, "style"), "text_position_mode")[1]);
+  const xy = (n) => K.kids(K.kid(n, "pts"), "xy").map((x) => [K.num(x[1]), K.num(x[2])]);
+  // aligned: the crossbar handle slides along its feature line, the height is the signed distance; the text follows
+  let n = P.editPointNode(node("aligned"), "dimension", "cbstart", [2, 5]);
+  assert.equal(num(n, "height"), 5); assert.deepEqual(at(n), [10, 3.85, 0]); assert.equal(text(n), "20 mm");
+  n = P.editPointNode(node("aligned"), "dimension", "cbend", [20, -4]); assert.equal(num(n, "height"), -4, "the other side");
+  n = P.editPointNode(node("aligned"), "dimension", "end", [30, 0]); assert.deepEqual(xy(n), [[0, 0], [30, 0]]); assert.equal(text(n), "30 mm");
+  // the text handle switches to manual placement; a manual text then keeps its place relative to the crossbar
+  n = P.editPointNode(node("aligned"), "dimension", "text", [12, 6]); assert.equal(mode(n), 2); assert.deepEqual(at(n).slice(0, 2), [12, 6]);
+  const n2 = P.editPointNode(n, "dimension", "cbstart", [0, 4]); assert.equal(num(n2, "height"), 4); assert.deepEqual(at(n2).slice(0, 2), [12, 7], "the text keeps its distance from the crossbar");
+  const n3 = P.editPointNode(n, "dimension", "end", [40, 0]); assert.deepEqual(at(n3).slice(0, 2), [24, 6], "and its ratio along it");
+  // orthogonal: leaving the points' box beside them turns the measurement vertical
+  n = P.editPointNode(node("orthogonal"), "dimension", "cbstart", [-6, 12]); assert.equal(num(n, "orientation"), 1); assert.equal(num(n, "height"), -6); assert.equal(text(n), "4");
+  assert.deepEqual(at(n), [-7.15, 12, 90]);
+  n = P.editPointNode(node("orthogonal"), "dimension", "cbstart", [5, 12]); assert.equal(num(n, "orientation"), 0, "inside the box the axis stays"); assert.equal(num(n, "height"), 2);
+  // radial: the knee stays on the radius line, the leader length is its distance from the end, the text moves with it
+  n = P.editPointNode(node("radial"), "dimension", "knee", [56.4, 57.7], [56.4, 57.7]); assert.equal(num(n, "leader_length"), 5);
+  assert.deepEqual(at(n).slice(0, 2), [70.714, 56.952]);
+  n = P.editPointNode(node("radial"), "dimension", "end", [56, 50]); assert.equal(text(n), "R 6");
+  n = P.editPointNode(node("radial"), "dimension", "text", [70, 59.5], [70, 59.5]); assert.deepEqual(at(n), [70, 57.048, 0], "the text keeps to 45° steps from the knee");
+  // leader: moving the end carries the text; the text keeps to 45° steps from the end
+  n = P.editPointNode(node("leader"), "dimension", "end", [86, 76]); assert.deepEqual(at(n).slice(0, 2), [96, 76]); assert.equal(text(n), "NOTE");
+  n = P.editPointNode(node("leader"), "dimension", "text", [90, 79], [90, 79]); assert.deepEqual(at(n).slice(0, 2), [90, 80]);
+  // centre: the arm keeps to 45°
+  n = P.editPointNode(node("center"), "dimension", "end", [63, 60.4], [63, 60.4]); assert.deepEqual(xy(n), [[60, 60], [63, 60]]);
+  assert.equal(K.kid(n, "gr_text"), null, "a centre mark has no text");
+});
+
+test("Dimension Properties: the dialog's values round-trip, and OK re-derives the text as updateDimensionFromDialog + Update()", () => {
+  const esbuild = require("esbuild");
+  const out = esbuild.buildSync({ entryPoints: [webPath("domains", "pcb", "editor", "pcbdialogs", "dimension.ts")], bundle: true, format: "cjs", write: false, platform: "node", logLevel: "silent" });
+  const mod = { exports: {} }; globalThis.window = globalThis.window || globalThis; new Function("module", "exports", "require", out.outputFiles[0].text)(mod, mod.exports, require);
+  const D = mod.exports, doc = K.parseDoc(DIM_FIXTURE, "kicad_pcb"), node = (t) => doc.items.get("d-" + t).node;
+  const v = D.dimDialogValues(node("aligned"));
+  assert.equal(v.value, "20"); assert.equal(v.arbitrary, false); assert.equal(v.unitsFormat, 1); assert.equal(v.autoThickness, false); assert.equal(v.textThick, 0.15);
+  assert.equal(K.serialize(D.applyDimDialog(node("aligned"), v)), K.serialize(node("aligned")), "OK without changes writes the same node");
+  let n = D.applyDimDialog(node("aligned"), { ...v, unitsMode: 1, unitsFormat: 2, precision: 1, prefix: "L=" });
+  assert.equal(K.str(K.kid(n, "gr_text")[1]), "L=787.4 (mils)");
+  assert.ok(K.serialize(K.kid(n, "format")).includes('(prefix "L=") (suffix "") (units 1) (units_format 2) (precision 1) (suppress_zeroes yes)'));
+  n = D.applyDimDialog(node("aligned"), { ...v, arbitrary: true, value: "TBD" });
+  assert.equal(K.str(K.kid(n, "gr_text")[1]), "TBD mm"); assert.ok(K.serialize(n).includes('(override_value "TBD")'), "Arbitrary keeps its text as the override");
+  n = D.applyDimDialog(node("aligned"), { ...v, posMode: 2, textX: 3, textY: 9, keepAligned: false, angle: -90, autoThickness: true, bold: true, hJustify: "left", arrowInward: true, layer: "F.Fab" });
+  const at = K.kid(K.kid(n, "gr_text"), "at"); assert.deepEqual([K.num(at[1]), K.num(at[2]), K.num(at[3])], [3, 9, 270], "manual position, the angle normalised");
+  const s = K.serialize(n);
+  assert.ok(s.includes("(text_position_mode 2)") && s.includes("(arrow_direction inward)") && !s.includes("keep_text_aligned"), s);
+  assert.ok(/\(font \(size 1 1\) \(bold yes\)\)/.test(s) && s.includes("(justify left)"), "auto thickness drops (thickness); bold and the justification");
+  assert.equal((s.match(/\(layer "F\.Fab"\)/g) || []).length, 2, "the item and its text move layer together");
+  const lv = D.dimDialogValues(node("leader")); assert.equal(lv.value, "NOTE");
+  n = D.applyDimDialog(node("leader"), { ...lv, value: "SEE NOTE 2", textFrame: 1 });
+  assert.equal(K.str(K.kid(n, "gr_text")[1]), "SEE NOTE 2"); assert.ok(K.serialize(n).includes("(text_frame 1)"));
+  const cv = D.dimDialogValues(node("center")); n = D.applyDimDialog(node("center"), { ...cv, lineThickness: 0.3 });
+  assert.ok(!K.kid(n, "format") && !K.kid(n, "gr_text") && K.serialize(K.kid(n, "style")).includes("(thickness 0.3)"), "a centre mark has style only");
+});
+
+test("Draw Text Box opens Text Box Properties on the drawn box: OK adds it selected, Cancel drops it (DRAWING_TOOL::DrawRectangle)", () => {
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  let seen = null, reply = (n, done) => done(n);
+  pcb.setNewItemDialogs({ gr_text_box: (c, node, done) => { seen = node; reply(node, done); return true; } });
+  try {
+    ctx.setTool("gtextbox"); pcb.onPointerDown(ev(), [10, 12], ctx); pcb.onPointerMove(ev(), [30, 20], ctx); pcb.onPointerDown(ev(), [30, 20], ctx);
+    assert.equal(K.str(seen[1]), "", "the dialog gets an empty text box");
+    const c = log.commits.at(-1); assert.equal(c.label, "Draw Text Box"); assert.equal(c.changes[0].typeName, "PCB_TEXTBOX");
+    assert.deepEqual(log.selection || [...P.state.sel], [c.changes[0].id], "the new text box is selected");
+    assert.equal(log.tool, "gtextbox", "the tool stays for the next box");
+    const n = log.commits.length; reply = (node, done) => done(null);
+    pcb.onPointerDown(ev(), [40, 40], ctx); pcb.onPointerDown(ev(), [50, 45], ctx); assert.equal(log.commits.length, n, "Cancel: nothing added");
+  } finally { pcb.setNewItemDialogs({ gr_text_box: null }); pcb.onActivate("select", ctx); }
+});
+
+test("Text Box Properties: values round-trip; OK writes size, pen, flags, justification, border; the angle slides the box about its start", () => {
+  const esbuild = require("esbuild");
+  const out = esbuild.buildSync({ entryPoints: [webPath("domains", "pcb", "editor", "pcbdialogs", "textbox.ts")], bundle: true, format: "cjs", write: false, platform: "node", logLevel: "silent" });
+  const mod = { exports: {} }; globalThis.window = globalThis.window || globalThis; new Function("module", "exports", "require", out.outputFiles[0].text)(mod, mod.exports, require);
+  const T = mod.exports;
+  const node = K.parse('(gr_text_box "Line one\\nLine two" (start 10 10) (end 40 30) (margins 1.0025 1.0025 1.0025 1.0025) (layer "F.SilkS") (uuid "tb-1") (effects (font (size 1.5 1.2) (thickness 0.2)) (justify left top)) (border yes) (stroke (width 0.12) (type default)) (knockout no))');
+  const v = T.textBoxValues(node);
+  assert.deepEqual({ ...v }, { text: "Line one\nLine two", locked: false, layer: "F.SilkS", angle: 0, textW: 1.2, textH: 1.5, autoThickness: false, textThick: 0.2, bold: false, italic: false,
+    hJustify: "left", vJustify: "top", mirrored: false, border: true, borderWidth: 0.12, borderStyle: "solid", face: "" });
+  let r = T.applyTextBox(node, { ...v, borderStyle: "dash" }, v);
+  assert.equal(K.serialize(r.node).replace("(type dash)", "(type default)"), K.serialize(node), "only the border style changed");
+  r = T.applyTextBox(node, { ...v, text: "A\nB", textW: 2, textH: 2, autoThickness: true, bold: true, hJustify: "center", vJustify: "bottom", mirrored: true, border: false, borderWidth: NaN, locked: true }, v);
+  const s = K.serialize(r.node);
+  assert.ok(s.startsWith('(gr_text_box "A\\nB" (locked yes)'), s);
+  assert.ok(s.includes("(effects (font (size 2 2) (bold yes)) (justify bottom mirror))"), s);
+  assert.ok(s.includes("(border no) (stroke (width 0) (type solid)) (knockout no)"), s);
+  // a pen thicker than a quarter of the size is clamped
+  r = T.applyTextBox(node, { ...v, textThick: 0.5 }, v); assert.equal(r.clamped, true); assert.ok(K.serialize(r.node).includes("(thickness 0.3)"));
+  // 90°: the box turns its centre about the start (axis-aligned, same size), the angle sits before the layer
+  r = T.applyTextBox(node, { ...v, angle: 90 }, v);
+  const st = K.kid(r.node, "start"), en = K.kid(r.node, "end");
+  assert.deepEqual([st[1], st[2], en[1], en[2]], [5, -15, 35, 5]);   // centre (25, 20) turns CCW about (10, 10) to (20, -5)
+  assert.ok(K.serialize(r.node).includes('(angle 90) (layer "F.SilkS")'));
+  // the box grows to hold its text (GetMinSize): ten lines do not fit 20 mm
+  r = T.applyTextBox(node, { ...v, text: Array(10).fill("x").join("\n") }, v);
+  assert.ok(K.num(K.kid(r.node, "end")[2]) > 30, "taller");
+  assert.equal(K.num(K.kid(r.node, "end")[1]), 40, "the width is free");
+});
+
+// (after the module tests: loading a dialog bundle installs the editor state the board module then sees)
+test("Reference Image Properties: sizes from the scale, CheckValues' limits and the writer's order", () => {
+  const esbuild = require("esbuild");
+  const out = esbuild.buildSync({ entryPoints: [webPath("domains", "pcb", "editor", "pcbdialogs", "refimage.ts")], bundle: true, format: "cjs", write: false, platform: "node", logLevel: "silent" });
+  const mod = { exports: {} }; globalThis.window = globalThis.window || globalThis; new Function("module", "exports", "require", out.outputFiles[0].text)(mod, mod.exports, require);
+  const R = mod.exports;
+  const node = K.parse('(image (at 50 40) (layer "F.SilkS") (data "QUJD") (uuid "11111111-2222-3333-4444-555555555555"))');
+  const v = R.refImageValues(node, { w: 200, h: 100, ppi: 100, mime: "image/png" });
+  assert.deepEqual([v.x, v.y, v.rotation, v.opacity, v.layer, v.locked, v.scale, v.ppi], [50, 40, 0, 1, "F.SilkS", false, 1, 100]);
+  assert.deepEqual(R.refImageSize(v, 1), [50.8, 25.4], "25.4 mm / ppi a pixel");
+  assert.deepEqual(R.refImageSize(v, 0.5), [25.4, 12.7]);
+  assert.deepEqual(R.checkImageScale(v, -1), { error: "Scale must be a positive number." });
+  assert.deepEqual(R.checkImageScale(v, 0.1), { error: "This scale results in an image which is too small (0.85 mm or 33.3 mil)." });
+  assert.deepEqual(R.checkImageScale(v, 31), { confirm: "This scale results in an image which is very large (524.9 mm or 20.67 in). Are you sure?" });
+  assert.deepEqual(R.checkImageScale(v, 1), {});
+  assert.equal(K.serialize(R.applyRefImage(node, v)), K.serialize(node), "unchanged values write the same item");
+  const n = R.applyRefImage(node, { ...v, x: 10, y: 20, rotation: 30, scale: 0.5, opacity: 0.4, layer: "F.Fab", locked: true });
+  assert.equal(K.serialize(n), '(image (at 10 20) (layer "F.Fab") (rotate 30) (scale 0.5) (opacity 0.4) (locked yes) (data "QUJD") (uuid "11111111-2222-3333-4444-555555555555"))');
+  assert.equal(K.serialize(R.applyRefImage(n, { ...v, opacity: 3 })), K.serialize(node), "SetOpacity clamps to 0..1; the defaults drop their tokens");
+  // PANEL_IMAGE_EDITOR's pixel operations
+  const px = [255, 0, 0, 255, 10, 20, 30, 128]; R.invertPixels(px); assert.deepEqual(px, [0, 255, 255, 255, 245, 235, 225, 128]);
+  const gpx = [255, 0, 0, 200]; R.greyscalePixels(gpx); assert.deepEqual(gpx, [76, 76, 76, 200]);
+  const apx = [255, 255, 255, 255, 0, 0, 0, 255, 255, 128, 128, 255]; R.colourToAlpha(apx, [255, 255, 255]);
+  assert.deepEqual([apx[3], apx[7], apx[11]], [0, 255, 127], "white goes, black stays, half red half there");
+  assert.deepEqual(apx.slice(8, 11), [255, 0, 0], "the background's contribution taken out");
+  // the re-encoded PNG carries the resolution
+  const png = makePng(4, 4, 1000); const withPpi = Buffer.from(R.pngWithPpi(new Uint8Array(png), 254));
+  assert.equal(P.imageInfo(new Uint8Array(withPpi)).ppi, 254);
+  assert.equal(withPpi.length, png.length, "the old pHYs replaced, not doubled");
+});
+
+test("Create Array: ARRAY_OPTIONS transforms, ARRAY_TOOL's copies, and DIALOG_CREATE_ARRAY's checks", () => {
+  const g = { type: "grid", nx: 3, ny: 2, dx: 10, dy: 5, offX: 0, offY: 0, stagger: 1, staggerRows: true, centred: false, hThenV: true };
+  assert.equal(P.arraySize(g), 6);
+  assert.deepEqual([0, 1, 2, 3, 5].map((n) => P.arrayTransform(g, n, [0, 0]).offset), [[0, 0], [10, 0], [20, 0], [0, 5], [20, 5]]);
+  assert.deepEqual(P.arrayTransform({ ...g, centred: true }, 0, [0, 0]).offset, [-10, -2.5], "centred: minus half the extents");
+  assert.deepEqual(P.arrayTransform({ ...g, offX: 1, offY: 2 }, 4, [0, 0]).offset, [11, 7], "the offsets add per row / column");
+  assert.deepEqual(P.arrayTransform({ ...g, stagger: 2 }, 3, [0, 0]).offset, [5, 5], "stagger 2 on rows: every other row half a pitch over");
+  assert.deepEqual(P.arrayTransform({ ...g, stagger: -2 }, 3, [0, 0]).offset, [-5, 5], "a negative stagger goes the other way");
+  assert.deepEqual(P.arrayTransform({ ...g, hThenV: false }, 1, [0, 0]).offset, [0, 5], "vertical then horizontal");
+  const c = { type: "circular", centre: [0, 0], angle: 90, angleOffset: 0, clockwise: true, count: 4, rotateItems: true };
+  let t = P.arrayTransform(c, 1, [10, 0]); assert.deepEqual([t.offset.map((v) => Math.round(v * 1e6) / 1e6), t.rot], [[-10, 10], -90], "clockwise on screen: (10, 0) to (0, 10)");
+  t = P.arrayTransform({ ...c, clockwise: false, rotateItems: false }, 1, [10, 0]); assert.deepEqual([t.offset.map((v) => Math.round(v * 1e6) / 1e6), t.rot], [[-10, -10], 0]);
+  t = P.arrayTransform({ ...c, angle: 0, count: 3 }, 1, [10, 0]); assert.equal(Math.round(t.rot * 1e6) / 1e6, -120, "angle 0 divides the circle by the count");
+  assert.equal(P.arrayStacked({ ...g, dx: 0, dy: 0 }, [0, 0]), true); assert.equal(P.arrayStacked(g, [0, 0]), false);
+  assert.equal(P.arrayStacked({ ...c, count: 5, rotateItems: false }, [10, 0]), true, "five quarter turns come round to the first");
+  assert.equal(P.arrayStacked({ ...c, count: 5 }, [10, 0]), false, "unless the item turns: -360 is not 0 to EDA_ANGLE");
+  // the copies: footprints reannotated, the original stays the first cell and is selected with them
+  const doc = fixture();
+  let r = P.arrayChanges(doc, ["fp-1", "s-4"], { ...g, nx: 2, ny: 1 });
+  assert.equal(r.label, "Create Array"); assert.equal(r.changes.length, 2); assert.deepEqual(r.ids.slice(-2), ["fp-1", "s-4"]);
+  const fpc = r.changes.find((x) => x.typeName === "FOOTPRINT" || /^\(kicad_pcb.*\(footprint/s.test(x.sexpr) && x.sexpr.includes("(footprint"));
+  assert.ok(fpc && fpc.sexpr.includes('"Reference" "R2"') && fpc.sexpr.includes("(translate 110 50)"), fpc && fpc.sexpr.slice(0, 300));
+  assert.ok(r.changes.some((x) => x.sexpr.includes("(segment (start 140 50) (end 145 50)")));
+  r = P.arrayChanges(fixture(), ["fp-1"], { ...g, nx: 2, ny: 1, keepRefs: true });
+  assert.ok(r.changes[0].sexpr.includes('"Reference" "R1"'), "Keep existing reference designators");
+  // centred: the originals move too (MODIFIED), in the same commit
+  r = P.arrayChanges(fixture(), ["s-4"], { ...g, nx: 3, ny: 1, centred: true });
+  assert.deepEqual(r.changes.map((x) => x.kind), ["ADDED", "ADDED", "MODIFIED"]);
+  assert.ok(r.changes[2].sexpr.includes("(start 120 50) (end 125 50)"), r.changes[2].sexpr);
+  // circular, clockwise on screen: (130, 50) a quarter turn about (130, 60) is (140, 60), and the track turns with it
+  r = P.arrayChanges(fixture(), ["s-4"], { ...c, centre: [130, 60], count: 2, angle: 90 });
+  assert.ok(r.changes[0].sexpr.includes("(start 140 60) (end 140 65)"), r.changes[0].sexpr);
+  // arrange: the selection, in order, one item to a cell from the first one's position
+  r = P.arrayChanges(fixture(), ["s-4", "s-1"], { ...g, nx: 2, ny: 1, arrange: true });
+  assert.equal(r.label, "Arrange selection"); assert.equal(r.changes.length, 1); assert.ok(r.changes[0].sexpr.includes("(start 140 50) (end 145 50)") && r.changes[0].sexpr.includes('"s-1"'), r.changes[0].sexpr);
+
+  const esbuild = require("esbuild");
+  const out = esbuild.buildSync({ entryPoints: [webPath("domains", "pcb", "editor", "pcbdialogs", "array.ts")], bundle: true, format: "cjs", write: false, platform: "node", logLevel: "silent" });
+  const mod = { exports: {} }; globalThis.window = globalThis.window || globalThis; new Function("module", "exports", "require", out.outputFiles[0].text)(mod, mod.exports, require);
+  const A = mod.exports, D = A.ARRAY_DEFAULTS;
+  let o = A.arrayOptions(D); assert.deepEqual(o.errors, []); assert.deepEqual([o.opts.type, o.opts.nx, o.opts.ny, o.opts.dx, o.opts.dy, o.opts.stagger, o.opts.centred, o.opts.keepRefs, o.opts.arrange], ["grid", 5, 5, 2.54, 2.54, 1, true, false, false]);
+  // the persister restores Items-in-place then Centre-on-source, both true: the second radio wins (dialog_create_array.cpp:180-181)
+  assert.equal(D.gridCentred, true);
+  o = A.arrayOptions({ ...D, gridNx: "5x", gridStagger: "" });
+  assert.equal(o.opts, null); assert.deepEqual(o.errors, ["Bad numeric value for horizontal count: 5x", "Bad numeric value for stagger: "]);
+  o = A.arrayOptions({ ...D, tab: 1, circCount: "six" }); assert.deepEqual(o.errors, ["Bad numeric value for point count: six"]);
+  o = A.arrayOptions({ ...D, tab: 1, circFullCircle: true }); assert.deepEqual([o.opts.type, o.opts.count, o.opts.angle, o.opts.clockwise, o.opts.rotateItems], ["circular", 4, 90, true, false]);
+  assert.equal(A.stackedMessage(25), "The array configuration would place 25 items at the same position and rotation, stacking them on top of one another.\n\nProceed anyway?");
+});
+
+test("Table Properties: cells read and write as the table reads (reversed on the back); strokes as DIALOG_TABLE_PROPERTIES writes them", () => {
+  const esbuild = require("esbuild");
+  const out = esbuild.buildSync({ entryPoints: [webPath("domains", "pcb", "editor", "pcbdialogs", "table.ts")], bundle: true, format: "cjs", write: false, platform: "node", logLevel: "silent" });
+  const mod = { exports: {} }; globalThis.window = globalThis.window || globalThis; new Function("module", "exports", "require", out.outputFiles[0].text)(mod, mod.exports, require);
+  const T = mod.exports;
+  const node = P.tableNode([0, 0], [30, 6], "F.SilkS", 0);
+  const v = T.tableValues(node);
+  assert.deepEqual(v, { cells: [["", ""], ["", ""]], layer: "F.SilkS", locked: false, external: true, header: true, borderWidth: 0.1, borderStyle: "solid", rows: true, cols: true, sepWidth: 0.1, sepStyle: "solid" });
+  let n = T.applyTable(node, { ...v, cells: [["A", "B"], ["C\nD", ""]] });
+  const cells = K.kids(K.kid(n, "cells"), "table_cell");
+  assert.deepEqual(cells.map((c) => c[1]), ["A", "B", "C\nD", ""]);
+  assert.ok(K.serialize(n).includes("(border (external yes) (header yes) (stroke (width 0.1) (type solid)))"), "DEFAULT becomes the combo's Solid");
+  n = T.applyTable(node, { ...v, external: false, header: false, cols: false, sepStyle: "dash", layer: "F.Fab", locked: true });
+  const s = K.serialize(n);
+  assert.ok(s.includes("(border (external no) (header no))"), "no border lines: no stroke written");
+  assert.ok(s.includes("(separators (rows yes) (cols no) (stroke (width 0.1) (type dash)))"), s);
+  assert.ok(/^\(table \(uuid "[^"]+"\) \(locked yes\) \(layer "F\.Fab"\) \(column_count 2\)/.test(s), s.slice(0, 120));
+  assert.equal((s.match(/\(layer "F\.Fab"\)/g) || []).length, 5, "the table and its four cells change layer together");
+  // a back-layer table lists its columns as it reads (mirrored)
+  const back = P.tableNode([0, 0], [30, 6], "B.SilkS", 0);
+  n = T.applyTable(back, { ...T.tableValues(back), cells: [["left", "right"], ["", ""]] });
+  assert.deepEqual(K.kids(K.kid(n, "cells"), "table_cell").slice(0, 2).map((c) => c[1]), ["right", "left"]);
+});
+
+test("Draw Dimension takes Board Setup's dimension defaults; Switch Dimension Arrows flips the arrows of the one being drawn", () => {
+  P.designSettings(JSON.stringify({ board: { design_settings: { defaults: { dimension_units: 2, dimension_precision: 2, dimensions: { units_format: 1, suppress_zeroes: false, text_position: 1, keep_text_aligned: false, arrow_length: 1000000, extension_offset: 250000 } } } } }));
+  try {
+    const n = P.dimensionNode("aligned", { start: [0, 0], end: [12.5, 0], height: 2 }, "F.SilkS"), s = K.serialize(n);
+    assert.ok(s.includes("(format (prefix \"\") (suffix \"\") (units 2) (units_format 1) (precision 2))"), s);
+    assert.ok(s.includes("(style (thickness 0.1) (arrow_length 1) (text_position_mode 1) (arrow_direction outward) (extension_height 0.58642) (extension_offset 0.25))"), s);
+    assert.equal(K.str(K.kid(n, "gr_text")[1]), "12.50 mm"); assert.deepEqual(K.kid(K.kid(n, "gr_text"), "at").slice(1, 3), [6.25, 2], "inline: on the crossbar");
+    const lead = K.serialize(P.dimensionNode("leader", { start: [0, 0], end: [5, 0] }, "F.SilkS"));
+    assert.ok(lead.includes("(units 0) (units_format 0) (precision 4) (override_value \"Leader\")") && lead.includes("(text_position_mode 0)"), "a leader keeps its own constructor's format");
+  } finally { P.designSettings(JSON.stringify({ board: { design_settings: { defaults: {} } } })); }
+  assert.ok(K.serialize(P.dimensionNode("aligned", { start: [0, 0], end: [1, 0], height: 1 }, "F.SilkS")).includes("(units 3) (units_format 0) (precision 4) (suppress_zeroes yes)"), "the board defaults come back");
+  const doc = fixture(); const { ctx, log } = fakeCtx(doc); pcb.onDocChanged(ctx);
+  ctx.setTool("dimaligned"); pcb.onPointerDown(ev(), [0, 0], ctx);
+  assert.equal(P.runAction("changeDimensionArrows", ctx), true); pcb.onPointerDown(ev(), [10, 0], ctx); pcb.onPointerMove(ev(), [5, 3], ctx); pcb.onPointerDown(ev(), [5, 3], ctx);
+  assert.ok(K.serialize(lastNode(log, "dimension")).includes("(arrow_direction inward)"));
+  ctx.setTool("select"); assert.equal(P.runAction("changeDimensionArrows", ctx), false, "only while a dimension is drawn");
+});
+
+test("remove unused pads: PTH pads and multi-layer vias get remove_unused_layers / keep_end_layers (DIALOG_UNUSED_PAD_LAYERS)", () => {
+  const doc = K.parseDoc(`(kicad_pcb (version 20260728) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (4 "In1.Cu" signal) (6 "In2.Cu" signal) (2 "B.Cu" signal) (44 "Edge.Cuts" user))
+  (footprint "T:J" (layer "F.Cu") (uuid "fp-1") (at 10 10)
+    (pad "1" thru_hole circle (at 0 0) (size 1.7 1.7) (drill 1) (layers "*.Cu" "*.Mask") (uuid "pad-1"))
+    (pad "2" smd rect (at 3 0) (size 1 1) (layers "F.Cu" "F.Mask") (uuid "pad-2")))
+  (via (at 20 20) (size 0.8) (drill 0.4) (layers "F.Cu" "B.Cu") (uuid "v-1"))
+  (via blind (at 25 20) (size 0.8) (drill 0.4) (layers "F.Cu" "In1.Cu") (uuid "v-2"))
+  (via blind (at 30 20) (size 0.8) (drill 0.4) (layers "F.Cu" "In2.Cu") (uuid "v-3")))`, "kicad_pcb");
+  const ch = P.unusedPadLayerChanges(doc, null, { vias: true, pads: true, remove: true, keepOutside: true });
+  assert.deepEqual(ch.map((c) => c.id).sort(), ["fp-1", "v-1", "v-3"], "a blind via over one layer pair is left alone");
+  const via = node(ch.find((c) => c.id === "v-1"));
+  assert.deepEqual([K.kid(via, "remove_unused_layers"), K.kid(via, "keep_end_layers")].map((x) => x && x[1]), ["yes", "yes"]);
+  const fp = node(ch.find((c) => c.id === "fp-1")), pads = K.kids(fp, "pad");
+  assert.equal(K.kid(pads[0], "remove_unused_layers")[1], "yes"); assert.ok(!K.kid(pads[1], "remove_unused_layers"), "an SMD pad is not touched");
+  const li = pads[0].findIndex((c) => Array.isArray(c) && c[0] === "layers"); assert.equal(pads[0][li + 1][0], "remove_unused_layers", "written right after (layers ...)");
+  for (const c of ch) assert.ok(K.applyChange(doc, c, IU));
+  const back = P.unusedPadLayerChanges(doc, ["v-1"], { vias: true, pads: true, remove: false, keepOutside: true });
+  assert.equal(back.length, 1); const v = node(back[0]);
+  assert.ok(!K.kid(v, "remove_unused_layers"), "restoring a via drops both tokens"); assert.ok(!K.kid(v, "keep_end_layers"));
+  const fpBack = node(P.unusedPadLayerChanges(doc, ["fp-1"], { vias: false, pads: true, remove: false, keepOutside: true })[0]);
+  assert.equal(K.kid(K.kids(fpBack, "pad")[0], "remove_unused_layers")[1], "no", "a plated pad always says so");
+  assert.ok(!K.kid(K.kids(fpBack, "pad")[0], "keep_end_layers"));
+});
+
+test("cleanup graphics: zero-size and duplicated shapes, lines into rectangles, board outline gaps (GRAPHICS_CLEANER)", () => {
+  const S = (w = 0.1) => `(stroke (width ${w}) (type default))`;
+  const doc = K.parseDoc(`(kicad_pcb (version 20260728) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (44 "Edge.Cuts" user) (37 "F.SilkS" user))
+  (gr_line (start 0 0) (end 0 0) ${S()} (layer "F.SilkS") (uuid "z-1"))
+  (gr_circle (center 5 5) (end 6 5) ${S()} (fill no) (layer "F.SilkS") (uuid "c-1"))
+  (gr_circle (center 5 5) (end 6 5) ${S()} (fill no) (layer "F.SilkS") (uuid "c-2"))
+  (gr_line (start 10 10) (end 10 20) ${S()} (layer "F.SilkS") (uuid "r-l"))
+  (gr_line (start 10 10) (end 30 10) ${S()} (layer "F.SilkS") (uuid "r-t"))
+  (gr_line (start 30 20) (end 30 10) ${S()} (layer "F.SilkS") (uuid "r-r"))
+  (gr_line (start 10 20) (end 30 20) ${S()} (layer "F.SilkS") (uuid "r-b"))
+  (gr_line (start 50 0) (end 80 0) ${S()} (layer "Edge.Cuts") (uuid "e-1"))
+  (gr_line (start 80.5 0.3) (end 80 30) ${S()} (layer "Edge.Cuts") (uuid "e-2")))`, "kicad_pcb");
+  const dry = P.graphicsCleanup(doc, { mergeRects: true, deleteRedundant: true, fixBoardOutlines: true, tolerance: 2 }, true);
+  assert.deepEqual(dry.items.map((i) => i.text), ["Remove zero-size graphic", "Remove duplicated graphic", "Convert lines to rectangle"]);
+  assert.deepEqual(dry.items[1].ids, ["c-2"], "the second of two equal shapes goes");
+  assert.equal(dry.changes.length, 0, "a dry run changes nothing");
+  const run = P.graphicsCleanup(doc, { mergeRects: true, deleteRedundant: true, fixBoardOutlines: true, tolerance: 2 }, false);
+  const rect = run.changes.filter((c) => c.sexpr).map(node).find((n) => n && n[0] === "gr_rect");
+  assert.equal(run.changes.filter((c) => c.op === "REMOVED" || c.type === "REMOVED" || !c.sexpr).length, 6, "the zero-size line, the duplicate circle and the four sides go");
+  assert.deepEqual([K.kid(rect, "start").slice(1), K.kid(rect, "end").slice(1)], [[10, 10], [30, 20]]);
+  const e1 = node(run.changes.find((c) => c.id === "e-1")), e2 = node(run.changes.find((c) => c.id === "e-2"));
+  assert.ok(e1 && e2, "both outline lines moved");
+  const end1 = K.kid(e1, "end").slice(1), start2 = K.kid(e2, "start").slice(1);
+  assert.deepEqual(end1, start2, "the outline ends meet at the lines' intersection");
+  assert.ok(Math.abs(end1[1]) < 1e-6 && end1[0] > 80 && end1[0] < 81);
+  const only = P.graphicsCleanup(doc, { mergeRects: false, deleteRedundant: false, fixBoardOutlines: true, tolerance: 0.1 }, false);
+  assert.equal(only.changes.length, 0, "a gap wider than the tolerance stays");
+});
+
+test("edit teardrops: pads and vias get the shape's defaults, specified values or none; orphaned teardrop zones go (DIALOG_GLOBAL_EDIT_TEARDROPS)", () => {
+  const doc = K.parseDoc(`(kicad_pcb (version 20260728) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (44 "Edge.Cuts" user))
+  (net 0 "") (net 1 "A")
+  (footprint "T:J" (layer "F.Cu") (uuid "fp-1") (at 10 10)
+    (pad "1" thru_hole circle (at 0 0) (size 1.7 1.7) (drill 1) (layers "*.Cu" "*.Mask") (net 1 "A") (uuid "pad-1"))
+    (pad "2" smd rect (at 3 0) (size 1 2) (layers "F.Cu" "F.Mask") (net 1 "A") (uuid "pad-2")))
+  (via (at 20 20) (size 0.8) (drill 0.4) (layers "F.Cu" "B.Cu") (net 1 "A") (uuid "v-1"))
+  (zone (net 1) (net_name "A") (layer "F.Cu") (uuid "td-1") (attr (teardrop (type padvia))) (hatch full 0.1) (connect_pads yes (clearance 0)) (min_thickness 0.0254) (filled_areas_thickness no) (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5) (island_removal_mode 1) (island_area_min 10))
+    (polygon (pts (xy 20.3 20) (xy 21 19.8) (xy 21 20.2)))))`, "kicad_pcb");
+  const td = P.teardropEditChanges, PM = K.padModel;
+  const round = { ...PM.TD_DEFAULTS, lenRatio: 0.4 }, rect = { ...PM.TD_DEFAULTS, lenRatio: 0.3 };
+  const base = { vias: true, pthPads: true, smdPads: true, trackToTrack: false, defaults: { round, rect } };
+  const add = td(doc, { ...base, action: "default" });
+  assert.deepEqual(add.map((c) => c.id).sort(), ["fp-1", "v-1"]);
+  const pads = K.kids(node(add.find((c) => c.id === "fp-1")), "pad");
+  assert.equal(PM.readTeardrops(pads[0]).lenRatio, 0.4, "a round pad takes TARGET_ROUND"); assert.equal(PM.readTeardrops(pads[1]).lenRatio, 0.3, "a rectangle TARGET_RECT");
+  assert.ok(PM.readTeardrops(pads[0]).enabled);
+  const via = node(add.find((c) => c.id === "v-1")); const vi = via.findIndex((c) => Array.isArray(c) && c[0] === "teardrops");
+  assert.equal(via[vi + 1][0], "net", "(teardrops) goes before the via's net");
+  for (const c of add) assert.ok(K.applyChange(doc, c, IU));
+  const smdOnly = td(doc, { ...base, vias: false, pthPads: false, action: "specified", specified: { maxLen: 3 } });
+  assert.equal(PM.readTeardrops(K.kids(node(smdOnly[0]), "pad")[1]).maxLen, 3); assert.equal(PM.readTeardrops(K.kids(node(smdOnly[0]), "pad")[0]).maxLen, 1, "PTH pads out of scope keep theirs");
+  const skipNet = td(doc, { ...base, action: "remove", skip: (i) => i.net === "A" });
+  assert.equal(skipNet.length, 0, "the net filter keeps every item");
+  const rm = td(doc, { ...base, pthPads: false, smdPads: false, action: "remove" });
+  assert.deepEqual(rm.map((c) => c.id).sort(), ["td-1", "v-1"], "the via's teardrop zone goes with it");
+  assert.ok(!PM.readTeardrops(node(rm.find((c) => c.id === "v-1"))).enabled);
+  const all = td(doc, { ...base, vias: false, pthPads: false, smdPads: false, action: "removeAll" });
+  assert.deepEqual(all.map((c) => c.id).sort(), ["fp-1", "td-1", "v-1"], "Remove all teardrops ignores the scope");
+});
+
+test("repair board: duplicated uuids get new ones, footprints and pads claim first (BOARD::RepairDuplicateItemUuids)", () => {
+  const doc = K.parseDoc(`(kicad_pcb (version 20260728) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+  (footprint "T:J" (layer "F.Cu") (uuid "fp-1") (at 10 10)
+    (property "Reference" "J1" (at 0 -2 0) (layer "F.SilkS") (uuid "dup-a") (effects (font (size 1 1) (thickness 0.15))))
+    (pad "1" thru_hole circle (at 0 0) (size 1.7 1.7) (drill 1) (layers "*.Cu" "*.Mask") (uuid "dup-a"))
+    (pad "2" thru_hole circle (at 2.54 0) (size 1.7 1.7) (drill 1) (layers "*.Cu" "*.Mask") (uuid "dup-b")))
+  (segment (start 0 0) (end 5 0) (width 0.25) (layer "F.Cu") (uuid "dup-b")))`, "kicad_pcb");
+  assert.equal(P.repairBoard(K.parseDoc(FIXTURE, "kicad_pcb")).duplicates, 0, "a clean board has nothing to repair");
+  const r = P.repairBoard(doc);
+  assert.equal(r.duplicates, 2); assert.deepEqual(r.details, ["2 duplicate IDs replaced."]);
+  const fp = node(r.changes.find((c) => c.id === "fp-1"));
+  assert.equal(K.str(K.kid(K.kids(fp, "pad")[0], "uuid")[1]), "dup-a", "the pad keeps its id");
+  assert.notEqual(K.str(K.kid(K.kid(fp, "property"), "uuid")[1]), "dup-a", "the field after it gets a new one");
+  const kinds = r.changes.map((c) => c.kind).sort();
+  assert.deepEqual(kinds, ["ADDED", "MODIFIED", "REMOVED"], "the track after the pad goes and comes back under a new id");
+});
+
+test("geographical reannotate: sort by rounded location, renumber per prefix, exclusions and prefixes (DIALOG_BOARD_REANNOTATE)", () => {
+  const fp = (ref, x, y, extra = "", layer = "F.Cu") => `(footprint "T:R" (layer "${layer}") (uuid "u-${ref}-${x}") (at ${x} ${y}) ${extra}
+    (property "Reference" "${ref}" (at 0 -2 0) (layer "F.SilkS") (uuid "p-${ref}-${x}") (effects (font (size 1 1) (thickness 0.15)))))`;
+  const doc = K.parseDoc(`(kicad_pcb (version 20260728) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+  ${fp("R7", 30, 10)} ${fp("R2", 10, 10.2)} ${fp("R9", 20, 9.9)} ${fp("C4", 10, 20)} ${fp("REF**", 50, 50)} ${fp("R1", 40, 40, "", "B.Cu")} ${fp("U3", 5, 5, "(locked yes)")})`, "kicad_pcb");
+  const base = { sortCode: 0, useFootprintLocation: true, grid: 1.27, scope: "all", excludeLocked: true, exclude: "", frontStart: "1", backStart: "", frontPrefix: "", backPrefix: "", removeFrontPrefix: false, removeBackPrefix: false };
+  const r = P.geographicalReannotate(doc, base);
+  assert.ok(r.ok);
+  const ren = Object.fromEntries(r.renames.map((x) => [x.from, x.to]));
+  assert.deepEqual(ren, { R2: "R1", R9: "R2", R7: "R3", C4: "C1", R1: "R4" }, "top to bottom, left to right; the back side continues the numbering; the locked U3 stays");
+  assert.equal(r.bad.length, 1, "REF** has no number"); assert.ok(r.report.some((l) => l.text === "REF**  (unannotated; not updated)"));
+  assert.ok(r.report.some((l) => l.text === "U3  (excluded)"));
+  const ex = P.geographicalReannotate(doc, { ...base, exclude: "C" });
+  assert.ok(!ex.renames.some((x) => x.from === "C4"), "Exclude references: C means C*");
+  const pre = P.geographicalReannotate(doc, { ...base, backPrefix: "B_", backStart: "100" });
+  assert.equal(pre.renames.find((x) => x.from === "R1").to, "B_R100", "a back prefix and start");
+  const front = P.geographicalReannotate(doc, { ...base, scope: "front", frontStart: "1" });
+  assert.ok(!front.renames.some((x) => x.from === "R1"), "Front only leaves the back side");
+  assert.equal(K.str(K.kid(node(r.changes.find((c) => c.id === "u-R2-10")), "property")[2]), "R1", "the Reference field is rewritten");
+});
+
+test("sweep9 board tools: duplicate board items, transform footprints, outline directions, ellipses, start_end_only, non-component pads", () => {
+  // Repair Board: two board-level items with one uuid (the file keeps both; the second waits in dupItems)
+  const txt = `(kicad_pcb (version 20260728) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (37 "F.SilkS" user))
+  (segment (start 0 0) (end 1 0) (width 0.25) (layer "F.Cu") (uuid "dup"))
+  (segment (start 0 1) (end 1 1) (width 0.25) (layer "F.Cu") (uuid "dup"))
+  (gr_line (start 0 2) (end 1 2) (stroke (width 0.1) (type default)) (layer "F.SilkS") (uuid "dup2"))
+  (gr_line (start 0 3) (end 1 3) (stroke (width 0.1) (type default)) (layer "F.SilkS") (uuid "dup2")))`;
+  const dd = K.parseDoc(txt, "kicad_pcb");
+  assert.equal(dd.dupItems.length, 2, "the second copies are kept aside");
+  assert.equal(K.kid(dd.items.get("dup").node, "start")[2], 0, "the first item keeps the id");
+  const rr = P.repairBoard(dd);
+  assert.equal(rr.duplicates, 2);
+  assert.deepEqual(rr.steps.map((s) => s.map((c) => c.kind)), [["REMOVED", "REMOVED"], ["ADDED", "ADDED", "ADDED", "ADDED"]], "the copies go in an op of their own, then come back");
+  const fresh = K.parseDoc(txt, "kicad_pcb");
+  for (const st of rr.steps) for (const c of st) K.applyChange(fresh, c, IU);
+  assert.equal(fresh.items.size, 4); assert.equal(fresh.dupItems.length, 0);
+  assert.equal(K.kid(fresh.items.get("dup").node, "start")[2], 0, "the first segment keeps dup");
+  assert.equal(P.repairBoard(fresh).duplicates, 0, "nothing left to repair");
+  const rmOne = K.parseDoc(txt, "kicad_pcb"); K.applyChange(rmOne, { id: "dup", kind: "REMOVED" }, IU);
+  assert.equal(K.kid(rmOne.items.get("dup").node, "start")[2], 1, "removing one of two leaves the other");
+
+  // Geographical Reannotate: footprints in KiCad 10's (transform …)
+  const tf = (ref, x, y, u, rot = 0) => `(footprint "T:R" (layer "F.Cu") (uuid "${u}") (transform (translate ${x} ${y}) (rotate ${rot}) (scale 1 1))
+    (property "Reference" "${ref}" (at 0 -1.5 ${rot}) (layer "F.SilkS") (uuid "p${u}") (effects (font (size 1 1) (thickness 0.15)))))`;
+  const td = K.parseDoc(`(kicad_pcb (version 20260728) (generator "pcbnew") (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+  ${tf("R1", 50, 10, "a")} ${tf("R2", 10, 10, "b")} ${tf("R3", 30, 10, "c")})`, "kicad_pcb");
+  const gbase = { sortCode: 0, useFootprintLocation: true, grid: 1.27, scope: "all", excludeLocked: false, exclude: "", frontStart: "1", backStart: "", frontPrefix: "", backPrefix: "", removeFrontPrefix: false, removeBackPrefix: false };
+  const g1 = P.geographicalReannotate(td, gbase);
+  assert.deepEqual(Object.fromEntries(g1.renames.map((x) => [x.from, x.to])), { R2: "R1", R3: "R2", R1: "R3" });
+  assert.ok(g1.report.some((l) => l.text === "1 R2 at 10.0000 mm, 10.0000 mm (rounded to 10.1600 mm, 10.1600 mm)"));
+  // Reference location through the transform's rotation: R1's reference sits 1.5 mm to the left of its origin (rotated 90)
+  const tr = K.parseDoc(`(kicad_pcb (version 20260728) (generator "pcbnew") (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+  ${tf("R1", 10, 10, "a", 90)})`, "kicad_pcb");
+  const g2 = P.geographicalReannotate(tr, { ...gbase, useFootprintLocation: false, grid: 0.001 });
+  assert.ok(g2.report.some((l) => l.text.startsWith("1 R1 at 8.5000 mm, 10.0000 mm")), "the field offset is rotated with the footprint");
+
+  // Cleanup Graphics: SEG::Angle counts the drawing direction (0..180)
+  const gl = (a, b, u) => `(gr_line (start ${a}) (end ${b}) (stroke (width 0.1) (type default)) (layer "Edge.Cuts") (uuid "${u}"))`;
+  const edge = (more) => K.parseDoc(`(kicad_pcb (version 20260728) (generator "pcbnew") (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (44 "Edge.Cuts" user) (37 "F.SilkS" user)) ${gl("0 0", "10 0", "a")} ${more})`, "kicad_pcb");
+  const rev = P.graphicsCleanup(edge(gl("20 5", "10.5 0", "b")), { fixBoardOutlines: true, tolerance: 2 }, false);
+  assert.equal(rev.changes.length, 1, "only the first line moves; the second already ends at the intersection");
+  assert.deepEqual(K.kid(node(rev.changes[0]), "end").slice(1), [10.5, 0]);
+  assert.equal(P.graphicsCleanup(edge(gl("10.5 0", "20 5", "b")), { fixBoardOutlines: true, tolerance: 2 }, false).changes.length, 0, "the same lines drawn onward meet at under 45 degrees: the gap stays");
+  // ellipses: zero radius, duplicates
+  const el = (u, a, b) => `(gr_ellipse (center 5 5) (major_radius ${a}) (minor_radius ${b}) (rotation_angle 0) (stroke (width 0.1) (type default)) (fill no) (layer "F.SilkS") (uuid "${u}"))`;
+  const ec = P.graphicsCleanup(edge(`${el("e1", 2, 0)} ${el("e2", 3, 1)} ${el("e3", 3, 1)}`), { deleteRedundant: true }, true);
+  assert.deepEqual(ec.items.map((i) => [i.text, i.ids[0]]), [["Remove zero-size graphic", "e1"], ["Remove duplicated graphic", "e3"]]);
+
+  // Remove Unused Pads: the padstack mode replaces start_end_only
+  const sv = K.parseDoc(`(kicad_pcb (version 20260728) (generator "pcbnew") (layers (0 "F.Cu" signal) (4 "In1.Cu" signal) (6 "In2.Cu" signal) (2 "B.Cu" signal))
+  (via (at 1 1) (size 0.8) (drill 0.4) (layers "F.Cu" "B.Cu") (start_end_only yes) (uuid "v1")))`, "kicad_pcb");
+  const rmv = node(P.unusedPadLayerChanges(sv, null, { vias: true, pads: false, remove: true, keepOutside: true })[0]);
+  assert.ok(!K.kid(rmv, "start_end_only")); assert.equal(K.kid(rmv, "keep_end_layers")[1], "yes");
+  const keep = P.unusedPadLayerChanges(sv, null, { vias: true, pads: false, remove: false, keepOutside: true });
+  assert.equal(keep.length, 1); assert.ok(!K.kid(node(keep[0]), "start_end_only"), "Restore All Layers is KEEP_ALL");
+
+  // Edit Teardrops: a non-component pad is an SMD pad; a transform footprint's pads find their teardrop zones
+  const tdd = K.parseDoc(`(kicad_pcb (version 20260728) (generator "pcbnew") (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+  (footprint "T:J" (layer "F.Cu") (uuid "fp-1") (transform (translate 10 10) (rotate 90) (scale 1 1))
+    (pad "1" non_component rect (at 2 0 90) (size 1 1) (layers "F.Cu") (net 1 "A") (uuid "pad-1") (teardrops (best_length_ratio 0.5) (max_length 1) (best_width_ratio 1) (max_width 2) (curved_edges no) (filter_ratio 0.9) (enabled yes) (allow_two_segments yes) (prefer_zone_connections yes))))
+  (zone (net 1) (net_name "A") (layer "F.Cu") (uuid "td-1") (attr (teardrop (type padvia))) (hatch full 0.1) (connect_pads yes (clearance 0)) (min_thickness 0.0254) (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))
+    (polygon (pts (xy 10 8.2) (xy 10.3 7) (xy 9.7 7)))))`, "kicad_pcb");
+  const tdr = P.teardropEditChanges(tdd, { vias: false, pthPads: false, smdPads: true, trackToTrack: false, action: "remove", defaults: { round: K.padModel.TD_DEFAULTS, rect: K.padModel.TD_DEFAULTS } });
+  assert.deepEqual(tdr.map((c) => c.id).sort(), ["fp-1", "td-1"], "the pad is in the SMD scope and its zone at (10, 8) goes");
+});
+
+test("shape geometry pages: each page reads the shape and writes it back (DIALOG_SHAPE_PROPERTIES GEOM_SYNCERs)", () => {
+  const near6 = (a, b) => assert.ok(Math.abs(a - b) < 1e-6, `${a} ≈ ${b}`);
+  const rect = { kind: "rect", start: [10, 20], end: [30, 25] };
+  const rp = P.geomPages("rect");
+  assert.deepEqual(rp.map((p) => p.title), ["By Corners", "By Corner and Size", "By Center and Size"]);
+  assert.deepEqual(rp[2].get(rect), { mx: 20, my: 22.5, w: 20, h: 5 });
+  assert.deepEqual(rp[2].set({ mx: 0, my: 0, w: 4, h: 2 }), { kind: "rect", start: [-2, -1], end: [2, 1] });
+  assert.equal(rp[0].validate({ sx: 1, sy: 1, ex: 1, ey: 1 }), "Rectangle cannot be zero-sized.");
+  const lp = P.geomPages("line"), line = { kind: "line", start: [0, 0], end: [0, -10] };
+  const pol = lp[1].get(line); near6(pol.len, 10); near6(pol.ang, 90);   // straight up the screen is +90
+  const back = lp[1].set({ px: 0, py: 0, len: 10, ang: 90 }); near6(back.end[0], 0); near6(back.end[1], -10);
+  assert.deepEqual(lp[2].set({ qx: 0, qy: 0, mx: 5, my: 5 }).end, [10, 10], "start and midpoint give the end");
+  const ap = P.geomPages("arc"), arc = { kind: "arc", start: [10, 0], mid: [0, 10], end: [-10, 0] };
+  const csa = ap[0].get(arc); near6(csa.cx, 0); near6(csa.cy, 0); near6(csa.ang, 180);
+  const craa = ap[2].get(arc); near6(craa.rad, 10); near6(craa.sa, 0); near6(craa.ea, 180);
+  const a2 = ap[2].set({ rcx: 0, rcy: 0, rad: 5, sa: 0, ea: 90 }); near6(a2.start[0], 5); near6(a2.end[1], 5); near6(a2.mid[0], 5 * Math.SQRT1_2);
+  assert.equal(ap[1].set({ sx2: 0, sy2: 0, mx: 1, my: 1, ex: 2, ey: 2 }), null, "collinear points keep the old arc");
+  const cp = P.geomPages("circle");
+  assert.deepEqual(cp[0].set({ cx: 1, cy: 2, r: 3 }), { kind: "circle", center: [1, 2], end: [4, 2] });
+  const n = K.parse('(gr_arc (start 10 0) (mid 0 10) (end -10 0) (stroke (width 0.1) (type default)) (layer "F.SilkS"))');
+  assert.deepEqual(P.shapeGeomOf(n), arc);
+  P.setShapeGeom(n, { kind: "arc", start: [-10, 0], mid: [0, -10], end: [10, 0] });
+  assert.deepEqual(K.kid(n, "start").slice(1), [-10, 0], "an arc keeps its stored winding");
+});

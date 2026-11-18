@@ -1,0 +1,391 @@
+/* theme.css — the one theme of Junction on the web.
+
+   Every page takes its look from this file: the app shell (static/app.html links it), the
+   server-rendered pages (src/pages.rs and src/auth.rs inline it), the GitHub page and the home
+   page (`{{THEME}}`), and the style guide at /styleguide, which shows everything below live.
+   The written guide is server/web/STYLE.md.
+
+   Two parts, split at the "components" marker below:
+     1. tokens      custom properties only: colour (light, system dark, explicit dark), type,
+                    spacing, radii, control heights, elevation, motion
+     2. components  the shared classes: .btn, .input, .pill, .box, the .kd-* dialog frame, …
+
+   Rules of the house:
+     - No colour literal outside this file's token blocks.  Canvas drawing (KiCad's layer and
+       schematic colours) is the one exception and lives in web/domains/pcb/canvas/colors.ts.
+     - Near-black and near-white chrome with one accent, ink: the primary button is a solid ink
+       fill, links, selection and focus are neutral.  No blue on chrome.  Red means F.Cu, an
+       error, or a destructive action, never "go".
+     - Radii stay small (3px controls, 6px windows), rules are 1px.  The one gradient on chrome
+       is the pane caption (paper to bench), as KiCad's docked panes have. */
+
+:root {
+  color-scheme: light dark;
+
+  /* ---- surfaces ---- */
+  --bench: #F4F4F5;      /* chrome: toolbars, sidebars, title bars */
+  --paper: #FAFAFA;      /* page and pane bodies, hover fill */
+  --panel: #FFFFFF;      /* inputs, menus, cards, raised surfaces */
+  --line: #E4E4E7;       /* 1px rules and control borders */
+  --line-2: #C8C8CE;     /* stronger rule, grid dots, hovered border */
+
+  /* ---- text ---- */
+  --ink: #111113;        /* primary */
+  --ink-2: #52525B;      /* secondary */
+  --ink-3: #71717A;      /* tertiary: captions, mono meta, placeholders */
+
+  /* ---- accent: ink.  The site is one colour; the canvas keeps KiCad's ---- */
+  --accent: #111113;     /* primary action fill */
+  --accent-2: #2E2E33;   /* its border, hover and pressed */
+  --on-accent: #FFFFFF;  /* text and icons on --accent, --copper and --err fills */
+  --blue: #3F3F46;       /* links, selection, focus ring, active tab */
+
+  /* ---- KiCad layer colours used as meaning ---- */
+  --copper: #C83434;     /* F.Cu, owner badge */
+  --copper-2: #A82B2B;
+  --teal: #006464;       /* values and references, editor badge */
+  --wire: #128A12;       /* live, ok */
+  --warn: #B87A00;       /* warning */
+  --warn-row: #FFF8D4;   /* a list row with a problem (CvPcb's missing footprint, symbols_listbox.cpp) */
+  --err: #D2181C;        /* error, destructive */
+  --err-2: #B01317;      /* destructive hover and pressed */
+  --silk: #F2EDA1;       /* silkscreen: labels drawn on the board canvas */
+  --canvas: #001023;     /* board background (KiCad's PCB editor) */
+  --sheet: #F5F4EF;      /* schematic background (KiCad's schematic editor) */
+  --mark: #FFB43A;       /* annotations on the canvas: comments, measure, peers without a colour */
+
+  /* ---- elevation ---- */
+  --shadow: 0 6px 20px #00000026;         /* menus, popovers, toasts */
+  --shadow-dialog: 0 18px 48px #00000047; /* dialogs and windows */
+  --scrim: #00000047;                     /* behind a modal dialog */
+
+  /* ---- type ---- */
+  --font: "IBM Plex Sans", -apple-system, "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --fs-2xs: 10px;        /* uppercase pane captions, badges */
+  --fs-xs: 11px;         /* mono meta, kbd, status bar */
+  --fs-sm: 12px;         /* dense editor chrome: panes, dialogs, small buttons */
+  --fs-base: 13px;       /* the app's body text and controls */
+  --fs-md: 14px;         /* page body text (GitHub, join, explore), dialog titles */
+  --fs-lg: 16px;         /* section headings */
+  --fs-xl: 20px;         /* page titles */
+  --fs-2xl: 28px;        /* the home page's display size starts here */
+
+  /* ---- spacing: a 4px scale ---- */
+  --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 24px; --s-6: 32px; --s-7: 48px;
+
+  /* ---- radii ---- */
+  --r-1: 2px;            /* badges, kbd */
+  --r-2: 3px;            /* buttons, inputs, menu items */
+  --r-3: 6px;            /* dialogs, cards, menus */
+  --r-sheet: 12px;       /* bottom sheets on narrow windows */
+
+  /* ---- control heights ---- */
+  --h-sm: 24px;          /* dense editor rows, small buttons */
+  --h-md: 28px;          /* buttons and inputs in the app */
+  --h-lg: 34px;          /* buttons and inputs on pages */
+  --h-touch: 40px;       /* everything on touch-sized windows */
+
+  /* ---- motion ---- */
+  --ease: cubic-bezier(.2, .7, .3, 1);
+  --dur-1: .12s;         /* hover, press */
+  --dur-2: .2s;          /* dialogs, menus, toasts */
+
+  /* ---- states derived from the above (opaque mixes, so they sit on any surface) ---- */
+  --on: color-mix(in srgb, var(--blue) 22%, var(--paper));        /* a pressed toggle */
+  --on-line: color-mix(in srgb, var(--blue) 60%, var(--line));    /* its border */
+  --sel: color-mix(in srgb, var(--blue) 25%, var(--paper));       /* selected row */
+  --sel-soft: color-mix(in srgb, var(--blue) 12%, var(--paper));  /* hovered row */
+  /* toolbar buttons (WX_AUI_TOOLBAR_ART::DrawButton): a 1px accent rectangle filled with the accent
+     lightened (ChangeLightness 170 hover/checked, 180 checked+hover, 150 pressed; dark 40, 50, 20) */
+  --tb-hover: color-mix(in srgb, var(--accent) 30%, #FFFFFF);
+  --tb-on-hover: color-mix(in srgb, var(--accent) 20%, #FFFFFF);
+  --tb-press: color-mix(in srgb, var(--accent) 50%, #FFFFFF);
+
+  /* ---- older names still used by inline styles; do not use in new code ---- */
+  --bg: var(--bench); --panel-2: var(--paper); --text: var(--ink); --muted: var(--ink-2);
+  --hot: var(--warn); --ok: var(--wire); --danger: var(--err);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bench: #111113; --paper: #18181B; --panel: #0B0B0C; --line: #27272A; --line-2: #3F3F46;
+    --ink: #FAFAFA; --ink-2: #A1A1AA; --ink-3: #85858E;
+    --accent: #FAFAFA; --accent-2: #D4D4D8; --on-accent: #0B0B0C; --blue: #D4D4D8;
+    --copper: #E05555; --copper-2: #C83434; --teal: #4FBDBD; --wire: #45C245;
+    --warn: #E5A800; --err: #F0464A; --err-2: #D2383C; --warn-row: #706020;
+    --shadow: 0 6px 20px #00000080; --shadow-dialog: 0 18px 48px #000000A6; --scrim: #00000080;
+    --tb-hover: color-mix(in srgb, var(--accent) 40%, #000000);
+    --tb-on-hover: color-mix(in srgb, var(--accent) 50%, #000000);
+    --tb-press: color-mix(in srgb, var(--accent) 20%, #000000);
+  }
+}
+:root[data-theme="dark"] {
+  --bench: #111113; --paper: #18181B; --panel: #0B0B0C; --line: #27272A; --line-2: #3F3F46;
+  --ink: #FAFAFA; --ink-2: #A1A1AA; --ink-3: #85858E;
+  --accent: #FAFAFA; --accent-2: #D4D4D8; --on-accent: #0B0B0C; --blue: #D4D4D8;
+  --copper: #E05555; --copper-2: #C83434; --teal: #4FBDBD; --wire: #45C245;
+  --warn: #E5A800; --err: #F0464A; --err-2: #D2383C; --warn-row: #706020;
+  --shadow: 0 6px 20px #00000080; --shadow-dialog: 0 18px 48px #000000A6; --scrim: #00000080;
+  --tb-hover: color-mix(in srgb, var(--accent) 40%, #000000);
+  --tb-on-hover: color-mix(in srgb, var(--accent) 50%, #000000);
+  --tb-press: color-mix(in srgb, var(--accent) 20%, #000000);
+}
+/* the mark (static/icon.svg) follows the system scheme on its own; these make an inlined copy follow
+   an explicit theme choice too */
+:root[data-theme="light"] .jn-t { fill: #111113; } :root[data-theme="light"] .jn-e { stroke: #fff; stroke-opacity: .18; }
+:root[data-theme="light"] .jn-w { stroke: #FAFAFA; } :root[data-theme="light"] .jn-d { fill: #FAFAFA; }
+:root[data-theme="dark"] .jn-t { fill: #FAFAFA; } :root[data-theme="dark"] .jn-e { stroke: #000; stroke-opacity: .12; }
+:root[data-theme="dark"] .jn-w { stroke: #111113; } :root[data-theme="dark"] .jn-d { fill: #111113; }
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-theme="light"] { color-scheme: light; }
+
+/* ==== components ==== */
+
+/* ---- base ---- */
+*, *::before, *::after { box-sizing: border-box; }
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:where(p) a:not([class]) { text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 2px; }
+/* in a layer: unlayered, this reset beat every layered rule (the Tailwind components and utilities) that colours a
+   button, e.g. the Plugin Manager's selected "All" chip drew its label in the chip's own colour */
+@layer base { button, input, select, textarea, k-select { font: inherit; color: inherit; } }
+button { cursor: pointer; }
+button:disabled { cursor: default; }
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+::selection { background: color-mix(in srgb, var(--blue) 35%, transparent); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--line); border-radius: 6px; border: 2px solid var(--bench); }
+::-webkit-scrollbar-thumb:hover { background: var(--line-2); }
+::placeholder { color: var(--ink-3); opacity: 1; }
+
+/* ---- buttons: .btn, with .primary (one per view), .danger, .ghost, and sizes .sm / .lg ---- */
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: var(--h-md);
+       padding: 4px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-2);
+       color: var(--ink); font: 500 var(--fs-base)/1.3 var(--font); white-space: nowrap; text-decoration: none;
+       cursor: pointer; transition: background-color var(--dur-1), border-color var(--dur-1); }
+.btn:hover { border-color: var(--line-2); background: var(--paper); text-decoration: none; }
+.btn:active { background: var(--bench); }
+.btn.primary { background: var(--accent); border-color: var(--accent-2); color: var(--on-accent); }
+.btn.primary:hover, .btn.primary:active { background: var(--accent-2); border-color: var(--accent-2); }
+.btn.danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, var(--line)); }
+.btn.danger:hover { background: color-mix(in srgb, var(--err) 9%, var(--panel)); border-color: var(--err); }
+.btn.danger.solid, .btn.hp-danger { background: var(--err); border-color: var(--err-2); color: var(--on-accent); }
+.btn.danger.solid:hover, .btn.hp-danger:hover { background: var(--err-2); border-color: var(--err-2); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--ink-2); }
+.btn.ghost:hover { background: var(--paper); border-color: var(--line); color: var(--ink); }
+.btn.on { background: var(--on); border-color: var(--on-line); }
+.btn.sm, .btn.small { min-height: var(--h-sm); padding: 2px 8px; font-size: var(--fs-sm); }
+.btn.lg { min-height: var(--h-lg); padding: 6px 16px; font-size: var(--fs-md); }
+.btn:disabled, .btn[aria-disabled="true"] { opacity: .5; cursor: default; pointer-events: none; }
+.btn svg { flex: none; }
+
+/* ---- text fields: .input on input, select and textarea ---- */
+.input { width: 100%; min-width: 0; min-height: var(--h-md); padding: 4px 8px; background: var(--panel);
+         border: 1px solid var(--line); border-radius: var(--r-2); color: var(--ink);
+         font: var(--fs-base)/1.3 var(--font); }
+.input:hover { border-color: var(--line-2); }
+.input:focus, .input:focus-visible { outline: 0; border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue); }
+.input.mono { font-family: var(--mono); font-size: var(--fs-sm); }
+.input.lg { min-height: var(--h-lg); padding: 6px 10px; font-size: var(--fs-md); }
+.input:disabled { opacity: .55; }
+.input.bad { border-color: var(--err); box-shadow: 0 0 0 1px var(--err); }
+textarea.input { resize: vertical; line-height: 1.45; }
+input[type="checkbox"], input[type="radio"], input[type="range"], progress { accent-color: var(--accent); }
+/* ---- .kslider: wxSlider (the Appearance pane's opacity sliders) drawn with the theme instead of the browser's range ---- */
+input[type="range"].kslider { -webkit-appearance: none; appearance: none; height: 14px; margin: 0; padding: 0; background: transparent; cursor: default; }
+input[type="range"].kslider:focus { outline: 0; }
+input[type="range"].kslider::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: var(--line); }
+input[type="range"].kslider::-moz-range-track { height: 4px; border-radius: 2px; background: var(--line); }
+input[type="range"].kslider::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--blue); }
+input[type="range"].kslider::-webkit-slider-thumb { -webkit-appearance: none; width: 10px; height: 12px; margin-top: -4px; border-radius: 2px;
+  background: var(--panel); border: 1px solid var(--line-2); box-sizing: border-box; }
+input[type="range"].kslider::-moz-range-thumb { width: 10px; height: 12px; border-radius: 2px; background: var(--panel); border: 1px solid var(--line-2); box-sizing: border-box; }
+input[type="range"].kslider:hover::-webkit-slider-thumb, input[type="range"].kslider:focus-visible::-webkit-slider-thumb { border-color: var(--blue); }
+input[type="range"].kslider:hover::-moz-range-thumb, input[type="range"].kslider:focus-visible::-moz-range-thumb { border-color: var(--blue); }
+/* ---- drop-downs: <k-select> (web/shared/components/kselect.ts) in place of the browser's <select> ----
+   The closed control is the element itself (a field like .input, dense by default); its list is a .ksel-pop
+   on <body>, so no pane or dialog clips it.  size > 1 draws the list in place (a wxListBox). */
+k-select { display: inline-flex; align-items: center; box-sizing: border-box; min-width: 0; max-width: 100%;
+           height: var(--h-sm); padding: 0 5px 0 6px; vertical-align: middle; background: var(--panel);
+           border: 1px solid var(--line); border-radius: var(--r-2); color: var(--ink); cursor: default;
+           user-select: none; -webkit-user-select: none; }
+k-select:hover { border-color: var(--line-2); }
+k-select:focus-within { outline: 0; border-color: var(--blue); }
+k-select[disabled] { opacity: .55; pointer-events: none; }
+k-select[size]:not([size="0"]):not([size="1"]) { display: flex; flex-direction: column; align-items: stretch; height: auto; padding: 0; }
+k-select.input { min-height: var(--h-md); height: auto; }
+.ksel-pop { position: fixed; z-index: 20000; box-sizing: border-box; overflow-x: hidden; overflow-y: auto; padding: 3px 0;
+            background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: var(--r-3);
+            box-shadow: var(--shadow); user-select: none; -webkit-user-select: none; }
+.ksel-opt { padding: 3px 10px; white-space: nowrap; cursor: default; line-height: 1.35; }
+.ksel-opt.ic { display: flex; align-items: center; gap: 5px; }
+.ksel-opt.on { background: var(--sel); }
+.ksel-opt.hi { background: var(--accent); color: var(--on-accent); }
+.ksel-opt.dis { color: var(--ink-3); }
+.ksel-sep { height: 1px; margin: 4px 2px; background: var(--line); }
+.ksel-head { padding: 4px 10px 2px; color: var(--ink-2); font-weight: 600; white-space: nowrap; }
+.ksel-opt.ind { padding-left: 20px; }
+/* FILTER_COMBOBOX's popup (components/kcombo.ts): a "Filter:" label and entry over the list, which scrolls alone */
+.ksel-pop.kcombo-pop { display: flex; flex-direction: column; overflow: hidden; padding: 2px; }
+.kcombo-flabel { padding: 0 2px 1px; color: var(--ink-2); white-space: nowrap; }
+.kcombo-filter.input { min-height: var(--h-sm); padding: 2px 6px; flex: none; }
+.kcombo-list { margin-top: 2px; overflow-x: hidden; overflow-y: auto; min-height: 0; flex: 1 1 auto; }
+/* wxDatePickerCtrl (components/kdate.ts): an entry and drop-down button, the popup a month calendar */
+.kdate { display: inline-flex; gap: 2px; align-items: stretch; min-width: 0; flex: 0 1 auto; }
+.kdate .kdate-entry { width: 92px; min-width: 0; flex: 1 1 auto; font-variant-numeric: tabular-nums; }
+.kdate .kdate-btn { padding: 0 5px; flex: none; display: flex; align-items: center; }
+.ksel-pop.kdate-pop { padding: 6px; }
+.kdate-bar { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 4px; }
+.kdate-title { font-weight: 600; flex: 1; text-align: center; }
+.kdate-nav.btn { padding: 0 6px; display: flex; align-items: center; }
+.kdate-grid { display: grid; grid-template-columns: repeat(7, 28px); gap: 1px; text-align: center; font-variant-numeric: tabular-nums; }
+.kdate-dow { color: var(--ink-2); font-size: 11px; padding: 2px 0; }
+.kdate-day { padding: 3px 0; border-radius: var(--r-1); cursor: default; border: 1px solid transparent; }
+.kdate-day:hover { background: var(--sel); }
+.kdate-day.out { color: var(--ink-3); }
+.kdate-day.today { border-color: var(--line-2); }
+.kdate-day.on { background: var(--sel); font-weight: 600; }
+.kdate-day.hi { background: var(--accent); color: var(--on-accent); }
+
+/* ---- menus cut to the window (web/shared/menufit.ts): they scroll, with arrow strips at the ends in place of a scroll
+        bar, as native menus do (macOS, Windows and GTK menus alike); resting the pointer on a strip scrolls the
+        menu.  A combo box's list gets them only on a Mac (an NSPopUpButton's menu); elsewhere it is never
+        .kmenu-cut and keeps its scroll bar, like a wxChoice's list ---- */
+.kmenu-cut { scrollbar-width: none; scroll-padding-block: 18px; }
+.kmenu-cut::-webkit-scrollbar { display: none; }
+.kmenu-arrow { position: fixed; display: none; align-items: center; justify-content: center; box-sizing: border-box;
+               background: var(--panel); color: var(--ink-2); pointer-events: none; }
+.kmenu-arrow.on { display: flex; }
+
+/* ---- badges: .pill, coloured by role or state ---- */
+.pill { display: inline-block; padding: 0 6px; border: 1px solid var(--line); border-radius: var(--r-1);
+              color: var(--ink-2); font: 500 var(--fs-2xs)/1.6 var(--mono); text-transform: uppercase;
+              letter-spacing: .06em; white-space: nowrap; }
+.pill.owner { border-color: var(--copper); color: var(--copper); }
+.pill.editor { border-color: var(--teal); color: var(--teal); }
+.pill.commenter { border-color: var(--blue); color: var(--blue); }
+.pill.info { border-color: var(--blue); color: var(--blue); }
+.pill.ok { border-color: var(--wire); color: var(--wire); }
+.pill.warn { border-color: var(--warn); color: var(--warn); }
+.pill.err { border-color: var(--err); color: var(--err); }
+
+/* ---- keys ---- */
+.kbd { display: inline-block; min-width: 18px; padding: 0 5px; border: 1px solid var(--line); border-bottom-width: 2px;
+            border-radius: var(--r-1); background: var(--panel); color: var(--ink-2);
+            font: var(--fs-xs)/1.5 var(--mono); text-align: center; }
+
+/* ---- a titled box: pages group their content in these ---- */
+.box { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-3); overflow: hidden; }
+.box > h2 { display: flex; align-items: center; gap: 8px; margin: 0; padding: 8px 14px; background: var(--bench);
+            border-bottom: 1px solid var(--line); font-size: var(--fs-base); font-weight: 600; }
+.box > .in { padding: 14px; }
+
+/* ---- small text helpers ---- */
+.muted { color: var(--ink-2); }
+.note { color: var(--ink-2); font-size: var(--fs-sm); margin: 6px 0; }
+.mono { font-family: var(--mono); }
+.empty { padding: 24px; border: 1px dashed var(--line); border-radius: var(--r-2); background: var(--panel);
+         color: var(--ink-2); text-align: center; }
+.row { display: flex; gap: 8px; align-items: center; }
+
+/* ---- the dialog frame (KiCad's property dialogs and every other window): overlay, title bar,
+        body, button row.  OK/primary sits rightmost, Cancel to its left. ---- */
+/* the overlay only blocks input to the frame behind a modal dialog: KiCad does not dim the parent window */
+.kd-overlay { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center;
+              background: transparent; }
+.kd-dialog { position: relative; display: flex; flex-direction: column; min-width: 420px; max-width: min(760px, 94vw); max-height: 90vh;
+             background: var(--bench); color: var(--ink); border: 1px solid var(--line); border-radius: var(--r-3);
+             box-shadow: var(--shadow-dialog); font: var(--fs-sm) var(--font); }
+.kd-title { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--paper);
+            border-bottom: 1px solid var(--line); border-radius: var(--r-3) var(--r-3) 0 0; font-weight: 600;
+            cursor: move; user-select: none; }
+.kd-title .kd-x { margin-left: auto; display: inline-flex; align-items: center; padding: 3px 4px; color: var(--ink-2); line-height: 1; cursor: pointer; }
+.kclose, .kmax { display: block; flex: none; pointer-events: none; }
+.kd-title .kd-x:hover { color: var(--ink); }
+.kd-body { padding: 10px 14px; overflow: auto; flex: 1 1 auto; min-height: 0; }
+/* wxRESIZE_BORDER's size grip: the dotted corner at the bottom right */
+.kd-grip { position: absolute; right: 1px; bottom: 1px; width: 12px; height: 12px; cursor: nwse-resize; touch-action: none;
+           background: radial-gradient(circle, var(--ink-2) 1px, transparent 1.3px) 0 0 / 4px 4px;
+           clip-path: polygon(100% 0, 100% 100%, 0 100%); opacity: .7; }
+.kd-grip:hover { opacity: 1; }
+.kd-body h3 { margin: 10px 0 6px; color: var(--ink-2); font-size: var(--fs-xs); letter-spacing: .04em; text-transform: uppercase; }
+.kd-body h3:first-child { margin-top: 0; }
+.kd-body .kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; align-items: center; }
+.kd-body .kv label { color: var(--ink-2); white-space: nowrap; }
+.kd-body input[type=text], .kd-body input[type=number], .kd-body select, .kd-body k-select, .kd-body textarea {
+  width: 100%; padding: 4px 6px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-2);
+  color: var(--ink); font-family: var(--mono); }
+.kd-body input[type=text]:focus, .kd-body input[type=number]:focus, .kd-body select:focus, .kd-body k-select:focus-within, .kd-body textarea:focus {
+  outline: 0; border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue); }
+.kd-body .ro { color: var(--ink-2); font-family: var(--mono); }
+/* ---- the font choice (web/domains/pcb/dialogs/font-picker.ts): a combo box with a search and the names in their own fonts ---- */
+.kd-font { display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 4px 6px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--r-2); color: var(--ink); font-family: var(--mono); cursor: default;
+  user-select: none; box-sizing: border-box; }
+.kd-font:hover { border-color: var(--line-2); }
+.kd-font:focus, .kd-font[aria-expanded="true"] { outline: 0; border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue); }
+.kd-font[aria-disabled="true"] { opacity: .55; pointer-events: none; }
+.kd-font-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kd-font-chev { flex: none; color: var(--ink-2); font-size: 10px; }
+/* EDA_VIEW_SWITCHER (Ctrl+Tab / Shift+Tab on a board): a borderless stay-on-top box, its "View Preset Switcher"
+   caption and a borderless list, 5px margins (eda_view_switcher_base.cpp); rows padded as LIST_BOX_V/H_PADDING */
+.vsw { position: fixed; z-index: 95; box-sizing: border-box; padding: 5px; background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--r-3); box-shadow: var(--shadow); font: 400 var(--fs-base)/1.35 var(--font); }
+.vsw-title { padding: 0 0 5px; white-space: nowrap; }
+.vsw-list { display: flex; flex-direction: column; min-width: 120px; padding: 4px 0; background: var(--paper); }
+.vsw-row { padding: 4px 10px; white-space: nowrap; }
+.vsw-row.on { background: var(--accent); color: var(--on-accent); }
+.kd-font-pop { position: fixed; z-index: 90; display: flex; flex-direction: column; background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--r-2); box-shadow: var(--shadow);
+  color: var(--ink); font: var(--fs-base)/1.3 var(--font); overflow: hidden; }
+.kd-font-search { flex: none; margin: 6px; padding: 4px 6px; background: var(--paper); border: 1px solid var(--line);
+  border-radius: var(--r-2); color: var(--ink); font: inherit; }
+.kd-font-search:focus { outline: 0; border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue); }
+.kd-font-list { position: relative; flex: 1; min-height: 0; overflow-y: auto; border-top: 1px solid var(--line); }
+.kd-font-spacer { width: 1px; }
+.kd-font-row, .kd-font-head { position: absolute; left: 0; right: 0; height: 26px; display: flex; align-items: center;
+  padding: 0 10px; white-space: nowrap; overflow: hidden; }
+.kd-font-row { font-size: 14px; cursor: default; }
+.kd-font-row-name { overflow: hidden; text-overflow: ellipsis; }
+.kd-font-row.active { background: var(--sel-soft); }
+.kd-font-row.sel { background: var(--sel); }
+.kd-font-head { color: var(--ink-3); font-size: var(--fs-xs); letter-spacing: .04em; text-transform: uppercase; }
+.kd-font-foot { flex: none; min-height: 22px; padding: 3px 10px; border-top: 1px solid var(--line); color: var(--ink-2);
+  font-size: var(--fs-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kd-body .actions { display: flex; gap: 6px; grid-column: 1 / -1; }
+.kd-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 22px; }
+.kd-foot { display: flex; gap: 8px; justify-content: flex-end; padding: 10px 14px; border-top: 1px solid var(--line); }
+.kd-foot .spacer { flex: 1; }
+.kd-note { margin: 0 0 8px; color: var(--ink-2); font-size: var(--fs-xs); }
+
+@media (prefers-reduced-motion: reduce) {
+  .btn { transition: none; }
+}
+
+/* ---- callouts: a message in the flow of a page (.info is the default; .ok, .warn, .err) ---- */
+.callout { padding: 8px 12px; border-left: 3px solid var(--blue); border-radius: 0 var(--r-2) var(--r-2) 0;
+           background: color-mix(in srgb, var(--blue) 8%, transparent); color: var(--ink); font-size: var(--fs-base); }
+.callout.ok { border-color: var(--wire); background: color-mix(in srgb, var(--wire) 8%, transparent); }
+.callout.warn { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.callout.err { border-color: var(--err); background: color-mix(in srgb, var(--err) 8%, transparent); }
+.callout ul { margin: 4px 0 0; padding-left: 18px; }
+.callout p { margin: 6px 0 0; }
+
+/* ---- segmented control: a row of exclusive choices ---- */
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--r-2); overflow: hidden; }
+.seg button { min-height: calc(var(--h-md) - 2px); padding: 3px 12px; border: 0; background: var(--panel); color: var(--ink);
+              font: 500 var(--fs-base) var(--font); }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button:hover { background: var(--paper); }
+.seg button.on { background: var(--on); color: var(--ink); box-shadow: inset 0 -2px 0 var(--blue); }
+
+/* ---- busy spinner ---- */
+.spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid currentColor; border-right-color: transparent;
+        border-radius: 50%; animation: kc-spin .7s linear infinite; }
+@keyframes kc-spin { to { transform: rotate(360deg); } }
+
+/* A button inside a dialog body that carries no class of its own is still a small theme button. */
+.kd-body button:not([class]) { min-height: var(--h-sm); padding: 2px 8px; background: var(--panel); border: 1px solid var(--line);
+                               border-radius: var(--r-2); color: var(--ink); font: 500 var(--fs-sm)/1.3 var(--font); }
+.kd-body button:not([class]):hover { border-color: var(--line-2); background: var(--paper); }
+.kd-body button:not([class]):disabled { opacity: .5; }

@@ -1,0 +1,73 @@
+/* chat.css — the project chat: the Chat pane (components/panes/Chat.tsx), the menu bar's Chat button and the
+   cursor-chat bubble (web/domains/pcb/editor/chat.ts).  Plain rules on the theme's tokens (static/theme.css). */
+
+.chat-pane { padding: 0; }
+.chat-here { display: flex; align-items: center; gap: 4px; flex: none; padding: 4px 8px; border-bottom: 1px solid var(--line); background: var(--bench); color: var(--ink-3); font-size: var(--fs-xs); }
+.chat-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; box-shadow: 0 0 0 1px var(--panel); }
+.chat-here-n { margin-left: 4px; }
+.chat-tip { font-family: var(--mono); font-size: var(--fs-2xs); color: var(--ink-3); white-space: nowrap; }
+
+.chat-list { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 6px 4px 6px 8px; }
+.chat-older { display: block; margin: 2px auto 8px; }
+.chat-list .note { color: var(--ink-3); padding: 8px 4px; }
+
+.chat-msg { position: relative; display: flex; gap: 8px; padding: 1px 4px 1px 0; border-radius: var(--r-2); }
+.chat-msg.head { margin-top: 8px; }
+.chat-msg:hover { background: var(--bench); }
+.chat-msg.pending { opacity: .55; }
+.chat-av, .chat-av-gap { flex: none; width: 22px; height: 22px; }
+.chat-av { display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; color: #fff; font-size: var(--fs-xs); font-weight: 600; object-fit: cover; margin-top: 2px; }
+.chat-main { flex: 1 1 auto; min-width: 0; }
+.chat-meta { display: flex; align-items: baseline; gap: 6px; line-height: 1.4; }
+.chat-meta b { color: var(--ink); font-weight: 600; }
+.chat-meta span { color: var(--ink-3); font-size: var(--fs-xs); }
+.chat-text { color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
+.chat-text a { color: var(--blue); text-decoration: underline; }
+.chat-edited { color: var(--ink-3); font-size: var(--fs-xs); }
+.chat-edit textarea { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; }
+.chat-edit .row { display: flex; gap: 6px; margin-top: 4px; }
+
+.chat-acts { position: absolute; top: -8px; right: 4px; display: none; gap: 2px; padding: 1px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-2); box-shadow: var(--shadow); }
+.chat-msg:hover .chat-acts, .chat-msg:focus-within .chat-acts { display: inline-flex; }
+.chat-acts button { border: 0; background: transparent; color: var(--ink-2); font-size: var(--fs-xs); padding: 1px 6px; border-radius: var(--r-1); cursor: pointer; }
+.chat-acts button:hover { background: var(--bench); color: var(--ink); }
+.chat-acts button[data-chat-delete]:hover { background: var(--err); color: var(--on-accent); }
+
+.chat-new { display: flex; align-items: center; gap: 6px; margin: 10px 0 2px; color: var(--copper); font-size: var(--fs-2xs); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.chat-new::before, .chat-new::after { content: ""; flex: 1; height: 1px; background: var(--copper); opacity: .5; }
+
+/* a link to a place in the design: the same chip as a comment's anchor */
+.chat-link { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; margin-top: 3px; padding: 1px 7px 1px 5px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); color: var(--ink-2); font: 500 var(--fs-xs) var(--font); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+button.chat-link:hover { border-color: var(--ink-3); color: var(--ink); }
+.chat-link i { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--mark); }
+.chat-link.net i { background: var(--wire); }
+.chat-link.spot i { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink-3); }
+
+.chat-compose { flex: none; padding: 6px 8px 8px; border-top: 1px solid var(--line); background: var(--bench); }
+.chat-attached { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; }
+.chat-attached .chat-link { margin-top: 0; cursor: default; }
+.chat-attached .kx { border: 0; background: transparent; color: var(--ink-3); cursor: pointer; font-size: var(--fs-md); line-height: 1; padding: 0 4px; }
+.chat-row { display: flex; align-items: flex-end; gap: 4px; }
+.chat-input { flex: 1 1 auto; min-width: 0; min-height: var(--h-sm); max-height: 120px; resize: none; padding: 4px 6px; font: inherit; line-height: 1.35; field-sizing: content; }
+.chat-pin { flex: none; width: var(--h-sm); height: var(--h-sm); display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 1px solid var(--line); border-radius: var(--r-2); background: var(--panel); color: var(--ink-2); cursor: pointer; }
+.chat-pin svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.4; }
+.chat-pin:hover { border-color: var(--ink-3); color: var(--ink); }
+.chat-pin.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.chat-pin:disabled { opacity: .5; cursor: default; }
+
+/* the menu bar's Chat button, beside AI */
+.chat-btn { position: relative; display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px; margin-right: 6px; border: 1px solid var(--line); border-radius: var(--r-2); background: var(--panel); color: var(--ink); font: 500 var(--fs-sm) var(--font); cursor: pointer; flex: none; }
+.chat-btn:hover { border-color: var(--ink-3); }
+.chat-btn[aria-pressed="true"] { background: var(--bench); border-color: var(--ink-3); }
+.chat-btn svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linejoin: round; }
+.chat-btn .badge { min-width: 16px; height: 16px; padding: 0 4px; box-sizing: border-box; border-radius: 8px; background: var(--copper); color: var(--on-accent); font: 600 var(--fs-2xs)/16px var(--font); text-align: center; }
+
+/* cursor chat: the bubble you type in, at the pointer (the canvas shows it to everyone beside your cursor) */
+.cursor-chat { position: absolute; z-index: 30; display: flex; flex-direction: column; gap: 2px; padding: 4px; border-radius: 14px 14px 14px 3px; background: var(--mark); box-shadow: var(--shadow); }
+.cursor-chat input { width: 220px; height: 24px; padding: 0 8px; border: 0; border-radius: 10px; background: #ffffffe6; color: #111113; font: 500 var(--fs-base) var(--font); outline: none; }
+.cursor-chat .hint { padding: 0 8px; color: #111113b3; font: 400 var(--fs-2xs) var(--font); }
+
+/* following a link: an outline that pulses round what was linked (chat.ts flash), in the annotation colour */
+.chat-flash { fill: none; stroke: var(--mark); animation: chat-flash 0.9s ease-in-out 5; }
+.chat-flash-label { fill: var(--mark); font-family: var(--font); font-weight: 600; paint-order: stroke; stroke: #000a; stroke-width: 0.15; }
+@keyframes chat-flash { 0%, 100% { stroke-opacity: 1; } 50% { stroke-opacity: 0.25; } }

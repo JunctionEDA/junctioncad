@@ -1,0 +1,840 @@
+// editor — GENERATED SOURCE MODULE (split from the former static/app.js; static/dist/editor.js is the esbuild output of web/domains/pcb/editor/index.ts — edit these modules, not the bundle).
+import { KICAD_LAYERS, SCH_LAYERS, setStatusBar, setToggle, state, store } from "./appstore";
+import { centerOn, closeThread, drawComments, loadComments, renderThreads } from "./comments";
+import { leaveCursorChat, loadChat } from "./chat";
+import { loadProposals } from "./proposals";
+import { $ } from "./dom";
+import { pruneSelection, resetInteraction } from "./gestures";
+import { loadHistory } from "./history";
+import { dropHistoryView } from "./versions";
+import { navigate, showView } from "./home";
+import { connect, requestResync, setConn } from "./net";
+import { setupEditorChrome, storedAngleSnap } from "./panes";
+import { renderPeers, stopPresenceKeepalive } from "./peers";
+import { clearPeerCursors } from "./peercursors";
+import { drawSelection, renderProps } from "./selection";
+import { E } from "./state";
+import { applyDrawingSheet } from "./drawingsheet";
+import { activeModule, bindUndoDoc, renderModuleTools, toolCtx } from "./tools";
+import { api, toast } from "./util";
+import { notePreviewDirty } from "./thumbpush";
+import { releaseLayers } from "./paint";
+import { applyVariantToDoc, refreshVariantNames } from "./variant";
+import { fpEntryFor, fpParam, isFpPrivate, isFpReadOnlyLib, onFootprintOpened, privateText } from "./fpedit";
+import { editorDocs, firstDoc, rootSchematicOf, topLevelSheetsOf, type TopLevelSheet } from "./bootpick";
+import { closeHostedDoc, isHostedDoc, openHostedDoc } from "./dochost";
+import { bindPcb, boundPcb, installPathScope, unbindPcb, viewOf } from "./pcbscope";
+import { HOME_TAB, pcbOfDoc, pcbsOf, type Pcb } from "../../../platform/doctabs/pcbs";
+import { ensurePcbTools, noteBoardOpened, preloadPcbToolsWhenIdle } from "./pcbtools-loader";
+import type { Boot } from "./boot";
+import type { DocEntry, ProjectInfo } from "../../../shared/store";
+import type { GridDef } from "../../../shared/units";
+import type { ItemSummary, SheetEntry, SvgLayer, WireChange } from "./types";
+import { applyView, base, canvas, cmtG, cmtPanel, dragG, fitView, isSch, overlay, peersG, requestRender, selG, stage, world } from "./view";
+import { fontsForProject } from "./fonts";
+export const docNav = { list: [] as string[], idx: -1, lock: false };
+
+
+/** Each editor's grids in KiCad's list order (Preferences > Grids, dialogs/prefs.ts fills them in from the saved settings). */
+export const GRID_CHOICES: Record<string, GridDef[]> = { kicad_sch: [2.54, 1.27, 0.635, 0.254].map((mm) => ({ mm, name: "" })), kicad_pcb: [1.27, 0.635, 0.5, 0.25, 0.1].map((mm) => ({ mm, name: "" })), footprint: [1.27, 0.635, 0.5, 0.25, 0.1].map((mm) => ({ mm, name: "" })) };
+/** Which grid list the open document uses: the schematic's, the board's, or the Footprint Editor's own window settings. */
+export function gridListKey(): string { return isSch() ? "kicad_sch" : E.DOC_TYPE === "footprint" ? "footprint" : "kicad_pcb"; }
+/** The grids of the open document (the board's for the Footprint Editor too). */
+export function gridList(): GridDef[] { return GRID_CHOICES[gridListKey()] || []; }
+
+export function syncItemsFromDoc() {
+  if (!E.kdoc) return;
+  const mv = KiCadCanvas.movableItems(E.kdoc);
+  E.items = mv.filter((m) => m.kind !== "sheet").map((m) => ({ id: m.id, ref: m.ref, value: m.value, lib: m.lib, layer: m.layer, x: Math.round(m.x * E.IU), y: Math.round(m.y * E.IU), rot: m.rot, bbox: m.bbox }));
+  E.sheets = mv.filter((m) => m.kind === "sheet").map((m) => ({ id: m.id, name: m.name, file: m.file, page: m.page, x: m.x * E.IU, y: m.y * E.IU, w: m.w! * E.IU, h: m.h! * E.IU }));
+  // Remember what this sheet calls its children and what page number it gives them: a child .kicad_sch
+  // carries neither (its ${SHEETPATH} name and its ${#} both live in the parent's (sheet …) node), and
+  // KiCad reads them off the sheet path / SCH_SCREEN::GetPageNumber() rather than out of the child file.
+  const dir = state.doc ? state.doc.path.split("/").slice(0, -1).join("/") : "";
+  for (const sh of E.sheets) {
+    if (!sh.file) continue;
+    const path = dir ? `${dir}/${sh.file}` : sh.file;
+    if (sh.name) sheetNames.set(path, sh.name);
+    if (sh.page) sheetPages.set(path, sh.page);
+  }
+  if (E.selected) E.selected = E.items.find((f: ItemSummary) => f.id === E.selected.id) || E.sheets.find((sh: SheetEntry) => sh.id === E.selected.id) || null;   // a selected sheet stays selected
+  renderObjects();
+}
+
+/**
+ * The drawing sheet's identity for the open document — what eeschema hands DS_PROXY_VIEW_ITEM
+ * (eeschema/sch_view.cpp:131-138, pcbnew/pcb_edit_frame.cpp:927-953) so the title block can
+ * resolve ${FILENAME}, ${SHEETPATH}, ${#} and ${##}.  The title-block fields, the paper name and
+ * the root sheet's own page number come out of the file itself (canvas/doc.ts).
+ *
+ * ${SHEETPATH} is SCH_SHEET_PATH::PathHumanReadable(): "/" on the root sheet, "/<sheet name>/"
+ * one level down.  A sheet reached through the hierarchy carries the name its parent gave it
+ * (E.sheets, remembered in sheetNames); opened cold by URL, the file's own stem is the best the
+ * browser has.  A board has no sheet path at all — EDA_DRAW_FRAME::GetFullScreenDesc returns
+ * empty for pcbnew, so KiCad's board title block reads "Sheet: ".
+ */
+export const sheetNames = new Map<string, string>();
+   // sheet file path -> the Sheetname its parent gives it
+export const sheetPages = new Map<string, string>();
+   // sheet file path -> the (page "N") its parent's (sheet … (instances …)) gives it
+
+/** The root sheet's own name: SCH_SHEET_FILE's loader calls it "Root" (eeschema/files-io.cpp:383). */
+export const ROOT_SHEET_NAME = "Root";
+
+/**
+ * The project's text variables — the .kicad_pro's `text_variables` object, which is PROJECT's own
+ * resolver and BuildFullText's last fallback (ds_painter.cpp:222-223).  Null until the file lands.
+ */
+export function projectTextVars(): Record<string, string> | null {
+  if (!E.proSettings) return null;
+  try { const j = JSON.parse(E.proSettings); const v = j && j.text_variables; return v && typeof v === "object" && Object.keys(v).length ? v : null; }
+  catch (e) { return null; }
+}
+
+/**
+ * Harvest the top-level sheets' (sheet …) nodes once per project, so a subsheet opened cold by URL —
+ * with no parent ever on screen — still knows the Sheetname and the (page "N") its parent gives it.
+ * eeschema always has the whole hierarchy loaded; the browser has one file at a time, so this is the
+ * one extra read (one per top-level sheet) that makes ${SHEETPATH} and ${#} agree with the desktop.
+ */
+let hierarchyLearned: string | null = null;
+/** sheet file path -> SCH_SHEET_PATH::PathHumanReadable() of its first instance, when the schematic has several
+ *  top-level sheets ("/<top-level name>/", "/<top-level name>/<sheet name>/") */
+export const sheetHumanPaths = new Map<string, string>();
+export async function learnHierarchy() {
+  const pid = state.project ? state.project.projectId : null;
+  const tops = pid ? topLevelSchematics() : [];
+  if (!tops.length || hierarchyLearned === pid) return;
+  hierarchyLearned = pid;
+  const multi = tops.length > 1;
+  sheetHumanPaths.clear();
+  if (multi) for (const t of tops) sheetHumanPaths.set(t.doc.path, "/" + t.name + "/");
+  await Promise.all(tops.map(async (t) => {
+    try {
+      const r = await fetch(`/api/docs/${t.doc.docId}/content`);
+      if (!r.ok) return;
+      const d = KiCadCanvas.parseDoc(await r.text(), "kicad_sch");
+      const dir = t.doc.path.split("/").slice(0, -1).join("/");
+      for (const m of KiCadCanvas.movableItems(d)) {
+        if (m.kind !== "sheet" || !m.file) continue;
+        const path = dir ? `${dir}/${m.file}` : m.file;
+        if (m.name && !sheetNames.has(path)) sheetNames.set(path, m.name);
+        if (m.page && !sheetPages.has(path)) sheetPages.set(path, m.page);
+        if (multi && !sheetHumanPaths.has(path)) sheetHumanPaths.set(path, "/" + t.name + "/" + (m.name || m.file.replace(/\.kicad_sch$/, "")) + "/");
+      }
+    } catch (e) { /* unreadable sheet: fall back to the file's own stem and page number */ }
+  }));
+}
+
+/** The title block's text variables the document resolves (${FILENAME}, ${SHEETNAME}, ${#}, ${##}, project variables). */
+type SheetContextDoc = KDoc & { fileName?: string; filePath?: string; projectName?: string; projectVars?: unknown; sheetName?: string; sheetPath?: string; sheetCount?: number; pageNumber?: string };
+export function applySheetContext(d: SheetContextDoc) {
+  const doc = state.doc;
+  d.fileName = doc ? doc.path.split("/").pop() : "";
+  d.filePath = doc ? doc.path : "";
+  d.projectName = state.project ? state.project.name : "";
+  d.projectVars = projectTextVars();
+  applyDrawingSheet(d as KDoc & { drawingSheet?: unknown });
+  if (d.type !== "sch") { d.sheetName = ""; d.sheetPath = ""; d.sheetCount = 1; return; }
+  const sch = state.docs!.filter((x) => x.docType === "kicad_sch");
+  d.sheetCount = sch.length || 1;
+  const tops = state.project ? topLevelSchematics() : [];
+  const top = doc ? tops.find((t) => t.doc.docId === doc.docId) : undefined;
+  if (tops.length > 1 && top) {
+    // one of several top-level sheets: its name is the project file's, and it is in the path (PathHumanReadable)
+    d.sheetName = top.name; d.sheetPath = "/" + top.name + "/"; return;
+  }
+  if (!doc || (tops[0] && tops[0].doc.docId === doc.docId)) { d.sheetName = ROOT_SHEET_NAME; d.sheetPath = "/"; return; }
+  const name = sheetNames.get(doc.path) || d.fileName!.replace(/\.kicad_sch$/, "");
+  d.sheetName = name; d.sheetPath = (tops.length > 1 && sheetHumanPaths.get(doc.path)) || "/" + name + "/";
+  // ${#} comes from SCH_SCREEN::GetPageNumber(), which the parent's instance data fills in; the
+  // child's own (sheet_instances …) — if it even has one — is not what eeschema shows.
+  const page = sheetPages.get(doc.path);
+  if (page) d.pageNumber = page;
+}
+
+
+/** The edits made to a document after `seq`, as one list of changes, and the seq of the last of them.  Null when they cannot be read (a guest). */
+async function editsSince(docId: string, seq: number): Promise<{ changes: WireChange[]; head: number } | null> {
+  try {
+    const r = await fetch(`/api/docs/${docId}/ops?since=${seq}`);
+    if (!r.ok) return null;
+    const j = await r.json() as { head: number; ops: { seq: number; changes: WireChange[] }[] };
+    const changes: WireChange[] = []; for (const op of j.ops || []) for (const c of op.changes || []) changes.push(c);
+    return { changes, head: Number(j.head) || seq };
+  } catch (e) { return null; }
+}
+
+/**
+ * Show the document `text` holds.  `then` are edits made after that text was stored (the join's thenOps, or
+ * the ones openDoc fetched): they go into the document before anything is derived from it or drawn, all in
+ * one go, however many there are.
+ */
+export function setDocFromText(text: string, then?: WireChange[] | null) {
+  let d: KDoc;
+  try { d = KiCadCanvas.parseDoc(text, E.DOC_TYPE); } catch (e) { console.warn("document parse failed", e); return false; }
+  applySheetContext(d);
+  cancelRemoteFlush();
+  // the board's (variants …) header section (the toolbar's variant list) and the session's current variant
+  if (d.type === "pcb") { try { (d as KDoc & { variantsNode?: SNode | null }).variantsNode = (KiCadCanvas as unknown as { boardSetup: { boardHeader(t: string): { variants?: SNode | null } } }).boardSetup.boardHeader(text).variants || null; } catch (e) { /* none */ } }
+  E.kdoc = d; E.vbPerMm = 1; notePreviewDirty();
+  applyVariantToDoc(d); refreshVariantNames();
+  if (then && then.length) { mutateDoc(then); if (!isSch()) KiCadCanvas.computeBBox(E.kdoc); }
+  if (isSch()) E.vb = [0, 0, E.kdoc.page[0], E.kdoc.page[1]];
+  else { const b = E.kdoc.bbox, m = 5; E.vb = [b[0] - m, b[1] - m, (b[2] - b[0]) + 2 * m, (b[3] - b[1]) + 2 * m]; }
+  base.replaceChildren(); base.setAttribute("viewBox", E.vb.join(" ")); overlay.setAttribute("viewBox", E.vb.join(" "));
+  $("#ovRoot").setAttribute("transform", "scale(1)");
+  // FOOTPRINT_EDIT_FRAME (makeFpHolderBoard, the constructor): GetBoard()->SetVisibleAlls(), every layer shown
+  if (!E.layersSeeded) { E.hiddenLayers = new Set(isSch() || E.kdoc.fpEditor ? [] : Array.from(KiCadCanvas.PCB_HIDDEN_DEFAULT)); E.layersSeeded = true; }
+  renderLayersFromDoc(); syncItemsFromDoc(); renderModuleTools(); bumpDoc();
+  const m = activeModule(); if (m && m.onDocChanged) { try { m.onDocChanged(toolCtx()); } catch (e) { console.warn(e); } }
+  canvas.style.display = "block"; requestRender();
+  return true;
+}
+
+export const layerRow = (l: { key: string; name: string; color: string; count: number }) => ({ key: l.key, name: l.name, color: l.color, count: l.count });
+
+export function renderLayersFromDoc() {
+  const list = KiCadCanvas.layerList(E.kdoc);
+  const cu = isSch() ? [] : list.filter((l) => /\.Cu$/.test(l.name));
+  if (!isSch()) { if (!cu.some((l) => l.name === E.activeLayer) && !(E.kdoc.layers && E.kdoc.layers.has(E.activeLayer))) E.activeLayer = cu[0] ? cu[0].name : ""; E.renderOpts.activeLayer = E.activeLayer; }   // any enabled layer can be the active one
+  store.slice("document", { layers: list.map(layerRow), hiddenLayers: Array.from(E.hiddenLayers), copperLayers: cu.map(layerRow), notice: null, hasDoc: true });
+  store.slice("viewport", { activeLayer: E.activeLayer });
+}
+
+export function setActiveLayer(name: string) {
+  E.activeLayer = name; E.renderOpts.activeLayer = E.activeLayer; store.slice("viewport", { activeLayer: E.activeLayer });
+  if (CollabTools.pcb && CollabTools.pcb.setLayer) { try { CollabTools.pcb.setLayer(toolCtx(), E.activeLayer); } catch (e) { /* module without layer API */ } }
+  requestRender();
+}
+
+export function setLayerVisible(key: string, visible: boolean) {
+  if (E.kdoc) { if (visible) E.hiddenLayers.delete(key); else E.hiddenLayers.add(key); store.slice("document", { hiddenLayers: Array.from(E.hiddenLayers) }); requestRender(); return; }
+  const l: SvgLayer | undefined = E.layers[key]; if (!l) return;                       // the desktop-pushed SVG render: toggle its nodes
+  l.visible = visible; for (const n of l.nodes) n.style.display = visible ? "" : "none";
+  renderLayers();
+}
+
+/** Every applied change bumps the document version (the Properties island re-reads on it). */
+export function bumpDoc() { notePreviewDirty(); store.slice("document", { version: store.get().document.version + 1 }); if (E.comments.length) drawComments(); }   // pins follow the items they are on
+
+/** Put the changes into the document.  True when it changed; what follows from that is afterDocChange(). */
+function mutateDoc(changes: WireChange[] | null | undefined): boolean {
+  if (!E.kdoc) return false;
+  let any = false, dropped: WireChange | null = null;
+  for (const c of changes || []) {
+    // a document-level change (Page Settings: paper and title block) addresses no item — web/domains/pcb/dialogs/project.ts
+    if (c && c.docProps) { if (KiCadCanvas.applyDocProps(E.kdoc, c.docProps)) { any = true; if (isSch()) { E.vb = [0, 0, E.kdoc.page[0], E.kdoc.page[1]]; base.setAttribute("viewBox", E.vb.join(" ")); overlay.setAttribute("viewBox", E.vb.join(" ")); applyView(); } } continue; }
+    if (c && c.typeName === "BOARD_SETUP") { if (KiCadCanvas.boardSetup && KiCadCanvas.boardSetup.applyBoardSetup(E.kdoc, c)) { any = true; renderLayersFromDoc(); refreshVariantNames(); applyVariantToDoc(E.kdoc); } continue; }   // board-level sections (canvas/board-setup.ts)
+    let ok = false;
+    try { ok = KiCadCanvas.applyChange(E.kdoc, c, E.IU); } catch (e) { console.warn("change not applied", e); }
+    if (ok) { any = true; continue; }
+    // A REMOVED (or a property edit) for an item we never had is a legitimate no-op — delete
+    // beats concurrent modify.  A fragment we could not take is not: the two views have just
+    // diverged, and the old code discarded that fact entirely.
+    if (c.sexpr || c.itemSexpr || String(c.kind).toUpperCase() === "ADDED") dropped = c;
+  }
+  if (dropped) noteDroppedChange(dropped);
+  return any;
+}
+
+
+/** Everything that follows a changed document: the item lists, the selection, the panels, the tools' caches, a repaint. */
+function afterDocChange() {
+  if (!E.kdoc) return;
+  if (!isSch()) KiCadCanvas.computeBBox(E.kdoc);
+  syncItemsFromDoc(); pruneSelection(); drawSelection(); renderProps(); bumpDoc(); requestRender();
+  const m = activeModule(); if (m && m.onDocChanged) { try { m.onDocChanged(toolCtx()); } catch (e) { console.warn(e); } }
+}
+
+export function applyChanges(changes: WireChange[] | null | undefined) {
+  const any = mutateDoc(changes);
+  // edits of others that were waiting for their turn (applyRemoteChanges) are in the document too: one pass covers both
+  if (any || remote.dirty) { cancelRemoteFlush(); afterDocChange(); }
+}
+
+/**
+ * Somebody else's edits, off the live session.  A script run through the assistant, a paste or an autorouter
+ * sends hundreds of them in a row, and following each with the full pass above (and a repaint, and on a board
+ * the connectivity the ratsnest is drawn from) froze the editor for as long as they kept coming.  The document
+ * takes each edit at once; the pass that follows is shared by all that arrive close together, and is paced by
+ * what it costs: after a pass and its frame took t ms, the next waits 3 t (at most a second), so three quarters
+ * of the time stay free for the person at this screen however heavy the board is.  A pass that costs a few
+ * milliseconds still runs every frame.
+ */
+const remote = { dirty: false, timer: 0, nextAt: 0 };
+export function applyRemoteChanges(changes: WireChange[] | null | undefined) {
+  if (!mutateDoc(changes)) return;
+  remote.dirty = true;
+  if (!remote.timer) remote.timer = window.setTimeout(flushRemoteChanges, Math.max(0, remote.nextAt - performance.now()));
+}
+function cancelRemoteFlush() { if (remote.timer) { clearTimeout(remote.timer); remote.timer = 0; } remote.dirty = false; }
+/** Run the pass for the remote edits that are waiting, now (a caller that is about to read the item lists). */
+export function flushRemoteChanges() {
+  if (!remote.dirty) { cancelRemoteFlush(); return; }
+  cancelRemoteFlush();
+  const t0 = performance.now();
+  afterDocChange();
+  remote.nextAt = performance.now() + 16;
+  // the frame this pass asked for is part of its cost: this runs after it, in the same frame (not in a hidden tab, where nothing is drawn)
+  requestAnimationFrame(() => {
+    const now = performance.now(), cost = now - t0; remote.nextAt = now + Math.min(1000, 3 * cost);
+    if (remote.timer) { clearTimeout(remote.timer); remote.timer = window.setTimeout(flushRemoteChanges, remote.nextAt - now); }   // edits that arrived before the frame wait their turn too
+  });
+}
+
+/**
+ * One remote change we could not apply means this document no longer matches the server's.
+ * Ask for a fresh base once per document (a resync per dropped op would be a storm, and if
+ * the item type is simply unknown to us the snapshot will not carry it either).
+ */
+export function noteDroppedChange(change: WireChange) {
+  console.warn("collab: a remote change was not applied", change.typeName || "", change.kind || "", change.id || "");
+  if (E.applyFailed) return;
+  E.applyFailed = true;
+  requestResync(null, true);
+}
+
+export function setupGridControls() {
+  const choices = gridList();   // the board's aux toolbar has KiCad's grid dropdown; the schematic uses the grid button's menu
+  E.gridPitch = (E.gridDefault && E.gridDefault()) || choices[0].mm;   // grid.last_size: not always the first of the list
+  store.slice("viewport", { gridChoices: choices.map((c) => ({ ...c })) });
+  updateGridStatus();
+}
+
+export function updateGridStatus() { setToggle("toggleGrid", E.gridOn); store.slice("viewport", { gridOn: E.gridOn, gridPitch: E.gridPitch, snapOn: E.snapOn }); }
+
+export function setGridPitch(v: unknown) { E.gridPitch = Number(v) || E.gridPitch; if (E.gridPicked) E.gridPicked(E.gridPitch); updateGridStatus(); requestRender(); }
+/** COMMON_TOOLS::GridPreset: the grid at a position of the list. */
+export function setGridIndex(i: number) { const l = gridList(); if (!l.length) return; setGridPitch(l[Math.max(0, Math.min(l.length - 1, i))].mm); }
+/** grid.last_size: where the current grid is in the list (-1 when it is not one of them). */
+export function gridIndex(): number { return gridList().findIndex((g) => Math.abs(g.mm - E.gridPitch) < 1e-9); }
+
+/** DRAWING_TOOL::UpdateStatusBar's text for the board's angle snap mode (PCBNEW_SETTINGS m_AngleSnapMode, per viewer). */
+export function boardConstraintMsg(): string {
+  const pt = (window as unknown as { PcbTools?: { angleSnapMode?: () => string } }).PcbTools;
+  let m = pt && pt.angleSnapMode ? pt.angleSnapMode() : null;
+  if (!m) m = storedAngleSnap();
+  return m === "45" ? "Constrain to H, V, 45" : m === "90" ? "Constrain to H, V" : "";
+}
+if (typeof window !== "undefined") window.addEventListener("kc:constraint-msg", (ev) => { if (!isSch()) setStatusBar({ constraint: String((ev as CustomEvent<{ msg?: string }>).detail?.msg || "") }); });
+
+export function snapMm(mm: [number, number]): [number, number];
+export function snapMm(mm: number[]): number[];
+export function snapMm(mm: number[]): number[] {
+  if (!E.snapOn) return mm;
+  const p = E.gridFor ? E.gridFor() : E.gridPitch;   // E.gridFor: the grid override of the active tool (Preferences > Grids)
+  if (!isSch()) return KiCadCanvas.pcbSizes.state.snapToGrid(mm as [number, number], p);   // the board's grid starts at its grid origin
+  return [KiCadCanvas.snap(mm[0], p), KiCadCanvas.snap(mm[1], p)];
+}
+
+
+export function leaveEditor() {
+  closeHostedDoc();
+  leaveDoc();
+  state.doc = null; state.docId = null;
+  setConn("offline", "");
+}
+
+
+/** An answer the page's early loader (boot.ts) already asked for, for this project; each is handed out once. */
+export function takeBoot<K extends "me" | "info" | "content">(key: K, projectId?: string): Boot[K] | undefined {
+  const boot = (window as unknown as { __kcBoot?: Boot }).__kcBoot;
+  if (!boot || !boot[key] || (projectId !== undefined && boot.projectId !== projectId)) return undefined;
+  const v = boot[key]; delete boot[key];
+  return v;
+}
+
+/** The whole project's documents (the editor's own list, `state.project.docs`, is one PCB's: pcbscope.ts). */
+export function allDocs(): DocEntry[] { return state.project ? state.project.allDocs || state.project.docs : []; }
+/** The project's PCBs. */
+export function projectPcbs(): Pcb<DocEntry>[] { return state.project ? pcbsOf(allDocs(), state.project.name) : []; }
+/** A document's path in the whole project (the editor's own entry has it relative to the PCB's folder). */
+export function projectPathOf(docId: string): string { const d = allDocs().find((x) => x.docId === docId); return d ? d.path : ""; }
+
+/**
+ * Take the project's documents as the server has them: the whole list for the shell, and for the editor the
+ * view of the PCB it is bound to (pcbscope.ts).  Everything worked out from the lists follows.
+ */
+function applyProjectDocs(all: DocEntry[]): void {
+  if (!state.project) return;
+  const was = boundPcb() ? boundPcb()!.dir : null;
+  const v = viewOf(all, state.project.projectId, state.project.name);
+  const b = boundPcb();
+  // the PCB on screen was renamed or moved (by this person on another tab of theirs, or by somebody else): load
+  // the page again at the same document rather than go on with paths that are no longer there
+  if (b && was !== null && was !== b.dir && state.view === "editor" && state.docId && all.some((d) => d.docId === state.docId)) {
+    location.assign(`/p/${state.project.projectId}/edit?doc=${encodeURIComponent(state.docId)}`);
+  }
+  state.project = { ...state.project, allDocs: all, docs: v.docs, pcb: v.pcb && b ? { key: b.key, dir: b.dir, name: b.name } : null };
+  state.docs = editorDocs(v.docs);
+  store.set({ project: state.project });
+}
+
+/** The pseudo-documents the shell opens like any tab: the project's Home, and a PCB's bill of materials. */
+const homeDoc = (): DocEntry => ({ docId: HOME_TAB, path: "", docType: "@home" });
+const bomDoc = (key: string): DocEntry => ({ docId: "bom:" + key, path: "", docType: "@bom" });
+
+/**
+ * Make `pcb` the PCB the editor works on.  False when the page has to load again for it (it has worked on
+ * another PCB of this project: pcbscope.ts), which is under way when this returns.
+ */
+function enterPcb(pcb: Pcb<DocEntry>, docId: string): boolean {
+  const pid = state.project!.projectId;
+  const how = bindPcb(pid, pcb);
+  if (how === "reload") { location.assign(`/p/${pid}/edit?doc=${encodeURIComponent(docId)}`); return false; }
+  if (how === "bound") {
+    // nothing of a project file or of custom rules has been read for this PCB yet
+    E.proSettings = null; E.druText = null;
+    applyProjectDocs(allDocs());
+  }
+  return true;
+}
+
+export async function openEditor(id: string) {
+  if (state.project && state.project.projectId === id && (state.view === "editor" || state.view === "cad")) return;
+  leaveEditor();
+  showView("editor");
+  let info: ProjectInfo;
+  // the page asked for the project as it arrived (boot.ts); a failed early answer is asked again here
+  const early = takeBoot("info", id);
+  try { info = (early && await early.catch(() => null)) as ProjectInfo || await api(`/api/projects/${id}/info`); }
+  catch (e) {
+    // Signed out, a private project looks the same as a missing one: sign in and come straight back.
+    if (!state.me) { location.href = "/auth/github/login?next=" + encodeURIComponent(location.pathname + location.search); return; }
+    toast("Project not found or private", 3500); navigate("/", true); return;
+  }
+  unbindPcb(); installPathScope();
+  state.project = info; fontsForProject(info.projectId);
+  state.role = info.role;
+  document.title = `${info.name} — Junction`;
+  state.docs = [];
+  // What the server lets this person do (server/src/access.rs).  Someone who is not signed in
+  // still joins the live session, as a guest who only watches.
+  const can = info.can || { edit: info.role === "editor", comment: info.role === "editor" || info.role === "commenter", copy: true, share: false, manage: false };
+  E.canJoin = true;
+  E.viewOnly = !state.me || !can.edit;
+  E.canComment = !!state.me && !!can.comment;
+  // A project that is one PCB at its root (every project made before there could be several) is bound to it at
+  // once and reads exactly as it always did.  Otherwise a PCB is bound when one of its documents is opened.
+  const pcbs = pcbsOf(info.docs, info.name);
+  const rootPcb = pcbs.find((p) => !p.dir);
+  if (pcbs.length === 1 && rootPcb) bindPcb(info.projectId, rootPcb);
+  applyProjectDocs(info.docs);
+  store.set({ role: info.role || null, canJoin: E.canJoin, viewOnly: E.viewOnly, canComment: E.canComment, guest: !state.me, can });
+  publishDocs();
+  loadHistory();
+  // ?fp=: the Footprint Editor on a footprint of the project, or on a private copy of a board footprint
+  const fp = fpParam();
+  if (fp) {
+    const entry = await fpEntryFor(info, fp);
+    if (entry) { await openDoc(entry); return; }
+  }
+  const wanted = new URLSearchParams(location.search).get("doc");
+  // A project opens on its root schematic, where a design starts and where KiCad's own project
+  // manager leads first; the board is one click away (and ?doc= still opens exactly what a link names).
+  // Only a project with no schematic at all opens on the board.
+  if (boundPcb()) rootSchematic();   // also starts reading the project file and the custom rules
+  // a link names a tab: Home, a part studio, an assembly, a PCB's bill of materials, or a sheet or board of a PCB
+  if (wanted === HOME_TAB) { await openDoc(homeDoc()); return; }
+  if (wanted && wanted.startsWith("bom:") && pcbs.some((p) => p.key === wanted.slice(4))) { await openDoc(bomDoc(wanted.slice(4))); return; }
+  const hosted = info.docs.find((d) => d.docId === wanted && isHostedDoc(d));
+  if (hosted) { await openDoc(hosted); return; }
+  const named = wanted ? info.docs.find((d) => d.docId === wanted && (d.docType === "kicad_sch" || d.docType === "kicad_pcb")) : undefined;
+  if (named) {
+    const pcb = pcbOfDoc(pcbs, named.docId);
+    if (pcb && !enterPcb(pcb, named.docId)) return;
+    const doc = state.docs!.find((d) => d.docId === named.docId);
+    if (doc) { rootSchematic(); await openDoc(doc); return; }
+  }
+  // No tab named.  A project with a PCB at its root opens on that PCB's root schematic, where a design starts and
+  // where it always opened; any other project (a new one, one of several PCBs, parts alone) opens on its Home tab.
+  if (rootPcb && enterPcb(rootPcb, (rootPcb.schematic || rootPcb.boards[0] || rootPcb.pro!).docId)) {
+    rootSchematic();
+    const doc = firstDoc(state.docs!, state.project!.docs, null);
+    if (doc) { await openDoc(doc); return; }
+  }
+  await openDoc(homeDoc());
+}
+
+
+export function rootSchematic(): DocEntry | undefined {
+  const pro = state.project!.docs.find((d) => d.docType === "kicad_pro");
+  if (pro && E.proSettings === null) { E.proSettings = ""; api(`/api/docs/${pro.docId}/content`).then((t) => { E.proSettings = typeof t === "string" ? t : JSON.stringify(t); if (CollabTools.pcb && CollabTools.pcb.setDesignSettings) { try { CollabTools.pcb.setDesignSettings(E.proSettings); } catch (e) { /* module without rules */ } }
+    // the title block's last resolver arrives with this file, so a sheet already on screen needs a repaint; the
+    // file's top-level sheets may name another root, so the hierarchy is learned again
+    hierarchyLearned = null; void learnHierarchy().then(() => { if (E.kdoc) { applySheetContext(E.kdoc); requestRender(); } });
+    publishDocs();
+    if (E.kdoc) { applySheetContext(E.kdoc); requestRender(); } }).catch(() => { E.proSettings = ""; }); }
+  // the custom rules (.kicad_dru) the PCB tools resolve length / skew constraints from
+  const dru = state.project!.docs.find((d) => d.docType === "design_rules");
+  if (dru && E.druText === null) { E.druText = ""; api(`/api/docs/${dru.docId}/content`).then((t) => { E.druText = typeof t === "string" ? t : ""; }).catch(() => { E.druText = ""; }); }
+  return topLevelSchematics()[0]?.doc || rootSchematicOf(state.docs!, state.project!.docs);
+}
+
+/** SCHEMATIC::GetTopLevelSheets: the project file's top-level sheets in order (the root sheet alone before the file
+ *  is read, or when it lists none).  Several only in a KiCad 10 project that has them (an Altium import). */
+export function topLevelSchematics(): TopLevelSheet<DocEntry>[] {
+  if (!state.project) return [];
+  const key = E.proSettings || "";
+  if (!topsMemo || topsMemo.pro !== key || topsMemo.docs !== state.docs || topsMemo.all !== state.project.docs) {
+    let pro: unknown = null;
+    try { pro = key ? JSON.parse(key) : null; } catch (e) { pro = null; }
+    topsMemo = { pro: key, docs: state.docs!, all: state.project.docs, tops: topLevelSheetsOf(pro, state.docs!, state.project.docs) };
+  }
+  return topsMemo.tops;
+}
+let topsMemo: { pro: string; docs: unknown; all: unknown; tops: TopLevelSheet<DocEntry>[] } | null = null;
+/** The top-level sheets changed (one renamed in the project file): the sheet paths and local net names follow. */
+export function topLevelSheetsChanged(): void {
+  hierarchyLearned = null; sheetHumanPaths.clear();
+  void learnHierarchy().then(() => { if (E.kdoc && E.kdoc.type === "sch") { applySheetContext(E.kdoc); requestRender(); } });
+  publishDocs();
+}
+/** The schematic has more than one top-level sheet: sheet paths and local net names start with the top-level
+ *  sheet's name (SCH_SHEET_PATH::PathHumanReadable). */
+export function multiTopLevel(): boolean { return topLevelSchematics().length > 1; }
+
+
+/** The project's schematic a sheet's Sheetfile names, seen from the folder of `parentPath` (else by file name). */
+export function findSheetDoc(file: string, parentPath: string): DocEntry | undefined {
+  file = file.replace(/\\/g, "/");
+  const base = file.split("/").pop(), dir = parentPath.split("/").slice(0, -1).join("/");
+  const rel = normPath(dir ? `${dir}/${file}` : file);
+  return state.docs!.find((d) => d.docType === "kicad_sch" && (d.path === rel || d.path === file))
+    || state.docs!.find((d) => d.docType === "kicad_sch" && d.path.split("/").pop() === base);
+}
+function normPath(p: string): string { const out: string[] = []; for (const x of p.split("/")) { if (!x || x === ".") continue; if (x === "..") out.pop(); else out.push(x); } return out.join("/"); }
+
+let docsFetch: Promise<boolean> | null = null;
+/**
+ * Read the project's file list again: a sheet somebody else drew made a new file after this page loaded (the
+ * server's "docs" notice, or a sheet that names a file this page has not heard of).  True when files were added.
+ */
+export function refreshDocs(): Promise<boolean> {
+  if (!state.project) return Promise.resolve(false);
+  if (docsFetch) return docsFetch;
+  const pid = state.project.projectId;
+  docsFetch = (async () => {
+    try {
+      const info = await api(`/api/projects/${pid}/info`) as ProjectInfo | null;
+      if (!info || !Array.isArray(info.docs) || !state.project || state.project.projectId !== pid) return false;
+      const known = new Set(allDocs().map((d) => d.docId));
+      const added = info.docs.filter((d) => !known.has(d.docId));
+      if (!added.length) return false;
+      // new arrays: what is worked out from the lists (the top-level sheets) is kept by their identity
+      applyProjectDocs(allDocs().concat(added));
+      publishDocs();
+      return true;
+    } catch (e) { return false; }
+    finally { docsFetch = null; }
+  })();
+  return docsFetch;
+}
+
+/** An empty schematic file (SCH_SCREEN of a new sheet whose file does not exist yet). */
+function emptySchematic(): string {
+  const uuid = KiCadCanvas.newUuid();
+  return `(kicad_sch (version 20250114) (generator "kicad-collab-web") (generator_version "9.0") (uuid "${uuid}") (paper "A4") (lib_symbols) (sheet_instances (path "/" (page "1"))))\n`;
+}
+
+/**
+ * A sheet whose file is in no one's copy of the project (added by a tool or an older app that did not upload it):
+ * like eeschema, which gives a sheet with a missing file a new empty screen, make the file and enter it.
+ */
+async function createSheetFile(file: string, parentPath: string): Promise<DocEntry | undefined> {
+  if (!state.project) return undefined;
+  const dir = parentPath.split("/").slice(0, -1).join("/"), path = normPath(dir ? `${dir}/${file}` : file);
+  if (!/\.kicad_sch$/i.test(path)) return undefined;
+  const res = await api(`/api/projects/${state.project.projectId}/docs`, { method: "POST", body: JSON.stringify({ path, docType: "kicad_sch" }) }) as { docId?: string; path?: string; existing?: boolean } | null;
+  if (!res || !res.docId) return undefined;
+  if (!res.existing) await api(`/api/docs/${res.docId}/snapshots?seq=0`, { method: "POST", headers: { "content-type": "text/plain" }, body: emptySchematic() });
+  await refreshDocs();
+  return state.docs!.find((d) => d.docId === res.docId);
+}
+
+/**
+ * SCH_NAVIGATE_TOOL::EnterSheet: open the sheet file a sheet symbol names.  `parentPath` is the file that holds
+ * the sheet symbol (the open one by default).  A file this page has not heard of is looked up again first.
+ */
+export async function enterSheet(file: string, parentPath?: string): Promise<void> {
+  const parent = parentPath !== undefined ? parentPath : state.doc ? state.doc.path : "";
+  let doc = findSheetDoc(file, parent);
+  if (!doc && await refreshDocs()) doc = findSheetDoc(file, parent);
+  if (!doc && !E.viewOnly) {
+    try { doc = await createSheetFile(file, parent); }
+    catch (e) { toast(`Could not create the sheet file '${file}': ${(e as Error).message || e}`, 5000); return; }
+  }
+  if (doc) { await openDoc(doc); return; }
+  toast(`The sheet file '${file}' is not in this project`, 4000);
+}
+
+
+/** The document list, the root sheet and the open document, for the hierarchy pane and the doc switcher. */
+export function publishDocs() {
+  const root = state.project ? rootSchematic() : null;
+  store.slice("document", { docs: state.docs!.slice(), rootDocId: root ? root.docId : null, doc: state.doc || null, docId: state.docId || null });
+}
+
+/** A note shown in the Appearance pane instead of the layer list (nothing to render yet). */
+export function setDocNotice(text: string | null) { store.slice("document", { notice: text || null, layers: [], copperLayers: [], hasDoc: false }); }
+
+
+/**
+ * Where each sheet and board was being looked at when it was left, so that coming back to it (the views of a
+ * PCB's tab, a sheet of the hierarchy) shows the same place.  For this page's life; a reload fits the document.
+ */
+const viewMemo = new Map<string, { zoom: number; panX: number; panY: number; w: number; h: number }>();
+
+export function leaveDoc() {
+  if (state.docId && E.kdoc && E.viewTouched) viewMemo.set(state.docId, { zoom: E.zoom, panX: E.panX, panY: E.panY, w: stage.clientWidth, h: stage.clientHeight });
+  else if (state.docId && E.kdoc) viewMemo.delete(state.docId);
+  dropHistoryView();    // the timeline belongs to the document being left
+  resetInteraction();   // no drag, menu, hover or tool survives into the next document
+  E.connectGen++;   // any connect() still waiting for its ticket must give up
+  if (E.ws) { E.ws.onclose = null; E.ws.close(); E.ws = null; }
+  stopPresenceKeepalive();
+  E.joinedDocId = null; E.lastSeq = 0; E.resyncAt = 0; E.lastPresenceMm = null; E.applyFailed = false;
+  clearInterval(E.renderTimer); E.renderTimer = 0;
+  E.items = []; E.sheets = []; E.selected = null; E.drag = null; E.boxSel = null; E.measure = null; E.selection = new Set(); E.highlightIds = null; E.peerState = {}; E.comments = []; E.followPeer = null; E.layers = {};
+  cancelRemoteFlush(); remote.nextAt = 0;
+  E.kdoc = null; E.loadedText = null; E.layersSeeded = false; canvas.style.display = "none"; { const cc = document.getElementById("cursorCanvas"); if (cc) cc.style.display = "none"; } if (E.renderReq) { cancelAnimationFrame(E.renderReq); E.renderReq = 0; }
+  releaseLayers();   // the cached pass and the zoom levels of the document left
+  peersG.replaceChildren(); clearPeerCursors(); selG.replaceChildren(); dragG.replaceChildren(); cmtG.replaceChildren();
+  closeThread(); leaveCursorChat();
+  store.slice("document", { layers: [], hiddenLayers: [], copperLayers: [], items: [], sheets: [], hasDoc: false, notice: null });
+  store.set({ comments: [], otherComments: [], openThread: null, peers: { list: [], follow: null } });
+  renderProps();
+}
+
+
+export async function openDoc(doc: DocEntry) {
+  leaveDoc();
+  // A part studio, an assembly: the domain's own editor draws it in the "cad" view (dochost.ts).  The tabs, the
+  // menu bar and the status bar stay; nothing of the schematic or board editor runs meanwhile.
+  if (isHostedDoc(doc)) {
+    state.doc = doc; state.docId = doc.docId;
+    const url = `/p/${state.project!.projectId}/edit?doc=${doc.docId}`;
+    if (location.pathname + location.search !== url) history.replaceState(null, "", url);
+    const bomOf = doc.docType === "@bom" ? projectPcbs().find((p) => "bom:" + p.key === doc.docId) : undefined;
+    const tabName = doc.docType === "@home" ? "" : bomOf ? `${bomOf.name} BOM` : doc.path.split("/").pop()!.replace(/\.[^.]+$/, "");
+    document.title = `${tabName ? tabName + " — " : ""}${state.project!.name} — Junction`;
+    await openHostedDoc(doc, () => {
+      showView("cad"); document.body.dataset.editor = "cad";   // the chrome's project layout (menu bar, status bar), none of KiCad's panes
+      store.slice("document", { editor: null, docType: null, docId: doc.docId, doc, hasDoc: false, notice: null });
+    }, openDocId);
+    return;
+  }
+  if (state.view === "cad") { showView("editor"); document.title = `${state.project!.name} — Junction`; }
+  state.doc = doc; state.docId = doc.docId; bindUndoDoc(doc.docId);
+  E.DOC_TYPE = doc.docType;
+  E.IU = isSch() ? 1e4 : 1e6;
+  E.ITEM_TYPE = isSch() ? "SCH_SYMBOL" : "FOOTPRINT";
+  // DRAWING_TOOL::Reset( MODEL_RELOAD ) writes the constraint field from the angle snap mode; eeschema never writes it
+  setStatusBar({ mode: "", constraint: isSch() ? "" : boardConstraintMsg() });
+  if (!docNav.lock) { docNav.list.length = docNav.idx + 1; docNav.list.push(doc.docId); docNav.idx = docNav.list.length - 1; }
+  setupEditorChrome(); publishDocs();
+  // the address names the document whenever the project has more than one thing to open
+  const several = state.docs!.length > 1 || !!(boundPcb() && boundPcb()!.dir) || allDocs().some((d) => isHostedDoc(d));
+  const url = `/p/${state.project!.projectId}/edit` + (doc.docType === "footprint" ? `?fp=${encodeURIComponent(doc.docId)}` : several ? `?doc=${doc.docId}` : "");
+  if (location.pathname + location.search !== url) history.replaceState(null, "", url);
+  setStatusBar({ message: "" });   // KiCad leaves the message field empty until something reports there
+  world.style.width = stage.clientWidth + "px";
+  E.viewTouched = false;
+  renderProps(); renderPeers(); renderThreads();
+  const docId = doc.docId;
+  setupGridControls();
+  loadComments();
+  void loadChat();
+  void loadProposals();
+  // The document itself, drawn here and kept current by the op stream; the
+  // desktop-pushed render is only a fallback when the file can't be read.
+  let ok = false;
+  // a board or a footprint is drawn and edited by the board tools, which the page no longer runs up front
+  const tools = isSch() ? null : ensurePcbTools().catch((e) => { console.warn(e); });
+  if (tools && doc.docType === "kicad_pcb") noteBoardOpened(doc.docId, firstDoc(state.docs!, state.project!.docs, null) === doc ? state.project!.projectId : null);
+  try {
+    const own = privateText(doc);
+    if (own !== null && tools) await tools;   // a board footprint's private copy: no document on the server
+    if (own !== null) ok = setDocFromText(own);
+    else {
+      // the document the page asked for as it arrived (boot.ts), when it is this one; otherwise ask now
+      const early = takeBoot("content", state.project!.projectId);
+      const had = early ? await early : null;
+      if (tools) await tools;
+      if (state.docId !== docId) return;
+      let got: { text: string; seq: number; head: number } | null = had && had.docId === docId ? had : null;
+      if (!got) {
+        const r = await fetch(`/api/docs/${docId}/content?v=${Date.now()}`);
+        if (r.ok) got = { text: await r.text(), seq: Number(r.headers.get("x-snapshot-seq")) || 0, head: Number(r.headers.get("x-head-seq")) || 0 };
+      }
+      if (got) {
+        // The text is the last stored snapshot, and only a desktop editor stores one: a project edited in the
+        // browser or by a script has all of that as edits on top.  They are fetched with the text and applied
+        // before the first picture, or the sheet would open as it once was (blank, for a project built here).
+        const late = got.head > got.seq ? await editsSince(docId, got.seq) : null;
+        if (tools) await tools;
+        if (state.docId !== docId) return;
+        performance.mark("kc:doc-text");
+        ok = setDocFromText(got.text, late ? late.changes : null);
+        if (ok) { E.loadedText = got.text; E.loadedOpN = E.opN; E.loadedSeq = late ? late.head : got.seq; }
+        if (ok && doc.docType === "footprint") onFootprintOpened(got.seq);
+      }
+      // DevTools' Performance panel shows these three (text here, parsed, on screen); scripts/load-timing.mjs reads them
+      if (ok) { performance.mark("kc:doc-parsed"); requestAnimationFrame(() => { performance.mark("kc:first-paint"); if (isSch()) preloadPcbToolsWhenIdle(); }); }
+    }
+    if (ok && own !== null) onFootprintOpened(0);
+  } catch (e) { console.warn(e); }
+  // a subsheet opened cold knows neither its Sheetname nor its page number: both live in its parent
+  if (ok && isSch() && state.doc && !(sheetNames.has(state.doc.path) && sheetPages.has(state.doc.path))) {
+    const rootSch = state.project ? rootSchematic() : null;
+    if (rootSch && rootSch.docId !== docId) {
+      learnHierarchy().then(() => { if (state.docId === docId && E.kdoc) { applySheetContext(E.kdoc); requestRender(); } });
+    }
+  }
+  if (!ok) {
+    const itemsReq = isSch()
+      ? api(`/api/docs/${docId}/items`).then((j) => { if (state.docId !== docId) return;
+          E.items = (j.symbols || []).map((sy: ItemSummary) => ({ ...sy, x: Math.round(sy.x * E.IU), y: Math.round(sy.y * E.IU) }));
+          E.sheets = (j.sheets || []).map((sh: SheetEntry) => ({ ...sh, x: sh.x * E.IU, y: sh.y * E.IU, w: sh.w * E.IU, h: sh.h * E.IU })); renderObjects(); })
+      : api(`/api/projects/${state.project!.projectId}/board-items`).then((j) => { if (state.docId !== docId) return; E.items = j.footprints || []; renderObjects(); });
+    itemsReq.catch(() => {});
+    const okSvg = await loadBase(true);
+    if (!okSvg) {
+      base.replaceChildren();
+      setDocNotice(`Nothing to show yet for this ${isSch() ? "sheet" : "board"} — it appears once a desktop editor has the project open in a live session.`);
+    }
+  }
+  // back where this document was left (the same thing in the middle of the stage, at the same zoom, whatever
+  // the panes around it have done to its size since); a document not seen before is shown whole
+  const seen = ok ? viewMemo.get(docId) : undefined;
+  setTimeout(() => {   // not rAF: a background tab would defer it indefinitely
+    if (state.docId !== docId) return;
+    if (seen) { E.zoom = seen.zoom; E.panX = seen.panX + (stage.clientWidth - seen.w) / 2; E.panY = seen.panY + (stage.clientHeight - seen.h) / 2; E.viewTouched = true; applyView(); requestRender(); }
+    else fitView();
+  }, 0);
+  if (isFpPrivate()) setConn("", "private copy of a board footprint");   // nothing goes over the socket until Save
+  else if (isFpReadOnlyLib()) setConn("", "read-only library footprint");   // a global library's footprint: Save As makes a project copy
+  else if (E.canJoin) connect().catch(() => setConn("err", "connection failed"));
+  else setConn("", "sign in to collaborate");
+}
+
+
+// ---- board render (inline SVG so layers can be toggled) ----
+export async function loadBase(first: boolean) {
+  let text: string;
+  try {
+    const r = await fetch(`/api/docs/${state.docId}/preview.svg?fit=false&v=${Date.now()}`);
+    if (!r.ok) return false;
+    text = await r.text();
+  } catch { return false; }
+  if (!text.includes("<svg")) return false;
+  const doc = new DOMParser().parseFromString(text, "image/svg+xml");
+  const src = doc.documentElement;
+  const vbs = src.getAttribute("viewBox");
+  if (vbs) { E.vb = vbs.split(/\s+/).map(Number); base.setAttribute("viewBox", vbs); overlay.setAttribute("viewBox", vbs); }
+  // Physical width from the width attribute tells us what a viewBox unit is.
+  const wAttr = src.getAttribute("width") || "";
+  const wm = wAttr.match(/^([\d.]+)\s*(mm|cm|in|px)?$/);
+  if (wm && E.vb[2] > 0) {
+    const n = parseFloat(wm[1]), u = wm[2] || "px";
+    const widthMm = u === "mm" ? n : u === "cm" ? n * 10 : u === "in" ? n * 25.4 : n * 25.4 / 96;
+    E.vbPerMm = widthMm > 0 ? E.vb[2] / widthMm : 1;
+  } else E.vbPerMm = 1;
+  $("#ovRoot").setAttribute("transform", `scale(${E.vbPerMm})`);
+  const hidden = new Set(Object.entries(E.layers as Record<string, SvgLayer>).filter(([, l]) => !l.visible).map(([k]) => k));
+  base.replaceChildren(...Array.from(src.childNodes).map((n) => document.importNode(n, true)));
+  tagLayers(hidden);
+  E.baseVersion++;
+  if (!first) { drawSelection(); drawComments(); }
+  return true;
+}
+
+
+export function tagLayers(hidden: Set<string>) {
+  E.layers = {};
+  for (const el of base.querySelectorAll<HTMLElement | SVGElement>("[style]")) {
+    const st = el.getAttribute("style") || "";
+    let m = st.match(/fill:#([0-9A-Fa-f]{6})/);
+    if (!m || /fill:none/i.test(st)) m = st.match(/stroke:#([0-9A-Fa-f]{6})/);
+    if (!m) continue;
+    const hex = m[1].toUpperCase();
+    const names: Record<string, string> = isSch() ? SCH_LAYERS : KICAD_LAYERS;
+    (E.layers[hex] ||= { name: names[hex] || `#${hex}`, nodes: [], visible: !hidden.has(hex) }).nodes.push(el);
+    el.dataset.layer = hex;
+    if (hidden.has(hex)) el.style.display = "none";
+  }
+  renderLayers();
+}
+
+
+export function renderLayers() {   // the desktop-pushed SVG render's layers (keyed by plot colour)
+  const order = Object.entries(E.layers as Record<string, SvgLayer>).sort((a, b) => b[1].nodes.length - a[1].nodes.length);
+  store.slice("document", { layers: order.map(([hex, l]) => ({ key: hex, name: l.name, color: "#" + hex, count: l.nodes.length })),
+    hiddenLayers: order.filter(([, l]) => !l.visible).map(([hex]) => hex), copperLayers: [],
+    notice: order.length ? null : "No render yet — the board renders once a desktop editor pushes a preview." });
+}
+
+
+export function fpName(fp: { ref?: string; value?: string; lib?: string }): string { return isSch() ? (fp.ref ? `${fp.ref}  ${fp.value || ""}`.trim() : (fp.lib || "?").split(":").pop()!) : (fp.lib || "?").split(":").pop()!; }
+
+/** The Objects tab reads the movable items (and a schematic's sheets) from the store. */
+export function renderObjects() {
+  store.slice("document", { items: E.items.map((fp: ItemSummary) => ({ id: fp.id, ref: fp.ref, value: fp.value, lib: fp.lib, layer: fp.layer, x: fp.x, y: fp.y, rot: fp.rot || 0 })),
+    sheets: E.sheets.map((sh: SheetEntry) => ({ id: sh.id, name: sh.name, file: sh.file, x: sh.x, y: sh.y, w: sh.w, h: sh.h })) });
+}
+
+export function selectItemAction(id: string) {
+  const fp: ItemSummary | undefined = E.items.find((f: ItemSummary) => f.id === id); if (!fp) return;
+  E.selected = fp; drawSelection(); renderProps(); centerOn(fp.x / E.IU, fp.y / E.IU);
+}
+
+/** Open a tab by its id: a document of the project, "home", or a PCB's bill of materials ("bom:<PCB key>"). */
+export function openDocId(id: string) {
+  if (!state.project) return;
+  if (id === HOME_TAB) { void openDoc(homeDoc()); return; }
+  if (id.startsWith("bom:")) { if (projectPcbs().some((p) => p.key === id.slice(4))) void openDoc(bomDoc(id.slice(4))); return; }
+  const whole = allDocs().find((x) => x.docId === id);
+  if (whole && isHostedDoc(whole)) { void openDoc(whole); return; }
+  // a sheet or a board: of the PCB the editor is on, or of another, which is entered first
+  if (whole && (whole.docType === "kicad_sch" || whole.docType === "kicad_pcb")) {
+    const pcb = pcbOfDoc(projectPcbs(), id);
+    if (pcb && !enterPcb(pcb, id)) return;
+    rootSchematic();
+  }
+  const d = state.docs!.find((x) => x.docId === id);
+  if (d) void openDoc(d);
+}
+
+/**
+ * The project's documents changed under the open project (the document tabs added, renamed or deleted one):
+ * take the new list, and open `open` when it names one.  A document that was open and is gone gives way to the
+ * project's first document.
+ */
+export function setProjectDocs(docs: DocEntry[], open?: string) {
+  if (!state.project) return;
+  applyProjectDocs(docs);
+  const id = state.docId;
+  // the open document as the editor has it now: a sheet or board by its place in its PCB, anything else by its place in the project
+  const cur = id ? state.docs!.find((d) => d.docId === id) || docs.find((d) => d.docId === id) : undefined;
+  if (cur && state.doc && cur.path !== state.doc.path) state.doc = cur;
+  publishDocs();
+  if (open) { openDocId(open); return; }
+  if (!id || cur || id === HOME_TAB || id.startsWith("board:") || id.startsWith("lib:")) return;
+  if (id.startsWith("bom:") && projectPcbs().some((p) => "bom:" + p.key === id)) return;
+  // what was open is gone (somebody deleted it).  A sheet or board gives way to its PCB's first document; in a
+  // project whose PCB is at the root, so does anything else, as it always did; otherwise Home.
+  const b = boundPcb();
+  const next = b && (state.view === "editor" || !b.dir) ? firstDoc(state.docs!, state.project.docs, null) : null;
+  void openDoc(next || homeDoc());
+}
+
+export function navigateDocs(dir: number) {
+  const i = docNav.idx + dir; if (i < 0 || i >= docNav.list.length) { toast(dir < 0 ? "No previous sheet" : "No next sheet"); return; }
+  docNav.lock = true; docNav.idx = i; try { openDocId(docNav.list[i]); } finally { docNav.lock = false; }
+}
+
+export function switchEditor() {
+  const target = isSch() ? state.docs!.find((d) => d.docType === "kicad_pcb") : rootSchematic();
+  if (target) openDoc(target); else toast(isSch() ? "This project has no board yet" : "This project has no schematic yet");
+}

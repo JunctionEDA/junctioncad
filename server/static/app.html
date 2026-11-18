@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Junction</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<script>/* the stored UI theme before the first paint (web/shared/theme.ts owns it; keep the two in step) */try{var t=localStorage.getItem("kui.theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
+<!-- who is signed in, the project and its first document are asked for at once, beside the script downloads (web/domains/pcb/editor/boot.ts) -->
+<script>/*BOOT*/</script>
+<link rel="stylesheet" href="/static/theme.css">
+<link rel="stylesheet" href="/static/dist/ui.css">
+<link rel="icon" type="image/svg+xml" href="/brand/j2/icon.svg"><link rel="icon" type="image/png" sizes="192x192" href="/brand/j2/icon-192.png"><link rel="alternate icon" href="/brand/j2/favicon.ico" sizes="any"><link rel="apple-touch-icon" href="/brand/j2/icon-180.png">
+<style>
+  /* Colours, type, spacing and the shared components (.btn, .input, .pill, the .kd-* dialog frame, …)
+     come from /static/theme.css, linked above.  Only the app's own layout lives here. */
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bench); color: var(--ink); font: var(--fs-base)/1.45 var(--font); overflow: hidden;
+         -webkit-font-smoothing: antialiased; }
+  svg.glyph { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.7;
+              stroke-linecap: round; stroke-linejoin: round; flex: none; }
+
+  /* rows: the menu bar, the view, the document tabs of an open project (empty on the home view), the status bar */
+  #app { display: grid; grid-template-rows: 32px minmax(0, 1fr) auto 24px; grid-template-columns: minmax(0, 1fr); height: 100%; }
+  #ui-doctabs { display: contents; }
+  #doctabs { grid-row: 3; } #doctabs[hidden] { display: none; }
+  #ui-statusbar > * { grid-row: 4; }
+  /* ---- cad: a document a domain's own editor draws (a part studio, an assembly); the editor fills #cadHost
+       (web/platform/documents/host.ts, web/domains/pcb/editor/dochost.ts) ---- */
+  #cad.active { display: grid; grid-template-rows: minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); min-width: 0; }
+  #cadHost { min-width: 0; min-height: 0; background: var(--paper); }
+
+  /* ---- views ---- */
+  .view { display: none; min-height: 0; }
+  .view.active { display: grid; }
+
+  /* ---- editor: the page grid the React chrome (static/dist/ui.js) renders into.  The #ui-* hosts are
+       display:contents wrappers, so the rendered #tbTop/#dockL/… are the grid's own children. ---- */
+  #editor.active { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; grid-template-columns: minmax(0, 1fr); min-width: 0; }
+  /* explicit rows: with the aux toolbar hidden the body must still take the stretching row, not the auto one */
+  #tbTop { grid-row: 1; } #tbAux { grid-row: 2; } #editorBody { grid-row: 3; } #msgpanel { grid-row: 4; }
+  #ui-tbTop, #ui-tbAux, #ui-menubar, #ui-msgpanel, #ui-statusbar, #ui-dockL, #ui-dockR, #ui-dockB, #ui-dockPlugins, #ui-tbLeft, #ui-tbRight { display: contents; }
+  #editorBody { position: relative; display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto auto auto auto; grid-template-rows: minmax(0, 1fr) auto; min-height: 0; min-width: 0; }
+  #dockL { grid-column: 1; grid-row: 1 / 3; } #tbLeft { grid-column: 2; grid-row: 1; } #stage { grid-column: 3; grid-row: 1; } #tbRight { grid-column: 4; grid-row: 1; } #dockR { grid-column: 5; grid-row: 1 / 3; }
+  #dockB { grid-column: 2 / 5; grid-row: 2; } #dockPlugins { grid-row: 1 / 3; }
+  /* narrow windows: the side docks (and the plugin dock) float over the stage as drawers
+     instead of squeezing the canvas to nothing (web/shared/components/Dock.tsx toggles the side drawers) */
+  @media (max-width: 900px) {
+    #dockPlugins { position: absolute; top: 0; bottom: 0; right: 0; z-index: 30; max-width: calc(100% - 40px); box-shadow: var(--shadow); }
+  }
+  #stage { position: relative; background: var(--canvas); overflow: hidden; touch-action: none; cursor: default; min-width: 0; }
+  #stage:focus { outline: none; }
+  #stage.pan { cursor: grab; } #stage.comment { cursor: cell; } #stage.zoomtool { cursor: zoom-in; } #stage.measure { cursor: crosshair; }
+  #canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: none; }
+  #cursorCanvas { position: absolute; inset: 0; width: 100%; height: 100%; display: none; pointer-events: none; }
+  #world { transform-origin: 0 0; position: absolute; left: 0; top: 0; pointer-events: none; }
+  #world svg#base { display: block; width: 100%; height: auto; }
+  #overlay { position: absolute; inset: 0; pointer-events: none; overflow: visible; }   /* cursors, selection boxes and comments off the sheet are not clipped */
+  /* the canvas cursor is the tool's KICURSOR (web/domains/pcb/editor/cursors.ts); panning keeps it, as KiCad does */
+  .kinfobar { position: fixed; z-index: 100; box-sizing: border-box; display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 4px 6px 4px 30px; background: color-mix(in srgb, var(--blue) 14%, var(--paper)); border-bottom: 1px solid color-mix(in srgb, var(--blue) 45%, var(--line)); color: var(--ink); font-size: 12px; white-space: pre-line; pointer-events: none; transform: translateY(-100%); opacity: 0; visibility: hidden; transition: transform .16s ease-out, opacity .16s ease-out, visibility 0s linear .16s; }
+  .kinfobar-ic { position: absolute; left: 7px; top: 50%; margin-top: -8px; width: 16px; height: 16px; }   /* WX_INFOBAR's wxICON_INFORMATION */
+  .kinfobar.show { transform: none; opacity: 1; visibility: visible; pointer-events: auto; transition: transform .16s ease-out, opacity .16s ease-out; }
+  .kinfobar-x { margin-left: auto; flex: none; display: inline-grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--ink-2); }
+  .kinfobar-link { margin-left: auto; flex: none; color: var(--blue); text-decoration: underline; }
+  .kinfobar-link + .kinfobar-x { margin-left: 0; }
+  .kinfobar-x:hover { background: color-mix(in srgb, var(--ink) 10%, transparent); color: var(--ink); }
+  @media (prefers-reduced-motion: reduce) { .kinfobar, .kinfobar.show { transition: none; } }
+  .ktip { position: fixed; left: 0; top: 0; z-index: 1000; max-width: 360px; padding: 4px 7px; border: 1px solid var(--line-2, var(--line)); border-radius: 3px; background: var(--panel); color: var(--ink); font-size: 12px; line-height: 1.35; white-space: pre-line; pointer-events: none; box-shadow: 0 2px 8px color-mix(in srgb, var(--ink) 18%, transparent); opacity: 0; visibility: hidden; transition: opacity .08s linear, visibility 0s linear .08s; }
+  .ktip.on { opacity: 1; visibility: visible; transition: opacity .08s linear; }
+  #signinOverlay { position: absolute; left: 12px; bottom: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-3); padding: 10px 14px; display: none; box-shadow: var(--shadow); }
+  .kv { display: grid; grid-template-columns: 90px 1fr; gap: 6px 8px; align-items: center; }
+  .kv label { color: var(--ink-2); }
+  .kv input { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-2); padding: 4px 6px; color: var(--ink); font-family: var(--mono); width: 100%; }
+  .kv .ro { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="ui-menubar"></div>
+
+  <!-- ===== Home: the projects window (React, server/web/platform/home) ===== -->
+  <section id="home" class="view"><div id="ui-home"></div></section>
+
+  <!-- ===== Editor: KiCad's frame.  Toolbars, docks, menus, status bar and overlays are React
+       components in server/web (bundled into /static/dist/ui.js); only the stage is the editor bundle's (web/domains/pcb/editor). ===== -->
+  <section id="editor" class="view">
+    <div id="ui-tbTop"></div>
+    <div id="ui-tbAux"></div>
+    <div id="editorBody">
+      <div id="ui-dockL"></div>
+      <div id="ui-tbLeft"></div>
+      <div id="stage" tabindex="-1">
+        <canvas id="canvas"></canvas>
+        <div id="world">
+          <svg id="base" xmlns="http://www.w3.org/2000/svg"></svg>
+          <svg id="overlay" xmlns="http://www.w3.org/2000/svg"><g id="ovRoot"><g id="peersG"></g><g id="selG"></g><g id="dragG"></g><g id="cmtG" style="pointer-events:auto"></g></g></svg>
+        </div>
+        <canvas id="cursorCanvas"></canvas>
+        <div id="cmtPanel"></div>
+      </div>
+      <div id="ui-tbRight"></div>
+      <div id="ui-dockR"></div>
+      <div id="ui-dockPlugins"></div>
+      <div id="ui-dockB"></div>
+    </div>
+    <div id="ui-msgpanel"></div>
+  </section>
+
+  <!-- ===== A document a domain's own editor draws: a part studio, an assembly (web/domains/mechanical, …) ===== -->
+  <section id="cad" class="view"><div id="cadHost"></div></section>
+
+  <div id="ui-doctabs"></div>
+
+  <div id="ui-statusbar"></div>
+</div>
+<div id="ui-overlays"></div>
+<script src="/static/kicad-canvas.js"></script>
+<script src="/static/kicad-dialogs.js"></script>
+<script src="/static/sch-tools.js"></script>
+<script src="/static/props.js"></script>
+<script src="/static/dist/parts.js"></script>
+<script src="/static/dist/editor.js"></script>
+<script src="/static/dist/ui.js"></script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+{
+ "about": "Hand-routed boards the router is scored against (scripts/board-bench.py). Cloned into a cache, never written.",
+ "boards": {
+  "ledify": {"repo": "https://github.com/notaroomba/ledify", "board": "pcb/ledify.kicad_pcb"},
+  "cyberboard": {"repo": "https://github.com/notaroomba/cyberboard", "board": "hardware/Cyberboard.kicad_pcb"},
+  "ember": {"repo": "https://github.com/notaroomba/ember", "board": "hardware/board/ember.kicad_pcb"}
+ }
+}

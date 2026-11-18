@@ -1,0 +1,820 @@
+// pcbdialogs/ui — the widgets KiCad's board dialogs are made of, on top of KDialogs.open
+// (static/kicad-dialogs.js): a notebook (wxNotebook), a paged tree (PAGED_DIALOG's wxTreebook), static
+// boxes, unit fields (UNIT_BINDER: a number in the editor's units followed by the unit name), editable
+// grids with KiCad's add / delete row buttons (WX_GRID), and a report list (WX_HTML_REPORT_PANEL).
+import { trapTab } from "../../tools/kicad-dialogs/shell";
+import { E } from "../state";
+import "../../../../shared/components/kselect";   // <k-select>, the themed drop-down these use in place of <select>
+import { fromDisplayAbsAxis, toDisplayAbsAxis } from "../userorigin";
+import { evalExpr } from "../../tools/props/numeric";
+import { popupMenu } from "../../dialogs/dom";
+import { bitmapButton, kicadIcon, sortArrow, closeMark } from "../../../../shared/components/kicon-dom";
+
+// ---------------------------------------------------------------- elements
+type Child = Node | string | null | undefined | false;
+type Props = Record<string, string | number | boolean | null | undefined | ((ev: Event) => void)>;
+export function h<K extends keyof HTMLElementTagNameMap>(tag: K, props?: Props | null, ...children: Child[]): HTMLElementTagNameMap[K] {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (typeof v === "function") el.addEventListener(k.replace(/^on/, "").toLowerCase(), v as EventListener);
+    else if (k === "class") el.className = String(v);
+    else if (k === "style") el.style.cssText = String(v);
+    else if (k === "checked" || k === "disabled" || k === "selected" || k === "readOnly") (el as unknown as Record<string, boolean>)[k] = !!v;
+    else if (k === "value") (el as unknown as { value: string }).value = String(v);
+    else el.setAttribute(k, v === true ? "" : String(v));
+  }
+  for (const c of children) if (c !== null && c !== undefined && c !== false) el.append(c);
+  return el;
+}
+
+const CSS = `
+.pd-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--line); margin: 0 0 10px; flex-wrap: wrap; }
+.pd-tab { padding: 5px 12px; border: 1px solid transparent; border-bottom: none; border-radius: var(--r-3) var(--r-3) 0 0; background: none; color: var(--ink-2); margin-bottom: -1px; white-space: nowrap; }
+.pd-tab:hover { color: var(--ink); }
+.pd-tab.on { background: var(--bench); border-color: var(--line); color: var(--ink); font-weight: 600; }
+.pd-book { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 0 14px; height: 100%; min-height: 0; }
+.pd-tree { border: 1px solid var(--line); border-radius: var(--r-2); background: var(--panel); overflow: auto; padding: 4px 0; user-select: none; }
+.pd-tree .grp { padding: 4px 8px; font-weight: 600; cursor: default; }
+.pd-tree .leaf { padding: 3px 8px 3px 24px; cursor: pointer; white-space: nowrap; }
+.pd-tree .leaf:hover { background: var(--sel-soft); }
+.pd-tree .leaf.on, .pd-tree .leaf.on:hover { background: var(--sel); color: var(--ink); }
+.pd-page { overflow: auto; min-height: 0; padding-right: 4px; }
+.pd-box { margin: 0 0 12px; }
+.pd-box > .hd { font-weight: 600; margin: 0 0 6px; padding-bottom: 3px; border-bottom: 1px solid var(--line); }
+.pd-form { display: grid; grid-template-columns: max-content minmax(90px, 170px) max-content; gap: 6px 8px; align-items: center; }
+.pd-form.wide { grid-template-columns: max-content minmax(140px, 1fr) max-content; }
+.pd-form > label, .pd-lbl { color: var(--ink); white-space: nowrap; }
+.pd-form .unit { color: var(--ink-2); }
+.pd-form .span { grid-column: 1 / -1; }
+.pd-check { display: flex; gap: 6px; align-items: center; color: var(--ink); margin: 2px 0; }
+.pd-check input { width: auto; margin: 0; }
+.pd-check.disabled, .pd-check.dim, .pd-check:has(input:disabled) { color: var(--ink-3, var(--ink-2)); }
+.pd-note { color: var(--ink-2); font-size: 12px; margin: 4px 0 8px; }
+.pd-info { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-2); padding: 6px 10px; margin: 0 0 10px; color: var(--ink); }
+.pd-grid { border: 1px solid var(--line); border-radius: var(--r-2); overflow: auto; background: var(--panel); }
+.pd-grid table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.pd-grid th { position: sticky; top: 0; background: var(--panel-2); text-align: left; font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--line); border-right: 1px solid var(--line); white-space: nowrap; z-index: 1; }
+.pd-grid td { padding: 0; border-bottom: 1px solid var(--line); border-right: 1px solid var(--line); height: 24px; }
+.pd-grid td.ro, .pd-grid td.txt { padding: 3px 6px; white-space: nowrap; }
+.pd-grid td.ro { color: var(--ink-2); }
+.pd-grid tr.sel td { background: var(--sel); }
+.pd-grid tr.hd td { background: var(--panel-2); font-weight: 600; padding: 3px 6px; }
+.pd-grid td input[type=text], .pd-grid td k-select { border: none !important; border-radius: 0 !important; background: transparent !important; width: 100%; height: 23px; padding: 2px 6px !important; font-family: inherit !important; }
+.pd-grid td input[type=text]:focus, .pd-grid td k-select:focus-within { outline: 2px solid var(--blue); outline-offset: -2px; }
+.pd-grid td input[type=text] { min-width: 84px; }
+.pd-grid td.chk { text-align: center; }
+.pd-grid td.chk input { width: auto; margin: 0; }
+.pd-grid td.ico { width: 22px; text-align: center; vertical-align: middle; padding: 0 2px; }
+.pd-grid td.ico svg, .pd-grid td.ico img { display: block; margin: auto; }
+.pd-cellwrap { display: flex; align-items: center; }
+.pd-3dwrap { display: flex; flex: 1; min-width: 0; min-height: 0; gap: 4px; }
+.pd-3dprev { position: relative; flex: 1; min-width: 0; min-height: 200px; background: var(--canvas); border: 1px solid var(--line); overflow: hidden; }
+.pd-3dprev-msg { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-3); font-size: var(--fs-sm); }
+.pd-3dbtns { display: flex; flex-direction: column; gap: 4px; flex: none; }
+.pd-cellwrap input[type=text] { flex: 1; min-width: 0; }
+.pd-cellbtn { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; border: none; background: transparent; color: var(--ink); cursor: pointer; border-radius: var(--r-1); }
+.pd-cellbtn:hover { background: var(--sel-soft); }
+.pd-gridbar { display: flex; gap: 4px; margin: 4px 0 0; }
+/* the hand-made square buttons (a "..." picker, a colour swatch); icon buttons are components/kicon-dom's .kbmp */
+.pd-iconbtn:not(.kbmp) { width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--line); border-radius: var(--r-2); background: var(--panel); color: var(--ink); padding: 0; }
+.pd-iconbtn:not(.kbmp):hover { border-color: var(--ink-3, var(--ink-2)); }
+.pd-iconbtn:not(.kbmp):disabled { opacity: .4; cursor: default; }
+.pd-3dbtns .pd-iconbtn.on { background: var(--on); border-color: var(--on-line); }
+.pd-bitmap { display: inline-flex; flex: none; align-items: center; justify-content: center; }
+.pd-bitmap > svg.kicon-dom { display: block; max-width: 100%; height: auto; }
+.pd-bmplabel { display: inline-flex; align-items: center; gap: 6px; }
+.pd-togrow { display: flex; align-items: center; gap: 2px; }
+.pd-togrow .vsep { width: 1px; height: 18px; background: var(--line); margin: 0 5px; }
+.pd-report { border: 1px solid var(--line); border-radius: var(--r-2); background: var(--panel); overflow: auto; font-size: 12px; padding: 4px 8px; min-height: 120px; }
+.pd-report .ln { padding: 1px 0; white-space: pre-wrap; }
+.pd-report .ln.error { color: var(--err); }
+.pd-report .ln.warning { color: var(--warn); }
+.pd-report .ln.action { color: var(--ink); }
+.pd-report .ln.info { color: var(--ink-2); }
+.pd-sev { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
+.pd-sev.error { background: var(--err); border-radius: 50%; }
+.pd-sev.warning { width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 10px solid var(--warn); }
+.pd-sev.exclusion { background: var(--ink-3); }
+.pd-sev.ignore { background: var(--ink-3); border-radius: var(--r-1); }
+.pd-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 0 0 6px; }
+.pd-row k-select, .pd-row input[type=text] { width: auto; }
+.pd-cols2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; }
+.pd-radiobox { border: 1px solid var(--line); border-radius: 4px; padding: 2px 8px 6px; margin: 0; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.pd-radiobox > legend { padding: 0 4px; color: var(--ink); }
+.pd-radiobox.disabled > legend, .pd-check.disabled { color: var(--ink-3); }
+.pd-cols3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 20px; }
+.pd-list { border: 1px solid var(--line); border-radius: var(--r-2); background: var(--panel); overflow: auto; }
+.pd-list .it { padding: 3px 8px; cursor: pointer; display: flex; gap: 6px; align-items: baseline; }
+.pd-list .it:hover { background: var(--panel-2); }
+.pd-list .it.sel { background: var(--sel); }
+.pd-list .it .sub { color: var(--ink-2); padding-left: 16px; }
+.pd-list .hd { padding: 3px 8px; font-weight: 600; background: var(--panel-2); border-bottom: 1px solid var(--line); }
+.pd-swatch { display: inline-block; width: 22px; height: 12px; border: 1px solid var(--line); vertical-align: -1px; }
+.pd-layertable { border-collapse: collapse; margin: 8px 0; }
+.pd-layertable td { padding: 2px 8px 2px 0; }
+.pd-layertable td.chk input { width: auto; margin: 0 4px; }
+.pd-layertable input[type=text] { width: 190px; }
+.pd-layertable k-select { width: 190px; }
+.pd-layertable tr.cu input[type=text] { font-weight: 600; }
+.pd-layertable .desc { color: var(--ink-2); }
+.pd-colhead { font-weight: 600; margin: 0 0 4px; }
+.pd-status { font-size: 12px; } .pd-status.err { color: var(--err); } .pd-status.ok { color: var(--ink-2); }
+.pd-sevtable { border-collapse: collapse; width: 100%; }
+.pd-sevtable td { padding: 2px 10px 2px 0; white-space: nowrap; }
+.pd-sevtable td:first-child { white-space: normal; width: 100%; padding-left: 14px; }
+.pd-sevtable tr.hd td { font-weight: 600; padding: 8px 0 3px; }
+.pd-sevtable input { width: auto; margin: 0; vertical-align: -2px; }
+.pd-scroll { overflow: auto; }
+.pd-inline { display: inline-flex; gap: 14px; align-items: center; }
+.pd-value { font-variant-numeric: tabular-nums; }
+.pd-drclist { height: 300px; }
+.pd-drclist .it { align-items: flex-start; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+.pd-drclist .it .pd-sev { margin-top: 4px; flex: 0 0 auto; }
+.pd-empty { padding: 10px; color: var(--ink-2); }
+.pd-badge { display: inline-block; min-width: 20px; padding: 0 6px; border-radius: 9px; background: var(--panel-2); border: 1px solid var(--line); font-size: 11px; text-align: center; margin-left: -4px; }
+.pd-showrow { margin-top: 8px; }
+.pd-stat { border-collapse: collapse; width: 100%; margin: 0 0 14px; }
+.pd-stat th { text-align: left; font-weight: 600; padding: 3px 8px 3px 0; border-bottom: 1px solid var(--line); }
+.pd-stat td { padding: 3px 8px 3px 0; } .pd-stat td.n, .pd-stat th + th { text-align: right; font-variant-numeric: tabular-nums; }
+.pd-stat tr.total td { border-top: 1px solid var(--line); font-weight: 600; }
+.pd-fieldlist { margin-top: 8px; border: 1px solid var(--line); border-radius: var(--r-2); padding: 6px 8px; background: var(--panel); max-height: 380px; overflow: auto; }
+.pd-report .ln.hd { font-weight: 600; }
+.pd-xy { display: inline-flex; gap: 6px; align-items: center; } .pd-xy input { width: 96px; } .pd-xy label { color: var(--ink); }
+.pd-dim { color: var(--ink-3, var(--ink-2)) !important; opacity: .7; }
+.pd-zone { display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 0 16px; }
+textarea.pd-text { width: 100%; min-height: 260px; font-family: var(--mono); font-size: 12px; white-space: pre; }
+.pd-spin { position: relative; display: inline-flex; align-items: stretch; min-width: 0; }
+.pd-spin > input[type=text] { width: 100%; min-width: 0; padding-right: 18px; }
+.pd-spin > .arrows { position: absolute; right: 1px; top: 1px; bottom: 1px; width: 16px; display: flex; flex-direction: column; border-left: 1px solid var(--line); }
+.pd-spin > .arrows > button { flex: 1 1 50%; min-height: 0; padding: 0; border: 0; border-radius: 0; background: var(--panel-2); color: var(--ink-2); display: grid; place-items: center; cursor: default; }
+.pd-spin > .arrows > button:hover { color: var(--ink); background: color-mix(in srgb, var(--ink) 8%, var(--panel-2)); }
+.pd-spin > .arrows > button + button { border-top: 1px solid var(--line); }
+.pd-spin.disabled > .arrows { opacity: .5; pointer-events: none; }
+.pd-warnicon { display: inline-flex; align-items: center; margin-left: 4px; cursor: help; vertical-align: middle; }
+.pd-warnicon[hidden] { display: none; }
+.pd-infobar { display: flex; gap: 8px; align-items: center; background: color-mix(in srgb, var(--warn) 18%, var(--panel)); border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line)); border-radius: var(--r-2); padding: 5px 10px; margin: 0 0 8px; color: var(--ink); }
+.pd-infobar[hidden] { display: none; }
+.pd-form.pd-form4 { grid-template-columns: max-content minmax(90px, 170px) max-content max-content; }
+.pd-form4 > span > input { width: 100%; }
+.pd-bad { color: var(--err) !important; }
+.pd-sep { border: 0; border-top: 1px solid var(--line); margin: 6px 0; }
+.pd-layercell { display: inline-flex; gap: 6px; align-items: center; width: 100%; }
+.pd-layercell .sw { width: 12px; height: 12px; border: 1px solid var(--line); border-radius: 2px; flex: none; }
+.pd-layercell k-select { flex: 1; }
+.pd-report .ln.sel { background: var(--sel-soft); }
+.pd-report .ln[tabindex] { cursor: pointer; }
+.pd-vline { width: 1px; align-self: stretch; background: var(--line); margin: 0 4px; }
+.pd-reann-dirs { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 4px 0 8px; }
+.pd-reann-dir { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.pd-reann-pic { border: 1px solid var(--line); border-radius: var(--r-2); background: var(--panel); }
+.pd-infobar .msg { flex: 1; white-space: pre-wrap; }
+.pd-infobar .x { border: 0; background: none; color: var(--ink-2); padding: 0 4px; }
+.pd-grid td.cellsel input[type=text], .pd-grid td.cellsel { background: var(--sel-soft); }
+.pd-grid td.err input[type=text] { outline: 2px solid var(--err); outline-offset: -2px; }
+.pd-link { color: var(--blue); text-decoration: underline; cursor: pointer; background: none; border: 0; padding: 0; font: inherit; }
+.pd-small { font-size: var(--fs-xs); font-style: italic; color: var(--ink-2); margin: 2px 0 6px; }
+.pd-swatchbtn { width: 100%; height: 23px; border: 0; padding: 3px 6px; background: none; display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.pd-swatchbtn .sw { width: 28px; height: 14px; border: 1px solid var(--line-2); background-image: linear-gradient(45deg, var(--line) 25%, transparent 25%, transparent 75%, var(--line) 75%), linear-gradient(45deg, var(--line) 25%, transparent 25%, transparent 75%, var(--line) 75%); background-size: 8px 8px; background-position: 0 0, 4px 4px; position: relative; }
+.pd-swatchbtn .sw > i { position: absolute; inset: 0; }
+`;
+let cssDone = false;
+/** The kit's stylesheet, for a dialog opened with KDialogs.open directly (its own button row). */
+export function ensureCss(): void {
+  if (cssDone || typeof document === "undefined") return;
+  cssDone = true;
+  const st = document.createElement("style"); st.id = "pcbdialogs-css"; st.textContent = CSS; document.head.appendChild(st);
+}
+
+/** el.append that skips the absent children. */
+export function put(el: HTMLElement, ...children: Child[]): void { for (const c of children) if (c !== null && c !== undefined && c !== false) el.append(c); }
+
+// ---------------------------------------------------------------- the dialog shell
+export interface DialogApi { body: HTMLElement; close(): void; dialog: HTMLElement; okButton: HTMLButtonElement | null; cancelButton: HTMLButtonElement | null; setTitle(t: string): void }
+export interface DialogSpec {
+  title: string; width?: number; height?: number;
+  build(body: HTMLElement, api: DialogApi): void;
+  /** return false to keep the dialog open */
+  ok?(): boolean | void;
+  /** false keeps the dialog open (DIALOG_BOARD_SETUP::canDiscardChanges) */
+  cancel?(): boolean | void;
+  /** DIALOG_SHIM control-state persistence (see DlgSpec.persist) */
+  persist?: boolean | string; restored?(): void;
+  okLabel?: string; cancelLabel?: string;
+  /** a dialog with only its Close button */
+  noOk?: boolean; readOnly?: boolean;
+  /** buttons left of the standard pair, in order */
+  extra?: { label: string; fn(): void }[];
+  /** Enter does not press the default button (grids, multi-line editors) */
+  noEnter?: boolean;
+  /** a modeless dialog: the canvas and the menus stay usable while it is open (DIALOG_DRC) */
+  modeless?: boolean;
+  /** a child of the open dialog: it opens over it instead of replacing it (DlgSpec.child) */
+  child?: boolean;
+}
+interface KDialogOpenApi { body: HTMLElement; close(): void }
+/** KDialogs.open with KiCad's button wording and a size beyond the default cap. */
+export function openDialog(spec: DialogSpec): DialogApi | null {
+  if (typeof KDialogs === "undefined" || !KDialogs) return null;
+  ensureCss();
+  let out: DialogApi | null = null;
+  KDialogs.open({ title: spec.title, width: spec.width, okLabel: spec.okLabel, readOnly: spec.readOnly, extra: spec.extra, ok: spec.ok, cancel: spec.cancel, modeless: spec.modeless, child: spec.child, persist: spec.persist, restored: spec.restored,
+    build(body: HTMLElement, a: KDialogOpenApi) {
+      const dlg = body.parentElement as HTMLElement;
+      if (spec.width) dlg.style.maxWidth = "96vw";
+      if (spec.height) { dlg.style.height = `min(${spec.height}px, 92vh)`; body.style.flex = "1 1 auto"; body.style.minHeight = "0"; body.style.display = "flex"; body.style.flexDirection = "column"; }
+      const buttons = Array.from(dlg.querySelectorAll<HTMLButtonElement>(".kd-foot > button"));
+      const okButton = buttons.length ? buttons[buttons.length - 1] : null, cancelButton = buttons.length > 1 ? buttons[buttons.length - 2] : null;
+      if (cancelButton && spec.cancelLabel) cancelButton.textContent = spec.cancelLabel;
+      if (okButton && spec.noOk) { okButton.style.display = "none"; if (cancelButton && !spec.cancelLabel) cancelButton.textContent = "Close"; }
+      if (spec.noEnter) body.addEventListener("keydown", (ev) => { if (ev.key === "Enter") ev.stopPropagation(); });
+      // a grid cell, a multi-line editor or a list consumes Enter; a plain text control lets it press OK
+      else body.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && ev.target instanceof Element && ev.target.closest(".pd-grid, .pd-list, .pd-rules")) ev.stopPropagation(); });
+      const title = dlg.querySelector(".kd-title span");
+      out = { body, close: a.close, dialog: dlg, okButton, cancelButton, setTitle(t: string) { if (title) title.textContent = t; } };
+      spec.build(body, out);
+    } });
+  return out;
+}
+
+/**
+ * A message over the dialog that asked for it (DisplayError, wxMessageBox, IsOK): its own overlay on top of the open
+ * dialog, which stays as it is.  buttons: left to right; the last is the default (Enter), Escape picks `escape` (or
+ * the first button).
+ */
+export function messageBox(title: string, message: string, buttons: { label: string; fn?: () => void }[] = [{ label: "OK" }], escape?: number): HTMLElement | null {
+  if (typeof document === "undefined") return null;
+  ensureCss();
+  const ov = h("div", { class: "kd-overlay", style: "z-index:10050", "data-k": "messagebox" });
+  const dlg = h("div", { class: "kd-dialog", style: "width:max-content;min-width:440px;max-width:min(640px, calc(100vw - 32px))", tabIndex: -1 });
+  const body = h("div", { class: "kd-body" }, h("p", { style: "margin:4px 0 6px;white-space:pre-wrap", "data-k": "message" }, message));
+  const foot = h("div", { class: "kd-foot" }, h("span", { class: "spacer" }));
+  const done = (i: number): void => { ov.remove(); const b = buttons[i]; if (b && b.fn) b.fn(); };
+  const btns = buttons.map((b, i) => { const e = h("button", { class: "btn" + (i === buttons.length - 1 ? " primary" : ""), type: "button", "data-k": "mb-" + b.label.toLowerCase() }, b.label); e.addEventListener("click", () => done(i)); return e; });
+  foot.append(...btns);
+  dlg.append(h("div", { class: "kd-title" }, h("span", null, title)), body, foot); ov.append(dlg);
+  ov.addEventListener("keydown", (ev) => {
+    ev.stopPropagation(); if (ev.key === "Tab") trapTab(ev, ov);
+    if (ev.key === "Escape") { ev.preventDefault(); done(escape === undefined ? 0 : escape); }
+    else if (ev.key === "Enter" && !(ev.target instanceof HTMLButtonElement)) { ev.preventDefault(); done(buttons.length - 1); }
+  });
+  document.body.append(ov); const last = btns[btns.length - 1]; if (last) last.focus(); else dlg.focus();
+  return ov;
+}
+/**
+ * A modal sub-dialog over the dialog that opened it (the parent stays open beneath, as a wxDialog's ShowModal child):
+ * its own overlay with the body `build` fills and Cancel / OK.  ok() returning false keeps it open.
+ */
+export function subDialog(title: string, width: number, build: (body: HTMLElement) => void, ok: () => boolean | void, opts?: { key?: string }): HTMLElement | null {
+  if (typeof document === "undefined") return null;
+  ensureCss();
+  const ov = h("div", { class: "kd-overlay", style: "z-index:10040", "data-k": (opts && opts.key) || "subdialog" });
+  const dlg = h("div", { class: "kd-dialog", style: `width:${width}px;max-width:calc(100vw - 32px)`, tabIndex: -1 });
+  const body = h("div", { class: "kd-body" });
+  const cancel = h("button", { class: "btn", type: "button", "data-k": "sub-cancel" }, "Cancel"), okB = h("button", { class: "btn primary", type: "button", "data-k": "sub-ok" }, "OK");
+  cancel.addEventListener("click", () => ov.remove());
+  okB.addEventListener("click", () => { if (ok() !== false) ov.remove(); });
+  dlg.append(h("div", { class: "kd-title" }, h("span", null, title)), body, h("div", { class: "kd-foot" }, h("span", { class: "spacer" }), cancel, okB)); ov.append(dlg);
+  ov.addEventListener("keydown", (ev) => {
+    ev.stopPropagation(); if (ev.key === "Tab") trapTab(ev, ov);
+    if (ev.key === "Escape") { ev.preventDefault(); ov.remove(); }
+  });
+  build(body);
+  document.body.append(ov); dlg.focus();
+  return ov;
+}
+/**
+ * WX_TEXT_ENTRY_DIALOG over the dialog that asked for it: a caption, a (multi-line) text field and Cancel / OK.
+ * OK hands the text to onOk; Cancel or Escape leaves it alone.
+ */
+export function textEntryBox(title: string, caption: string, value: string, multiline: boolean, onOk: (text: string) => void): HTMLElement | null {
+  if (typeof document === "undefined") return null;
+  ensureCss();
+  const ov = h("div", { class: "kd-overlay", style: "z-index:10050", "data-k": "textentry" });
+  const dlg = h("div", { class: "kd-dialog", style: "width:max-content;min-width:440px;max-width:min(640px, calc(100vw - 32px))", tabIndex: -1 });
+  const field = multiline ? h("textarea", { class: "pd-text", style: "min-height:90px;width:100%", "data-k": "entry" }) : h("input", { type: "text", style: "width:100%", "data-k": "entry" });
+  (field as HTMLInputElement | HTMLTextAreaElement).value = value;
+  const body = h("div", { class: "kd-body" }, caption ? h("p", { style: "margin:4px 0 6px" }, caption) : null, field);
+  const done = (ok: boolean): void => { ov.remove(); if (ok) onOk((field as HTMLInputElement | HTMLTextAreaElement).value); };
+  const cancel = h("button", { class: "btn", type: "button", "data-k": "te-cancel" }, "Cancel"), okb = h("button", { class: "btn primary", type: "button", "data-k": "te-ok" }, "OK");
+  cancel.addEventListener("click", () => done(false)); okb.addEventListener("click", () => done(true));
+  dlg.append(h("div", { class: "kd-title" }, h("span", null, title)), body, h("div", { class: "kd-foot" }, h("span", { class: "spacer" }), cancel, okb)); ov.append(dlg);
+  ov.addEventListener("keydown", (ev) => {
+    ev.stopPropagation(); if (ev.key === "Tab") trapTab(ev, ov);
+    if (ev.key === "Escape") { ev.preventDefault(); done(false); }
+    else if (ev.key === "Enter" && (!multiline || ev.shiftKey || ev.ctrlKey || ev.metaKey) && !(ev.target instanceof HTMLButtonElement)) { ev.preventDefault(); done(true); }
+  });
+  document.body.append(ov); field.focus();
+  return ov;
+}
+/** DisplayError: an "Error" message with an OK button, over the dialog. */
+export const errorMessage = (message: string, then?: () => void): void => { messageBox("Error", message, [{ label: "OK", fn: then }]); };
+
+/** wxMessageBox / confirmation. */
+export function confirmBox(title: string, message: string, okLabel: string, onOk: () => void): void {
+  openDialog({ title, width: 440, okLabel, build(body) { body.append(h("p", { style: "margin:4px 0 6px;white-space:pre-wrap" }, message)); }, ok() { setTimeout(onOk, 0); } });
+}
+
+// ---------------------------------------------------------------- units (UNIT_BINDER)
+type Units = "mm" | "in" | "mil";
+const UNIT: Record<Units, { name: string; per: number; digits: number }> = { mm: { name: "mm", per: 1, digits: 4 }, in: { name: "in", per: 25.4, digits: 5 }, mil: { name: "mils", per: 0.0254, digits: 2 } };
+export const currentUnits = (): Units => (E.units === "in" || E.units === "mil" ? E.units : "mm") as Units;
+export const unitName = (): string => UNIT[currentUnits()].name;
+const trim = (s: string): string => (s.includes(".") ? s.replace(/0+$/, "").replace(/\.$/, "") : s);
+/** A millimetre length in the editor's units, without the unit name ("0.2", "7.87"). */
+export function fmtLen(mm: number, units: Units = currentUnits()): string { const u = UNIT[units] || UNIT.mm; return trim((mm / u.per).toFixed(u.digits)) || "0"; }
+/** …with the unit name, as KiCad's grids and reports show it ("0.2 mm"). */
+export function fmtLenU(mm: number): string { return fmtLen(mm) + " " + unitName(); }
+/**
+ * A typed length in millimetres; NaN when it is no number.  UNIT_BINDER runs NUMERIC_EVALUATOR over the text, so
+ * "0.2", "0.2mm", "8 mils", "0.01in", "0.2+0.3" and "1/4" are all lengths; a bare number is in the editor's units.
+ */
+export function parseLen(text: string, units: Units = currentUnits()): number {
+  const v = evalExpr(text.replace(/\b(mils?|thou)\b/gi, "mil").replace(/\binch\b/gi, "in"), units);
+  return isNaN(v) ? NaN : +v.toFixed(6);
+}
+/** A plain number typed into a UNIT_BINDER without units (an expression is evaluated too). */
+export function parseNum(text: string): number { const v = evalExpr(text, ""); return isNaN(v) ? NaN : v; }
+const isExpr = (text: string): boolean => /[-+*/()]/.test(text.trim().replace(/^[-+]/, "").replace(/e[-+]\d/i, ""));
+/**
+ * UNIT_BINDER::onSetFocus / onKillFocus: the formula typed last comes back when the field takes the focus again,
+ * and is evaluated when it loses it.
+ */
+function bindEval(input: HTMLInputElement, evaluate: (text: string) => string | null): void {
+  let original = "";
+  input.addEventListener("focus", () => { if (original && original !== input.value) { input.value = original; input.select(); } });
+  input.addEventListener("blur", () => { const t = input.value; const out = evaluate(t); if (out !== null) { original = isExpr(t) ? t : ""; if (out !== t) input.value = out; } });
+}
+
+export interface Field<T> { el: HTMLElement; get(): T; set(v: T): void; input: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement }
+/** A length: the text control; pair it with unitLabel() in a form row. */
+export function lenField(mm: number, opts?: { ro?: boolean; key?: string; min?: number; allowEmpty?: boolean; units?: Units; onChange?(v: number): void }): Field<number> & { warn: Warning } {
+  let cur = mm;
+  // `units`: another frame's units than the open editor's (a Preferences page of the schematic editor)
+  const u = (opts && opts.units) || currentUnits(), fmt = (v: number): string => fmtLen(v, u), parse = (t: string): number => parseLen(t, u);
+  const input = h("input", { type: "text", value: opts && opts.allowEmpty && !isFinite(mm) ? "" : fmt(mm), disabled: !!(opts && opts.ro), "data-k": opts && opts.key, "data-units": u });
+  // the value is evaluated when the field loses the focus (an expression shows its result); a typed value that is no
+  // number puts the last good one back
+  bindEval(input, (t) => { const v = parse(t); return isNaN(v) ? null : fmt(opts && opts.min !== undefined ? Math.max(opts.min, v) : v); });
+  input.addEventListener("change", () => { const v = parse(input.value); if (isNaN(v)) { if (opts && opts.allowEmpty && !input.value.trim()) { cur = NaN; return; } input.value = isFinite(cur) ? fmt(cur) : ""; return; } cur = opts && opts.min !== undefined ? Math.max(opts.min, v) : v; if (!isExpr(input.value)) input.value = fmt(cur); if (opts && opts.onChange) opts.onChange(cur); });
+  const warn = warningIcon();
+  // an untouched field gives back the value it was given, not its display rounding (0.58642 shown as 0.5864)
+  return { el: input, input, warn, get: () => { if (isFinite(cur) && input.value === fmt(cur)) return cur; const v = parse(input.value); return isNaN(v) ? cur : (opts && opts.min !== undefined ? Math.max(opts.min, v) : v); }, set(v) { cur = v; input.value = isFinite(v) ? fmt(v) : ""; } };
+}
+/**
+ * FIELD_WARNING_ICON: a small warning sign beside a control, shown with its tooltip while the value breaks a rule
+ * (PANEL_SETUP_CONSTRAINTS::updateWarnings).
+ */
+export interface Warning { el: HTMLElement; set(message: string | null): void }
+export function warningIcon(): Warning {
+  const el = h("span", { class: "pd-warnicon", hidden: true, "data-k": "warning" });
+  el.innerHTML = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5L15 14H1z" style="fill:var(--warn)"/><path d="M8 6v4M8 11.6v.4" style="stroke:var(--paper)" stroke-width="1.6" stroke-linecap="round"/></svg>';
+  return { el, set(m) { el.hidden = !m; el.title = m || ""; } };
+}
+/**
+ * A board position (UNIT_BINDER with SetCoordType( ABS_X_COORD / ABS_Y_COORD )): shown from the user origin with the
+ * axis senses of Preferences > PCB Editor > Origins & Axes, and given back in board coordinates.
+ */
+export function coordField(mm: number, axis: "x" | "y", opts?: { ro?: boolean; key?: string }): Field<number> {
+  // the board value comes back untouched while the shown value is the one it gave (no float drift from the round trip)
+  let raw = mm, shown = toDisplayAbsAxis(mm, axis);
+  const f = lenField(shown, opts);
+  const back = (d: number): number => (d === shown ? raw : +fromDisplayAbsAxis(d, axis).toFixed(6));
+  return { el: f.el, input: f.input, get: () => back(f.get()), set: (v) => { raw = v; shown = toDisplayAbsAxis(v, axis); f.set(shown); } };
+}
+export const unitLabel = (text?: string): HTMLElement => h("span", { class: "unit" }, text === undefined ? unitName() : text);
+export function numField(v: number, opts?: { ro?: boolean; key?: string; digits?: number }): Field<number> {
+  let cur = v; const fmt = (x: number): string => trim(x.toFixed(opts && opts.digits !== undefined ? opts.digits : 6)) || "0";
+  const input = h("input", { type: "text", value: fmt(v), disabled: !!(opts && opts.ro), "data-k": opts && opts.key });
+  bindEval(input, (t) => { const x = parseNum(t); return isNaN(x) ? null : fmt(x); });
+  input.addEventListener("change", () => { const x = parseNum(input.value); if (isNaN(x) || !input.value.trim()) input.value = fmt(cur); else { cur = x; if (!isExpr(input.value)) input.value = fmt(x); } });
+  return { el: input, input, get: () => { if (input.value === fmt(cur)) return cur; const x = parseNum(input.value); return isNaN(x) || !input.value.trim() ? cur : x; }, set(x) { cur = x; input.value = fmt(x); } };
+}
+/**
+ * wxSpinCtrl / wxSpinCtrlDouble: a number entry with up / down arrows (and the arrow keys) that step by `step` and
+ * stay in min..max (`wrap` goes round, wxSP_WRAP); `digits` decimals are shown.  onChange fires on every step and
+ * on a typed value (wxEVT_SPINCTRL).
+ */
+export function spinField(v: number, opts: { min: number; max: number; step?: number; digits?: number; wrap?: boolean; ro?: boolean; key?: string; onChange?(v: number): void }): Field<number> & { enable(on: boolean): void } {
+  const step = opts.step || 1, digits = opts.digits || 0;
+  const clamp = (x: number): number => { if (opts.wrap) { const span = opts.max - opts.min + step; while (x > opts.max) x -= span; while (x < opts.min) x += span; return x; } return Math.min(opts.max, Math.max(opts.min, x)); };
+  const fmt = (x: number): string => x.toFixed(digits);
+  let cur = clamp(v);
+  const input = h("input", { type: "text", value: fmt(cur), disabled: !!opts.ro, "data-k": opts.key, inputmode: "decimal" });
+  const arrow = (d: string): SVGSVGElement => { const t = document.createElement("template"); t.innerHTML = `<svg viewBox="0 0 8 5" width="8" height="5" aria-hidden="true"><path d="${d}" fill="currentColor"/></svg>`; return t.content.firstChild as SVGSVGElement; };
+  const set = (x: number, fire: boolean): void => { const n = clamp(Math.round(x / step) * step); const was = cur; cur = +n.toFixed(Math.max(digits, 6)); input.value = fmt(cur); if (fire && opts.onChange && cur !== was) opts.onChange(cur); };
+  const bump = (dir: number): void => { if (input.disabled) return; set(cur + dir * step, true); };
+  const up = h("button", { type: "button", tabindex: "-1", "data-k": opts.key ? opts.key + "-up" : undefined, "aria-label": "Increment" }, arrow("M0 5L4 0L8 5Z"));
+  const down = h("button", { type: "button", tabindex: "-1", "data-k": opts.key ? opts.key + "-down" : undefined, "aria-label": "Decrement" }, arrow("M0 0L8 0L4 5Z"));
+  up.addEventListener("mousedown", (ev) => { ev.preventDefault(); bump(1); }); down.addEventListener("mousedown", (ev) => { ev.preventDefault(); bump(-1); });
+  input.addEventListener("keydown", (ev) => { if (ev.key === "ArrowUp") { ev.preventDefault(); bump(1); } else if (ev.key === "ArrowDown") { ev.preventDefault(); bump(-1); } });
+  input.addEventListener("change", () => { const x = Number(input.value.replace(",", ".")); if (isNaN(x) || !input.value.trim()) input.value = fmt(cur); else set(x, true); });
+  const el = h("span", { class: "pd-spin" + (opts.ro ? " disabled" : "") }, input, h("span", { class: "arrows" }, up, down));
+  return { el, input, get: () => { const x = Number(input.value.replace(",", ".")); return input.value === fmt(cur) || isNaN(x) || !input.value.trim() ? cur : clamp(x); }, set: (x) => set(x, false),
+    enable: (on) => { input.disabled = !on; el.classList.toggle("disabled", !on); } };
+}
+export function textField(v: string, opts?: { ro?: boolean; key?: string; placeholder?: string }): Field<string> {
+  const input = h("input", { type: "text", value: v, disabled: !!(opts && opts.ro), "data-k": opts && opts.key, placeholder: opts && opts.placeholder });
+  return { el: input, input, get: () => input.value, set(x) { input.value = x; } };
+}
+export function selectField<T extends string | number>(v: T, options: [T, string][], opts?: { ro?: boolean; key?: string; onChange?(v: T): void; icons?: Record<string, string> }): Field<T> {
+  const input = h("k-select", { disabled: !!(opts && opts.ro), "data-k": opts && opts.key });
+  options.forEach(([val, label]) => { const o = h("option", { value: String(val), "data-icon": opts && opts.icons ? opts.icons[String(val)] : undefined }, label); if (String(val) === String(v)) o.selected = true; input.append(o); });
+  if (!options.some(([val]) => String(val) === String(v)) && options.length) input.selectedIndex = 0;
+  const get = (): T => (options[input.selectedIndex] || options[0])[0];
+  if (opts && opts.onChange) { const cb = opts.onChange; input.addEventListener("change", () => cb(get())); }
+  return { el: input, input, get, set(x) { const i = options.findIndex(([val]) => String(val) === String(x)); if (i >= 0) input.selectedIndex = i; } };
+}
+export function checkField(v: boolean, label: string, opts?: { ro?: boolean; key?: string; tip?: string; onChange?(v: boolean): void }): Field<boolean> {
+  const input = h("input", { type: "checkbox", checked: v, disabled: !!(opts && opts.ro), "data-k": opts && opts.key });
+  const el = h("label", { class: "pd-check" + (opts && opts.ro ? " disabled" : ""), title: opts && opts.tip }, input, label);
+  if (opts && opts.onChange) { const cb = opts.onChange; input.addEventListener("change", () => cb(input.checked)); }
+  return { el, input, get: () => input.checked, set(x) { input.checked = x; } };
+}
+
+/** wxStaticBoxSizer: a titled group. */
+export function box(title: string, ...children: Child[]): HTMLElement { return h("div", { class: "pd-box" }, h("div", { class: "hd" }, title), ...children); }
+/** wxRadioBox: a titled group of radio buttons, one per row; enable(i, on) greys one choice (wxRadioBox::Enable( n, on )). */
+let radioSeq = 0;
+export function radioBox(title: string, choices: string[], v: number, opts?: { ro?: boolean; key?: string; onChange?(v: number): void }): Field<number> & { enable(on: boolean): void; enableItem(i: number, on: boolean): void } {
+  const name = "pd-radio-" + (++radioSeq);
+  const inputs = choices.map((c, i) => h("input", { type: "radio", name, checked: i === v, disabled: !!(opts && opts.ro), "data-k": opts && opts.key ? opts.key + "-" + i : undefined }) as HTMLInputElement);
+  const labels = choices.map((c, i) => h("label", { class: "pd-check" }, inputs[i], c));
+  const el = h("fieldset", { class: "pd-radiobox", "data-k": opts && opts.key }, h("legend", null, title), ...labels);
+  const get = (): number => Math.max(0, inputs.findIndex((x) => x.checked));
+  if (opts && opts.onChange) { const cb = opts.onChange; inputs.forEach((x) => x.addEventListener("change", () => cb(get()))); }
+  let enabled = true; const itemOn = choices.map(() => true);
+  const sync = () => inputs.forEach((x, i) => { x.disabled = !!(opts && opts.ro) || !enabled || !itemOn[i]; labels[i].classList.toggle("disabled", x.disabled); });
+  return { el, input: inputs[0], get, set(x) { inputs.forEach((r, i) => { r.checked = i === x; }); },
+    enable(on) { enabled = on; el.classList.toggle("disabled", !on); sync(); }, enableItem(i, on) { itemOn[i] = on; sync(); } };
+}
+/** A label / control / unit grid; rows are [label, control, unit?] or a single element spanning the row. */
+export function form(rows: ([string | Node, Child, Child?, string?] | Child)[], wide?: boolean): HTMLElement {
+  const f = h("div", { class: "pd-form" + (wide ? " wide" : "") });
+  for (const r of rows) {
+    if (Array.isArray(r)) { f.append(h("label", r[3] ? { title: r[3] } : null, r[0]), (r[1] as Node) || h("span"), (r[2] as Node) || h("span")); }
+    else if (r) { const s = h("div", { class: "span" }); s.append(r as Node | string); f.append(s); }
+  }
+  return f;
+}
+export const note = (text: string): HTMLElement => h("p", { class: "pd-note" }, text);
+
+// ---------------------------------------------------------------- notebook and tree book
+export interface Page { label: string; build(el: HTMLElement): void }
+/** wxNotebook: tabs across the top, pages built on first show. */
+export function notebook(pages: Page[], opts?: { start?: number; onShow?(i: number): void; fill?: boolean }): { el: HTMLElement; show(i: number): void; setLabel(i: number, label: string): void; current(): number } {
+  const bar = h("div", { class: "pd-tabs" }), host = h("div", opts && opts.fill ? { style: "flex:1 1 auto;min-height:0;display:flex;flex-direction:column" } : null);
+  const el = h("div", opts && opts.fill ? { style: "display:flex;flex-direction:column;flex:1 1 auto;min-height:0" } : null, bar, host);
+  const built: (HTMLElement | null)[] = pages.map(() => null), tabs: HTMLButtonElement[] = [];
+  let cur = -1;
+  const show = (i: number): void => {
+    if (i === cur || !pages[i]) return;
+    cur = i;
+    tabs.forEach((t, k) => t.classList.toggle("on", k === i));
+    let p = built[i];
+    if (!p) { p = h("div", opts && opts.fill ? { style: "flex:1 1 auto;min-height:0;display:flex;flex-direction:column" } : null); built[i] = p; pages[i].build(p); }
+    host.replaceChildren(p);
+    if (opts && opts.onShow) opts.onShow(i);
+  };
+  pages.forEach((pg, i) => { const t = h("button", { class: "pd-tab", type: "button" }, pg.label); t.addEventListener("click", () => show(i)); tabs.push(t); bar.append(t); });
+  show(opts && opts.start ? opts.start : 0);
+  return { el, show, setLabel(i, label) { if (tabs[i]) tabs[i].textContent = label; }, current: () => cur };
+}
+
+export interface TreeGroup { label: string; pages: Page[] }
+/**
+ * PAGED_DIALOG: groups with sub-pages down the left, the chosen page on the right.  `canLeave` is
+ * onPageChanging's Validate + TransferDataFromWindow of the page being left: false keeps it shown.
+ */
+export function treeBook(groups: TreeGroup[], start?: string, opts?: { canLeave?(label: string): boolean; onShow?(label: string, from: string): void }): { el: HTMLElement; show(label: string, force?: boolean): void; current(): string; built(label: string): boolean; rebuild(label: string): void } {
+  const tree = h("div", { class: "pd-tree" }), page = h("div", { class: "pd-page" }), el = h("div", { class: "pd-book" }, tree, page);
+  const built = new Map<string, HTMLElement>(), leaves = new Map<string, HTMLElement>(), specs = new Map<string, Page>();
+  let cur = "";
+  const show = (label: string, force?: boolean): void => {
+    const pg = specs.get(label); if (!pg || label === cur) return;
+    if (cur && !force && opts && opts.canLeave && !opts.canLeave(cur)) return;
+    const from = cur; cur = label;
+    for (const [l, leaf] of leaves) leaf.classList.toggle("on", l === label);
+    let p = built.get(label);
+    if (!p) { p = h("div", { "data-page": label }); built.set(label, p); pg.build(p); }
+    page.replaceChildren(p); page.scrollTop = 0;
+    if (opts && opts.onShow) opts.onShow(label, from);
+  };
+  for (const g of groups) {
+    tree.append(h("div", { class: "grp" }, g.label));
+    for (const pg of g.pages) { const leaf = h("div", { class: "leaf" }, pg.label); leaf.addEventListener("click", () => show(pg.label)); leaves.set(pg.label, leaf); specs.set(pg.label, pg); tree.append(leaf); }
+  }
+  show(start && specs.has(start) ? start : groups[0].pages[0].label);
+  // a built page is dropped and, when it is the one showing, built again from its sources
+  const rebuild = (label: string): void => {
+    if (!built.has(label)) return;
+    built.delete(label);
+    if (label === cur) { const pg = specs.get(label) as Page; const p = h("div", { "data-page": label }); built.set(label, p); pg.build(p); page.replaceChildren(p); }
+  };
+  return { el, show, current: () => cur, built: (l) => built.has(l), rebuild };
+}
+
+/** WX_INFOBAR at the top of a dialog: ShowMessage (stays) and ShowMessageFor (goes after `ms`). */
+export function infoBar(): { el: HTMLElement; show(message: string, ms?: number): void; hide(): void } {
+  const msg = h("span", { class: "msg", "data-k": "infobar-msg" });
+  const x = h("button", { class: "x", type: "button", title: "Hide this message." }, closeMark());
+  const el = h("div", { class: "pd-infobar", hidden: true, "data-k": "infobar" }, h("span", { class: "pd-warnicon" }), msg, x);
+  (el.firstChild as HTMLElement).innerHTML = warningIcon().el.innerHTML;
+  let timer = 0;
+  const hide = (): void => { el.hidden = true; if (timer) clearTimeout(timer); timer = 0; };
+  x.addEventListener("click", hide);
+  return { el, hide, show(m, ms) { msg.textContent = m; el.hidden = false; if (timer) clearTimeout(timer); timer = ms ? window.setTimeout(hide, ms) : 0; } };
+}
+/** PAGED_DIALOG::SetError's focus part: a text control is selected and focused; a grid cell gets the cursor. */
+export function focusError(ctrl: HTMLElement | null | undefined, row?: number, col?: number): void {
+  if (!ctrl) return;
+  let target: HTMLElement | null = ctrl;
+  if (ctrl.classList.contains("pd-grid") && row !== undefined) {
+    const tr = ctrl.querySelectorAll("tbody tr")[row] as HTMLElement | undefined;
+    const td = tr ? (tr.children[col || 0] as HTMLElement | undefined) : undefined;
+    target = td ? (td.querySelector("input,textarea,k-select") as HTMLElement | null) || td : ctrl;
+    if (td) { td.classList.add("err"); setTimeout(() => td.classList.remove("err"), 3000); td.scrollIntoView({ block: "nearest" }); }
+  }
+  setTimeout(() => { if (!target) return; target.focus(); if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) target.select(); }, 0);
+}
+
+// ---------------------------------------------------------------- grids (WX_GRID)
+/** The BITMAPS these buttons draw (STD_BITMAP_BUTTON / BITMAP_BUTTON in KiCad's dialogs), from the web's KiCad icon pack. */
+export const ICONS = {
+  plus: "small_plus", trash: "small_trash", up: "small_up", down: "small_down", library: "small_library", sort: "small_sort_desc", folder: "small_folder", edit: "small_edit",
+  refresh: "small_refresh", warning: "small_warning",
+  bold: "text_bold", italic: "text_italic", alignLeft: "text_align_left", alignCenter: "text_align_center", alignRight: "text_align_right",
+  valignTop: "text_valign_top", valignCenter: "text_valign_center", valignBottom: "text_valign_bottom", mirror: "text_mirrored", link: "link",
+} as const;
+/**
+ * BITMAP_BUTTON::SetIsCheckButton: an icon that stays pressed.  `group` makes the buttons sharing it a set where at
+ * most one is on (onAlignButton: pressing one releases the others; pressing the pressed one releases it).
+ */
+export function iconToggle(icon: keyof typeof ICONS, title: string, on: boolean, opts?: { key?: string; group?: string; ro?: boolean; onChange?(on: boolean): void }): Field<boolean> & { el: HTMLButtonElement } {
+  const b = bitmapButton(ICONS[icon], title, null, { key: opts && opts.key, disabled: !!(opts && opts.ro), flat: true, cls: "pd-iconbtn pd-tog" + (on ? " on" : "") });
+  b.setAttribute("aria-pressed", on ? "true" : "false"); b.dataset.nopersist = ""; if (opts && opts.group) b.dataset.group = opts.group;
+  const set = (v: boolean): void => { b.classList.toggle("on", v); b.setAttribute("aria-pressed", v ? "true" : "false"); };
+  b.addEventListener("click", () => {
+    const now = !b.classList.contains("on");
+    if (now && opts && opts.group && b.parentElement) for (const o of Array.from(b.parentElement.querySelectorAll<HTMLButtonElement>(`.pd-tog[data-group="${opts.group}"]`))) if (o !== b) { o.classList.remove("on"); o.setAttribute("aria-pressed", "false"); }
+    set(now); if (opts && opts.onChange) opts.onChange(now);
+  });
+  return { el: b, input: b as unknown as HTMLInputElement, get: () => b.classList.contains("on"), set };
+}
+/** iconToggle with a KiCad icon-pack bitmap (BITMAP_BUTTON::SetIsCheckButton over KiBitmapBundle( BITMAPS::name )). */
+export function kiconToggle(name: string, title: string, on: boolean, opts?: { key?: string; group?: string; ro?: boolean; onChange?(on: boolean): void }): Field<boolean> & { el: HTMLButtonElement } {
+  const f = iconToggle("bold", title, on, opts);
+  f.el.replaceChildren(kicadIcon(name, 16)); f.el.dataset.icon = name;
+  return f;
+}
+/** wxStaticBitmap: one of KiCad's bitmaps drawn at `w` x `hgt` px (KiBitmapBundle( BITMAPS::name, size )). */
+export function staticBitmap(bitmap: string, w: number, hgt = w, style?: string): HTMLElement {
+  const s = h("span", { class: "pd-bitmap", "data-bitmap": bitmap, style: style || null });
+  s.append(kicadIcon(bitmap, w, hgt)); return s;
+}
+export function iconButton(icon: keyof typeof ICONS, title: string, fn: () => void, disabled?: boolean): HTMLButtonElement {
+  return bitmapButton(ICONS[icon], title, fn, { disabled: !!disabled, cls: "pd-iconbtn" });
+}
+
+// STD_BITMAP_BUTTON with KiBitmapBundle( BITMAPS::<name> ): the one implementation, in components/kicon-dom
+export { bitmapButton };
+
+export type CellValue = string | number | boolean;
+export interface GridColumn {
+  label: string; key: string; width?: string;
+  /** the header's sort arrow (wxGrid::SetSortingColumn) */
+  sort?: "asc" | "desc";
+  /** text (default), a length in the editor's units, a number, a checkbox, a choice or read-only text */
+  type?: "text" | "len" | "num" | "check" | "select" | "ro" | "color" | "icon";
+  /** an "icon" cell (GRID_CELL_STATUS_ICON_RENDERER): the icon-pack bitmap and its tooltip, or nothing */
+  icon?(row: Record<string, CellValue>, index: number): { icon: string; title: string } | null;
+  /** a text cell's button (GRID_CELL_RUN_FUNCTION_EDITOR): `set` writes the cell and reports the change */
+  button?: { icon: string; title: string; run(row: Record<string, CellValue>, index: number, set: (v: string) => void): void };
+  options?: [string | number, string][];
+  /** a "select" column's bitmaps by option value (GRID_CELL_ICON_TEXT_POPUP: the Line Style column's stroke_* icons) */
+  icons?: Record<string, string>;
+  /** the column header's tooltip (PANEL_SETUP_NETCLASSES::onmouseMove) */
+  tip?: string;
+  /** hidden until shown from the header's right-click menu (WX_GRID::ShowHideColumns) */
+  hidden?: boolean;
+  /** a "color" cell: the swatch opens this picker (GRID_CELL_COLOR_SELECTOR) */
+  pick?(current: string, done: (css: string) => void): void;
+  /** a per-row override: read-only cells (the Default netclass's name) */
+  readOnly?(row: Record<string, CellValue>, index: number): boolean;
+  /** shown for an unset length (NaN) */
+  blank?: string;
+}
+export interface GridApi { el: HTMLElement; rows(): Record<string, CellValue>[]; setRows(rows: Record<string, CellValue>[]): void; selected(): number; select(i: number): void; refresh(): void; columns: GridColumn[];
+  /** every selected row in order: the cursor row and, with `multi`, the rows Shift- and Ctrl-click added (wxGrid::GetSelectedRows) */
+  selectedRows(): number[] }
+/** A CSS colour ("rgba(r, g, b, a)" as KiCad writes it, or #hex) drawn over the checkerboard that shows transparency. */
+export function swatch(css: string): HTMLElement { const sw = h("span", { class: "sw" }); const i = h("i"); i.style.background = css || "transparent"; sw.append(i); return sw; }
+/**
+ * An editable table; `rows` is edited in place (commit reads grid.rows()).  GRID_TRICKS: Ctrl+C copies the row (or
+ * the cell's selected text), Ctrl+V pastes tab- and line-separated text over the cells from the focused one on, and
+ * a right-click on the header shows or hides the optional columns.
+ */
+export function grid(columns: GridColumn[], rows: Record<string, CellValue>[], opts?: { ro?: boolean; height?: string; onSelect?(i: number): void; onChange?(): void; rowClass?(row: Record<string, CellValue>, i: number): string; key?: string;
+  /** Shift-click selects the rows from the last clicked one, Ctrl- (Cmd-) click adds or removes one (wxGrid's row selection) */
+  multi?: boolean }): GridApi {
+  let data = rows, sel = -1, anchor = -1; const more = new Set<number>();
+  const table = h("table"), wrap = h("div", { class: "pd-grid", style: opts && opts.height ? `max-height:${opts.height}` : null, "data-k": opts && opts.key }, table);
+  const changed = (): void => { if (opts && opts.onChange) opts.onChange(); };
+  const isSel = (k: number): boolean => k === sel || more.has(k);
+  const mark = (): void => { Array.from(table.querySelectorAll("tbody tr")).forEach((tr, k) => tr.classList.toggle("sel", isSel(k))); };
+  const select = (i: number): void => { sel = i; anchor = i; more.clear(); mark(); if (opts && opts.onSelect) opts.onSelect(i); };
+  const selectedRows = (): number[] => data.map((_r, k) => k).filter(isSel);
+  const pick = (i: number, ev: PointerEvent): void => {
+    if (!(opts && opts.multi) || (!ev.shiftKey && !ev.ctrlKey && !ev.metaKey)) { if (sel !== i || more.size) select(i); return; }
+    if (ev.shiftKey && anchor >= 0) { more.clear(); for (let k = Math.min(anchor, i); k <= Math.max(anchor, i); k++) more.add(k); sel = i; }
+    else { if (isSel(i) && selectedRows().length > 1) { more.delete(i); if (sel === i) sel = selectedRows()[0]; } else { if (sel >= 0) more.add(sel); sel = i; } anchor = i; }
+    mark(); if (opts && opts.onSelect) opts.onSelect(sel);
+  };
+  const shown = (): GridColumn[] => columns.filter((c) => !c.hidden);
+  const cellText = (c: GridColumn, v: CellValue | undefined): string => c.type === "len" ? (typeof v === "number" && isFinite(v) ? fmtLenU(v) : "") : c.type === "num" ? (typeof v === "number" && isFinite(v) ? trim(v.toFixed(6)) : "") : c.type === "check" ? (v ? "1" : "0") : c.type === "select" ? (((c.options || []).find((o) => String(o[0]) === String(v)) || [0, String(v === undefined ? "" : v)])[1]) : String(v === undefined ? "" : v);
+  /** a pasted text into one cell (the value conversions of the cell's own editor) */
+  const setCell = (row: Record<string, CellValue>, c: GridColumn, text: string): void => {
+    if (c.type === "len") { const x = parseLen(text); row[c.key] = !text.trim() ? NaN : isNaN(x) ? row[c.key] : x; }
+    else if (c.type === "num") { const x = parseNum(text); row[c.key] = !text.trim() ? NaN : isNaN(x) ? row[c.key] : x; }
+    else if (c.type === "check") row[c.key] = /^(1|true|yes)$/i.test(text.trim());
+    else if (c.type === "select") { const o = (c.options || []).find((x) => x[1] === text || String(x[0]) === text); if (o) row[c.key] = o[0]; }
+    else row[c.key] = text;
+  };
+  const refresh = (): void => {
+    table.replaceChildren();
+    const head = h("tr"); for (const c of shown()) head.append(h("th", { style: c.width ? `width:${c.width}` : null, title: c.tip }, c.label, c.sort ? sortArrow(c.sort === "asc") : null));
+    head.addEventListener("contextmenu", (ev) => {
+      if (!columns.some((c) => c.hidden !== undefined)) return;
+      ev.preventDefault();
+      popupMenu(ev.clientX, ev.clientY, columns.filter((c, i) => i > 0 && c.label).map((c) => ({ label: c.label, check: true, checked: !c.hidden, run: () => { c.hidden = !c.hidden; refresh(); } })));
+    });
+    table.append(h("thead", null, head));
+    const body = h("tbody");
+    data.forEach((row, i) => {
+      const tr = h("tr", { class: (isSel(i) ? "sel " : "") + (opts && opts.rowClass ? opts.rowClass(row, i) : "") });
+      tr.addEventListener("pointerdown", (ev) => pick(i, ev));
+      shown().forEach((c, ci) => {
+        const ro = !!(opts && opts.ro) || c.type === "ro" || (c.readOnly ? c.readOnly(row, i) : false);
+        const v = row[c.key];
+        if (c.type === "icon") {
+          const ic = c.icon ? c.icon(row, i) : null;
+          tr.append(h("td", { class: "ico", title: ic ? ic.title : null }, ic ? kicadIcon(ic.icon, 16) : null));
+        } else if (c.type === "check") {
+          const cb = h("input", { type: "checkbox", checked: !!v, disabled: ro }); cb.addEventListener("change", () => { row[c.key] = cb.checked; changed(); });
+          tr.append(h("td", { class: "chk" }, cb));
+        } else if (c.type === "color") {
+          const b = h("button", { type: "button", class: "pd-swatchbtn", disabled: ro, title: String(v || "") }, swatch(String(v || "")));
+          b.addEventListener("click", () => { if (c.pick) c.pick(String(row[c.key] || ""), (css) => { row[c.key] = css; b.replaceChildren(swatch(css)); b.title = css; changed(); }); });
+          tr.append(h("td", null, b));
+        } else if (c.type === "select" && !ro) {
+          const s = h("k-select"); for (const [val, label] of c.options || []) { const o = h("option", { value: String(val), "data-icon": c.icons ? c.icons[String(val)] : undefined }, label); if (String(val) === String(v)) o.selected = true; s.append(o); }
+          s.addEventListener("change", () => { const o = (c.options || [])[s.selectedIndex]; if (o) { row[c.key] = o[0]; changed(); } });
+          tr.append(h("td", null, s));
+        } else if (ro) {
+          const text = c.type === "len" ? (typeof v === "number" && isFinite(v) ? fmtLenU(v) : c.blank || "") : cellText(c, v);
+          const bmp = c.type === "select" && c.icons ? c.icons[String(v)] : undefined;
+          tr.append(h("td", { class: "ro", title: text }, bmp ? h("span", { style: "display:inline-flex;align-items:center;gap:4px" }, kicadIcon(bmp, 40, 10), text) : text));
+        } else {
+          const text = cellText(c, v);
+          const inp = h("input", { type: "text", value: text, placeholder: c.blank, "data-col": c.key });
+          inp.addEventListener("change", () => {
+            if (c.type === "len") { const x = parseLen(inp.value); if (!inp.value.trim()) { row[c.key] = NaN; inp.value = ""; } else if (isNaN(x)) inp.value = text; else { row[c.key] = x; inp.value = fmtLenU(x); } }
+            else if (c.type === "num") { const x = parseNum(inp.value); if (!inp.value.trim()) row[c.key] = NaN; else if (isNaN(x)) inp.value = text; else row[c.key] = x; }
+            else row[c.key] = inp.value;
+            changed();
+          });
+          inp.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter") { ev.stopPropagation(); inp.blur(); return; }
+            const mod = ev.ctrlKey || ev.metaKey;
+            const noSel = inp.selectionStart === inp.selectionEnd;
+            if (mod && ev.key.toLowerCase() === "c" && noSel) {
+              // GRID_TRICKS::copySelectionToClipboard: the row's cells, tab-separated
+              ev.preventDefault();
+              void navigator.clipboard?.writeText(shown().map((x) => cellText(x, row[x.key])).join("\t"));
+            } else if (mod && ev.key.toLowerCase() === "v" && navigator.clipboard && navigator.clipboard.readText) {
+              ev.preventDefault();
+              void navigator.clipboard.readText().then((clip) => {
+                const lines = clip.replace(/\r/g, "").replace(/\n$/, "").split("\n");
+                if (lines.length === 1 && !lines[0].includes("\t")) { const a = inp.selectionStart || 0, b = inp.selectionEnd || 0; inp.value = inp.value.slice(0, a) + lines[0] + inp.value.slice(b); inp.dispatchEvent(new Event("change")); return; }
+                const cols = shown();
+                lines.forEach((line, k) => { const r = data[i + k]; if (!r) return; line.split("\t").forEach((cell, m) => { const col = cols[ci + m]; if (col && col.type !== "ro" && !(col.readOnly && col.readOnly(r, i + k))) setCell(r, col, cell); }); });
+                refresh(); changed();
+              });
+            }
+          });
+          if (c.button) {
+            const bt = c.button;
+            const b = h("button", { type: "button", class: "pd-cellbtn", title: bt.title, tabindex: "-1" }, kicadIcon(bt.icon, 16));
+            b.addEventListener("click", () => bt.run(row, i, (val) => { row[c.key] = val; inp.value = val; changed(); }));
+            tr.append(h("td", { class: "withbtn" }, h("div", { class: "pd-cellwrap" }, inp, b)));
+          } else tr.append(h("td", null, inp));
+        }
+      });
+      body.append(tr);
+    });
+    table.append(body);
+  };
+  refresh();
+  return { el: wrap, rows: () => data, setRows(r) { data = r; sel = -1; anchor = -1; more.clear(); refresh(); }, selected: () => sel, select, refresh, columns, selectedRows };
+}
+/** EDA_LIST_DIALOG: a filter box (wildcards, "*text*", case-insensitive, on the first column), "Items:" and a
+ *  read-only list; OK, Enter or a double-click picks the selected row.  `onPick` gets the row's columns. */
+export interface ListDialogOpts {
+  select?: string; width?: number;
+  /** EDA_LIST_DIALOG::SetListLabel (default "Items:") */
+  listLabel?: string;
+  /** EDA_LIST_DIALOG::SetOKLabel */
+  okLabel?: string;
+  /** SAVE_AS_DIALOG's "Name:" field above the list */
+  name?: { label: string; value: string; invalidChars?: string };
+  /** buttons left of the standard pair ("New Library...") */
+  extra?: { label: string; fn(): void }[];
+  /** TransferDataFromWindow: false (or a promise of false) keeps the dialog open */
+  validate?(row: string[] | null, name: string): boolean | Promise<boolean>;
+  /** OK with the row and the name (when there is a name field) */
+  onOk?(row: string[] | null, name: string): void;
+  /** opened from a dialog: over it, which stays open (DlgSpec.child) */
+  child?: boolean;
+}
+export function listDialog(title: string, headers: string[], items: string[][], onPick: (row: string[]) => void, opts?: ListDialogOpts): DialogApi | null {
+  const cols: GridColumn[] = headers.map((label, i) => ({ key: "c" + i, label, type: "ro" as const }));
+  const toRows = (list: string[][]) => list.map((r) => { const o: Record<string, CellValue> = {}; r.forEach((v, i) => { o["c" + i] = v; }); return o; });
+  let shown = items.slice();
+  const g = grid(cols, toRows(shown), { height: "300px" });
+  const filter = h("input", { type: "text", placeholder: "Filter", "data-k": "filter", style: "width:100%;margin-bottom:6px" });
+  const wild = (pat: string) => new RegExp("^" + pat.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
+  filter.addEventListener("input", () => { const re = wild("*" + filter.value.toLowerCase() + "*"); shown = items.filter((r) => re.test(String(r[0] || "").toLowerCase())); g.setRows(toRows(shown)); if (shown.length) g.select(0); });
+  const nameIn = opts && opts.name ? h("input", { type: "text", "data-k": "name", value: opts.name.value, style: "flex:1" }) as HTMLInputElement : null;
+  if (nameIn && opts!.name!.invalidChars) { const bad = opts!.name!.invalidChars; nameIn.addEventListener("input", () => { const v = nameIn.value.split("").filter((c) => !bad.includes(c)).join(""); if (v !== nameIn.value) nameIn.value = v; }); }
+  let api: DialogApi | null = null; let busy = false;
+  const row = (): string[] | null => { const i = g.selected(); return i >= 0 ? shown[i] || null : null; };
+  const pick = (): boolean => {
+    const r = row(); const name = nameIn ? nameIn.value.trim() : "";
+    if (!opts || (!opts.validate && !opts.onOk)) { if (!r) return false; onPick(r); return true; }
+    if (busy) return false;
+    const v = opts.validate ? opts.validate(r, name) : true;
+    const finish = (ok: boolean) => { busy = false; if (!ok) return; if (opts.onOk) opts.onOk(r, name); else if (r) onPick(r); if (api) api.close(); };
+    if (v instanceof Promise) { busy = true; v.then(finish, () => { busy = false; }); return false; }
+    if (!v) return false;
+    if (opts.onOk) opts.onOk(r, name); else if (r) onPick(r);
+    return true;
+  };
+  api = openDialog({ title, width: opts && opts.width || 400, okLabel: opts && opts.okLabel, extra: opts && opts.extra, child: !!(opts && opts.child),
+    build(body) {
+      if (nameIn) body.append(h("div", { style: "display:flex;align-items:center;gap:6px;margin-bottom:8px" }, h("span", { class: "pd-lbl" }, opts!.name!.label), nameIn));
+      body.append(filter, h("div", { class: "pd-lbl", style: "margin-bottom:4px" }, (opts && opts.listLabel) || "Items:"), g.el);
+      g.el.addEventListener("dblclick", () => { if (pick() && api) api.close(); });
+      const at = opts && opts.select ? shown.findIndex((r) => r[0] === opts.select) : 0; if (shown.length) g.select(Math.max(0, at));
+      setTimeout(() => { if (nameIn) { nameIn.focus(); nameIn.select(); } else filter.focus(); }, 0);
+    },
+    ok() { return pick(); } });
+  return api;
+}
+/** The add / delete buttons KiCad puts under a grid. */
+export function gridButtons(g: GridApi, make: () => Record<string, CellValue>, opts?: { ro?: boolean; canDelete?(row: Record<string, CellValue>, i: number): boolean; onChange?(): void; move?: boolean; addTip?: string; delTip?: string }): HTMLElement {
+  const ro = !!(opts && opts.ro);
+  const bar = h("div", { class: "pd-gridbar" });
+  bar.append(iconButton("plus", (opts && opts.addTip) || "Add row", () => { const rows = g.rows(); rows.push(make()); g.refresh(); g.select(rows.length - 1); const last = g.el.querySelector("tbody tr:last-child input[type=text]") as HTMLInputElement | null; if (last) { last.focus(); last.select(); } if (opts && opts.onChange) opts.onChange(); }, ro));
+  if (opts && opts.move) {
+    const swap = (d: number): void => { const rows = g.rows(), i = g.selected(), j = i + d; if (i < 0 || j < 0 || j >= rows.length) return; [rows[i], rows[j]] = [rows[j], rows[i]]; g.refresh(); g.select(j); if (opts.onChange) opts.onChange(); };
+    bar.append(iconButton("up", "Move up", () => swap(-1), ro), iconButton("down", "Move down", () => swap(1), ro));
+  }
+  bar.append(iconButton("trash", (opts && opts.delTip) || "Delete row", () => { const rows = g.rows(), i = g.selected(); if (i < 0 || i >= rows.length) return; if (opts && opts.canDelete && !opts.canDelete(rows[i], i)) return; rows.splice(i, 1); g.refresh(); g.select(Math.min(i, rows.length - 1)); if (opts && opts.onChange) opts.onChange(); }, ro));
+  return bar;
+}
+
+// ---------------------------------------------------------------- report panel
+export interface ReportLine { severity: string; text: string }
+/** WX_HTML_REPORT_PANEL: the message list with its "Show:" filter row. */
+export function reportPanel(height?: string, opts?: { fileName?: string; empty?: string }): { el: HTMLElement; set(lines: ReportLine[]): void } {
+  ensureCss();
+  const list = h("div", { class: "pd-report", style: `height:${height || "260px"}` });
+  let lines: ReportLine[] = [];
+  const filters: Record<string, Field<boolean>> = {};
+  const draw = (): void => {
+    list.replaceChildren();
+    for (const l of lines) { const key = l.severity === "error" ? "Errors" : l.severity === "warning" ? "Warnings" : l.severity === "action" ? "Actions" : "Infos"; if (!filters.All.get() && !filters[key].get()) continue; list.append(h("div", { class: "ln " + l.severity }, l.text)); }
+    if (!list.childElementCount) list.append(h("div", { class: "ln info" }, lines.length ? "" : opts && opts.empty !== undefined ? opts.empty : "No changes to be made."));
+    const count = (s: string): number => lines.filter((l) => l.severity === s).length;
+    (filters.Errors.el.lastChild as Text).textContent = `Errors (${count("error")})`; (filters.Warnings.el.lastChild as Text).textContent = `Warnings (${count("warning")})`;
+    list.scrollTop = list.scrollHeight;   // WX_HTML_REPORT_PANEL::Flush -> scrollToBottom
+  };
+  const bar = h("div", { class: "pd-row", style: "margin-top:6px" }, h("span", { class: "pd-lbl" }, "Show:"));
+  for (const [name, on] of [["All", true], ["Errors", true], ["Warnings", true], ["Actions", true], ["Infos", true]] as [string, boolean][]) {
+    const f = checkField(on, name, { onChange: (v) => { if (name === "All") for (const k of Object.keys(filters)) filters[k].set(v); else filters.All.set(["Errors", "Warnings", "Actions", "Infos"].every((k) => filters[k].get())); draw(); } });
+    filters[name] = f; bar.append(f.el);
+  }
+  if (opts && opts.fileName) {
+    // onBtnSaveToFile: every line as generatePlainText writes it ("Error: ", "Warning: ", "Info: " before the message)
+    const plain = (l: ReportLine): string => (l.severity === "error" ? "Error: " : l.severity === "warning" ? "Warning: " : l.severity === "info" ? "Info: " : "") + l.text + "\n";
+    const name = opts.fileName;
+    bar.append(h("span", { style: "flex:1" }), h("button", { class: "btn sm", "data-k": "saveReport", onclick: () => download(name, lines.map(plain).join(""), "text/plain;charset=utf-8") }, "Save..."));
+  }
+  const el = h("div", null, list, bar);
+  return { el, set(l) { lines = l; draw(); } };
+}
+
+export function download(name: string, text: string, type = "text/plain"): void {
+  const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name;
+  document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}

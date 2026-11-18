@@ -1,0 +1,374 @@
+{
+ "ch.ethz.atuzlak.splitplane": {
+  "status": "works"
+ },
+ "com.ahmedmikatonik.kisidian": {
+  "status": "works",
+  "note": "Runs here. Notes are written in Markdown with a live preview and kept with the project in this browser. Links in the preview cannot be clicked."
+ },
+ "com.alsoknownasfoo.spinrender": {
+  "status": "works"
+ },
+ "com.github.30350n.pcb2blender": {
+  "status": "works",
+  "note": "It writes the .pcb3d file: the board as VRML in KiCad's own layout, each part's 3D model as a file of its own (KiCad's STEP models, tessellated by the editor's 3D viewer), and the layer drawings. The file's contents are checked here; opening it in Blender has not been tried. This package is the plugin's KiCad 6 version, so it is answered in KiCad 6's terms. A model file the project does not hold is left out."
+ },
+ "com.github.BatNoize.Dial-Scale-FrontPanel-Footprint-Wizard": {
+  "status": "works",
+  "note": "Driven end to end: with 7 major and 24 minor ticks asked for, the footprint it places has exactly those lines at the right radii and angles, its mounting hole and its help circle."
+ },
+ "com.github.DIaLOGIKa-GmbH.kicad-coil-creator": {
+  "status": "works"
+ },
+ "com.github.HaydenHu.Space-Filling-Curve": {
+  "status": "works"
+ },
+ "com.github.HaydenHu.kicad-text-postion-size": {
+  "status": "works"
+ },
+ "com.github.Huaqiu-Electronics.kicad-hqdfm-plugin": {
+  "status": "works",
+  "note": "Its Quick DFM Check runs. Checked on a board with a part turned 45 degrees and tracks at every angle: layer count, board size and area, smallest track width, via rings and hole count are right, and every track-to-track, track-to-pad and pad-to-pad spacing it reports is the true distance to within 3 micrometres. Its online analysis uploads to the vendor's service and needs network access granted."
+ },
+ "com.github.Huaqiu-Electronics.kicad-hqpcb-plugin": {
+  "status": "works",
+  "note": "Runs here. What it sends was checked against a stand-in for the vendor's service built from the plugin's own code, not against the live service: Update Price sends the order form and shows the prices answered; Add to Cart uploads the Gerber and drill files with the form and opens the order page. Needs network access granted."
+ },
+ "com.github.Huaqiu-Electronics.kicad-hqsearch-plugin": {
+  "status": "works",
+  "note": "Runs here. What it sends was checked against a stand-in for the vendor's service built from the plugin's own code, not against the live service: a search lists the parts answered, with price and stock. Needs network access granted."
+ },
+ "com.github.Huaqiu-Electronics.kicad-nextpcb-plugin": {
+  "status": "works",
+  "note": "Runs here. What it sends on the PCB tab was checked against a stand-in for the vendor's service built from the plugin's own code, not against the live service: Update Price sends the order form and shows the prices answered; Add to Cart uploads the Gerber and drill files with the form and opens the order page. The BOM and SMT tab was not checked. Needs network access granted."
+ },
+ "com.github.Mage-Control-Systems-Ltd.NCCM": {
+  "status": "works",
+  "note": "Driven end to end: the rules it writes are read back, and they become the project's custom design rules once you agree."
+ },
+ "com.github.MitjaNemec.Archive3DModels": {
+  "status": "works",
+  "note": "Runs here. Checked on a board that names models of KiCad's 3D library: each was copied into packages3D as a STEP file, the footprints were pointed at the copies, the copies joined the project (the 3D viewer reads them from there), and a model the project does not have was named in the end report. KiCad's library publishes STEP only, so no .wrl copies are made; a model over 8 MB is handed over as a download instead."
+ },
+ "com.github.MitjaNemec.PlaceFootprints": {
+  "status": "works",
+  "note": "Runs here. Select one footprint first; the others are lined up, put in a grid or on a circle from it."
+ },
+ "com.github.MitjaNemec.ReplicateLayout": {
+  "status": "works",
+  "note": "Runs here. Select one footprint of the sheet that is laid out; the other sheets' parts, tracks and zones follow it. Locked footprints stay where they are unless you tick the box."
+ },
+ "com.github.MitjaNemec.SaveRestoreLayout": {
+  "status": "works",
+  "note": "Runs here. Save gives you the layout file as a download; Restore asks you to pick that file and lays the selected sheet out from it."
+ },
+ "com.github.MitjaNemec.SwapStubs": {
+  "status": "works",
+  "note": "Runs here. Select two pads of one footprint; they trade nets on the board, and the two labels at the symbol's pins trade places in the schematic. The editor shows the schematic change and asks before it is applied."
+ },
+ "com.github.Murali8051.Lioncircuits-PCB-Toolkit": {
+  "status": "works",
+  "note": "Driven end to end on a two-layer board: Gerbers, drill files, both BOMs, the position file, the BOM page and the netlist are checked against the board. On boards with inner layers the plugin picks the wrong inner copper layers, in KiCad 9 and later too."
+ },
+ "com.github.SK-Electronics-Consulting.kicad-coil-generators": {
+  "status": "works"
+ },
+ "com.github.Sajitha-Aldeniya.KiCAD-Schematic-Blocks-Plugin": {
+  "status": "works",
+  "note": "Runs here. Copy in the schematic editor, then Save Block; Import puts a block back in the editor's copy buffer for Paste. Blocks are kept with the project in this browser."
+ },
+ "com.github.Steffen-W.KiCad-Parasitics": {
+  "status": "works"
+ },
+ "com.github.Steffen-W.impartGUI": {
+  "status": "works",
+  "note": "Runs here. A part imported by its LCSC number comes as a symbol library and a footprint, which the editor offers to add to the project's libraries. A vendor's part ZIP is imported by dropping it on the plugin's window, since there is no Downloads folder to watch. Checked with a recorded answer from EasyEDA, not the live service; the 3D model was not in that recording. Needs network access granted."
+ },
+ "com.github.SteveMayze.pcb2fritzing": {
+  "status": "works",
+  "note": "Give it an output folder name; the Fritzing part comes as a download. Its optional 3D picture is drawn by the editor's 3D viewer."
+ },
+ "com.github.TheJigsApp.kicad-parts-placer-pcm": {
+  "status": "works"
+ },
+ "com.github.TheJigsApp.kicadtestpoints-pcm": {
+  "status": "works"
+ },
+ "com.github.adamws.kicad-git": {
+  "status": "works",
+  "note": "Its button opens the Save Version dialog, and the version you save there lands in the project's history (checked in the real editor). The version history stands in for git here: a commit is a saved version."
+ },
+ "com.github.adamws.kicad-kbplacer": {
+  "status": "works",
+  "note": "Places the switches from a keyboard layout file and each diode beside its switch, then routes switch to diode and the rows and columns. Checked on a 2 by 2 keyboard: positions, turns and tracks match the layout; where a row and a column would cross on one layer it lays one and leaves the other, as on a desktop."
+ },
+ "com.github.adamws.kicad-via-patterns": {
+  "status": "works"
+ },
+ "com.github.adrianwest.bakery": {
+  "status": "works",
+  "note": "Driven end to end: footprints, symbols and 3D models are copied into project libraries and every part, the schematics and the library table point at them; nothing else on the board changes. Datasheets it cannot download stay as links."
+ },
+ "com.github.aislerhq.PushForKiCad": {
+  "status": "works",
+  "note": "Driven end to end against a stand-in for AISLER's service: the uploaded archive is opened and its Gerbers, drill files, netlist, component list and ODB++ job are checked against the board, and the project id is written to the title block."
+ },
+ "com.github.aivon-pcba.Aivon-Fabrication-Toolkit-for-KiCad": {
+  "status": "works",
+  "note": "Driven end to end: the Gerber and drill archive, BOM, placement file and netlist are opened and checked against the board (every hole drilled, every part at its place)."
+ },
+ "com.github.aivon-pcba.aivon-plug-in-for-kicad": {
+  "status": "works",
+  "note": "Runs here. What it sends was checked against a stand-in for the vendor's service built from the plugin's own code, not against the live service: the upload holds the Gerbers, drill files, netlist and part lists with the board's size and layer count, and the quote page it names is opened. Needs network access granted."
+ },
+ "com.github.andresarmento.kicad2gcode": {
+  "status": "works"
+ },
+ "com.github.asukiaaa.gerber-to-order": {
+  "status": "works",
+  "note": "Driven end to end: the five archives are opened and their Gerbers and drill files checked against the board. Written for KiCad 6; boards with more than six copper layers are beyond the plugin itself."
+ },
+ "com.github.bbenchoff.orthoroute": {
+  "status": "works",
+  "note": "Its router runs on the processor here, in the page: the graphics card acceleration it uses on the desktop (CUDA) is not available in a browser, so large boards route slowly."
+ },
+ "com.github.bennymeg.JLC-Plugin-for-KiCad": {
+  "status": "works",
+  "note": "Driven end to end: the Gerber and drill archive, BOM, placement file and netlist are opened and checked against the board (every hole drilled, every part at its place)."
+ },
+ "com.github.black-ghost-off.autoled": {
+  "status": "works",
+  "note": "Placing LEDs, capacitors and connectors from a picture works, with the footprints of KiCad's own libraries. Its autorouting step starts Freerouting, a Java program, which a browser cannot run: route the result with the editor's own router."
+ },
+ "com.github.cgrassin.kicad-pinout-generator": {
+  "status": "works"
+ },
+ "com.github.cooked.kimotor": {
+  "status": "works"
+ },
+ "com.github.danielboston38.prefab-gate": {
+  "status": "works",
+  "note": "Driven end to end on the editor's own Design Rules Checker and schematic comparison: it blocks a board with footprint mismatches and a short, and passes once they are fixed. A few rare desktop checks are not in the web checker yet (creepage, microvia stacks, net chains, tuning profiles), so a board that relies on those still needs KiCad's own DRC."
+ },
+ "com.github.drandyhaas.kicadroutingtools": {
+  "status": "works",
+  "note": "Routes the nets you tick on its Route tab with its own Rust router, built here for the browser, and puts the tracks on the board. Checked on a six-layer test board: four crossing nets routed, each joining its pads without touching another net."
+ },
+ "com.github.drewsum.kipi": {
+  "status": "unsupported",
+  "note": "Its Qt window and its numpy, scipy and matplotlib parts load. Its solver meshes the copper with the Triangle library, which is compiled code that has no build for the browser."
+ },
+ "com.github.ducky64.SubLayout": {
+  "status": "works"
+ },
+ "com.github.easyw.kicad-action-tools": {
+  "status": "works",
+  "note": "All six commands are checked against the board file: annular rings, position files, move to layer, snap to grid and missing 3D models give the right results. Its DXF export reads the board file the way KiCad 5 wrote it, so on a current board it writes an empty drawing, here and on the desktop alike."
+ },
+ "com.github.easyw.kicad-rf-tools": {
+  "status": "works"
+ },
+ "com.github.f-blaze.velatrace": {
+  "status": "partly",
+  "note": "Its window opens and its own router routes the board and draws the preview. Its approval step checks the route with the web editor's Design Rules Checker, which covers fewer rules than KiCad's desktop DRC, and its optional Freerouting engine needs Java on a computer."
+ },
+ "com.github.fablabkerala.gerber2png-plugin-for-kicad": {
+  "status": "partly",
+  "note": "It makes the Gerber archive and hands it over as a download. The Gerber2Png page fetches the archive from a port on your own computer, which a browser tab cannot open: load the downloaded archive in that page instead."
+ },
+ "com.github.g200kg.kicad-gerberzipper2": {
+  "status": "works",
+  "note": "Driven end to end on real Gerber and drill files. On a board that renames its copper layers the plugin does not find the copper files, in KiCad too."
+ },
+ "com.github.gauravmm.hierarchicalpcb": {
+  "status": "works",
+  "note": "Runs here. Checked on a board that uses one sheet twice, with a sub-board layout for that sheet in the project: both sheets' footprints took the sub-board's arrangement around their anchor, its tracks and via were copied, and each sheet's items were grouped."
+ },
+ "com.github.gauravmm.kleplacement": {
+  "status": "works"
+ },
+ "com.github.gregdavill.KiBuzzard": {
+  "status": "works"
+ },
+ "com.github.heronitec-solutions.kicomlib": {
+  "status": "limited",
+  "note": "It opens and can reach a KiComLib server you run yourself once you allow its https address (asked once). Its sync writes library folders and KiCad's global settings on a computer, which the web editor does not have, so it was not proven against a server here."
+ },
+ "com.github.jOaSbA.localize-dependencies": {
+  "status": "works",
+  "note": "Driven end to end with “Also include standard KiCad libraries” ticked, on a project of three sheets and a board: five of KiCad's symbol libraries are copied whole into the project, the footprints too, every symbol and footprint that used them points at the copies, the project's library tables list them and nothing moves; Revert puts it all back. Also run in the browser editor. 3D models are copied the same way (run by hand on a second board, 17 files). Revert works until the page is closed: its backup is too large to keep after that, so use Edit > Undo or Version History then."
+ },
+ "com.github.jOaSbA.via-stitching": {
+  "status": "works"
+ },
+ "com.github.jacmie.PosOrient": {
+  "status": "works"
+ },
+ "com.github.jarrettr.stretch": {
+  "status": "works",
+  "note": "Runs here. To SVG hands over a drawing of the board. To PCB asks for the drawing you changed and carries what moved into the board as one undo step: checked with a track bent in two, a track made wider, a footprint moved and a zone corner pulled in, with everything else left as it was. The plugin writes a bare board file, so only positions are taken from it: items keep their ids and settings; text, arcs, circles and filled shapes drawn on the board are not changed."
+ },
+ "com.github.joelsa.kicad-hide-references-plugin": {
+  "status": "works"
+ },
+ "com.github.jsreynaud.kicad-action-scripts": {
+  "status": "works"
+ },
+ "com.github.kerstensrobin.kicad-breadboard": {
+  "status": "works"
+ },
+ "com.github.kicadlab.CopperFiller": {
+  "status": "works"
+ },
+ "com.github.lou270.pinout-image-generator": {
+  "status": "works"
+ },
+ "com.github.mey-26.kicad-layout-clone": {
+  "status": "works"
+ },
+ "com.github.mey-26.pcb-heatmap": {
+  "status": "works"
+ },
+ "com.github.michaelgaylor.tracklayer": {
+  "status": "works"
+ },
+ "com.github.mitxela.kicad-round-tracks": {
+  "status": "works"
+ },
+ "com.github.mrcpuddington.kobeestudio": {
+  "status": "works",
+  "note": "Runs here. Place artwork puts the label on the board as a footprint that follows the cursor until you click; with an artwork selected the window opens on it and Update artwork replaces it in place."
+ },
+ "com.github.officialdyray.projectinstances": {
+  "status": "works",
+  "note": "Runs here. Checked on a project whose root schematic places one sheet twice, with a sub-board layout for that sheet in the project: ticking the sub-board ticked both instances, their footprints took the sub-board's arrangement around the anchor with their fields, its tracks and via were copied, and each instance's items were grouped."
+ },
+ "com.github.ozzysv.holefinder": {
+  "status": "works"
+ },
+ "com.github.ozzysv.viafence": {
+  "status": "works"
+ },
+ "com.github.pcbway.PCBWay-Fabrication-Toolkit-for-KiCad": {
+  "status": "works",
+  "note": "Driven end to end: the Gerber and drill archive, BOM, placement file and netlist are opened and checked against the board (every hole drilled, every part at its place)."
+ },
+ "com.github.pcbway.PCBWay-Plug-in-for-Kicad": {
+  "status": "works",
+  "note": "Runs here. What it sends was checked against a stand-in for the vendor's service built from the plugin's own code, not against the live service: the upload holds the Gerbers, drill files, netlist and part lists with the board's size and layer count, and the order page it names is opened. Needs network access granted."
+ },
+ "com.github.riehlies.kisi": {
+  "status": "works",
+  "note": "It builds its viewer page for the open board and hands it over as a download; open the downloaded page in your browser."
+ },
+ "com.github.sagarHackeD.PlaceBySchKiCad": {
+  "status": "works"
+ },
+ "com.github.sagarHackeD.SnapToGridKiCAD": {
+  "status": "works"
+ },
+ "com.github.samuelcicuitstudio.traceforge-kicad": {
+  "status": "works",
+  "note": "Its helper and its panel both run in the page and talk over a local port that stays inside the page. The first launch sets its net highlight shortcut and asks to be opened again, as on the desktop. Checked on a board with ground pours: signal path export, rotation, ground stitching on a grid, a via fence along a track and rounded track corners all land where the numbers say. Its other via and trace tools, net colours and manufacturing checks work. Teardrops drive KiCad's own Windows dialog, on the desktop too, and are not available here."
+ },
+ "com.github.seigedigital.setholediameterpluginforkicad": {
+  "status": "works"
+ },
+ "com.github.sijah.center-silk-ref": {
+  "status": "works"
+ },
+ "com.github.sparkfun.SparkFunKiCadCAMmer": {
+  "status": "works",
+  "note": "Driven end to end: the zip is opened and its Gerbers and drill file checked against the board."
+ },
+ "com.github.sparkfun.SparkFunKiCadPanelizer": {
+  "status": "works",
+  "note": "Driven end to end: the 8 by 4 panel file is opened and checked part by part. The panel is saved as its own file; the open board stays as it was."
+ },
+ "com.github.spice-projects.kicad-xyce-plugin": {
+  "status": "unsupported",
+  "note": "The package is a compiled Linux desktop program (xyce-studio) with its own window toolkit, and it starts the Xyce simulator installed on the computer. A browser page cannot run either."
+ },
+ "com.github.tnaegele.kicad-cut-tracks-at-line": {
+  "status": "works"
+ },
+ "com.github.tobiglaser.KiPNG": {
+  "status": "works"
+ },
+ "com.github.ulikoehler.kicad-bulk-hide-silkscreen-designators": {
+  "status": "works"
+ },
+ "com.github.usetraces.traces": {
+  "status": "works",
+  "note": "It needs its own server, traces-serve, installed and started on your computer from the traces repository. The editor asks once before letting it reach that server at 127.0.0.1:8000, and the server must allow requests from this site (CORS). Tested against a stand-in traces server, not the real one."
+ },
+ "com.github.weirdgyn.viastitcher": {
+  "status": "works",
+  "note": "Vias are placed over the zone's filled copper. It keeps its settings per zone on a layer it renames; the editor does not follow a layer rename from a plugin, so it opens with its default settings each time."
+ },
+ "com.github.yaqwsx.kikit": {
+  "status": "works"
+ },
+ "com.github.yuri-ncs.t-junction-teardrops": {
+  "status": "works"
+ },
+ "com.github.z2labs.eagle-exhumer": {
+  "status": "unsupported",
+  "note": "It imports an Eagle project by starting the KiCad desktop program and pressing its menus through the computer's window system. A browser page cannot start or steer another program."
+ },
+ "com.github.z2labs.z2ems": {
+  "status": "limited",
+  "note": "Its windows open and the setup is saved. Simulating needs the Z2 EMS engine, a desktop program."
+ },
+ "com.github.z2labs.z2viacolino": {
+  "status": "works"
+ },
+ "com.gitlab.dennevi.Board2Pdf": {
+  "status": "works"
+ },
+ "com.gitlab.egloff-studio.z0-field-solver": {
+  "status": "works",
+  "note": "Works out track widths for each layer's impedance with its own field solver. Checked on a four-layer board (0.1 mm prepreg) and with the top dielectric made 1.5 mm, as on a two-layer board: the 50 ohm widths agree with the Hammerstad and Jensen formulas. A thick board's mesh holds about 1.5 million cells, so each layer there takes several minutes to solve."
+ },
+ "com.gitlab.egloff-studio.z0-wavelab": {
+  "status": "works",
+  "note": "Net check, Monte Carlo and the wave simulation's numbers and pictures are checked. Its Monte Carlo and wave tabs use the same field solver as Z0 Field Solver, so a thick two-layer board can run out of browser memory there."
+ },
+ "com.gitlab.mgyger.oktizer": {
+  "status": "works"
+ },
+ "com.gitlab.open-hardware-designs.kicad-ec-registration": {
+  "status": "works",
+  "note": "The panel is checked in full. The stencil Gerbers are drawn by the web editor's own Gerber writer."
+ },
+ "com.infernoembedded.vulcans-trials": {
+  "status": "unsupported",
+  "note": "The package holds only a launcher for the vulcans-trials program, a compiled desktop application that is installed separately. Without it the plugin reports that it cannot find the program, on the desktop too."
+ },
+ "com.pcbtools.kinotes": {
+  "status": "works",
+  "note": "Notes and tasks are kept per project in this browser, for you only; collaborators do not see them."
+ },
+ "com.stenchill.kicad": {
+  "status": "works",
+  "note": "Runs here. What it sends was checked against a stand-in for the vendor's service built from the plugin's own code, not against the live service: the paste and outline Gerbers go up with the stencil settings, the progress stream is followed, the mesh files are saved in a dated folder and handed over, and View in 3D opens the shared page. Needs network access granted."
+ },
+ "org.openscopeproject.InteractiveHtmlBom": {
+  "status": "works",
+  "note": "Driven end to end: the page's data is read back and checked against the board (every part and pad at its place, custom-shaped pads, outline, BOM)."
+ },
+ "org.openscopeproject.TransformIt": {
+  "status": "works"
+ },
+ "sierra.kicad.order": {
+  "status": "works",
+  "note": "Runs here. What it sends was checked against a stand-in for Sierra Circuits' service built from the plugin's own code, not against the live service: as a guest it fills the quote from the board (size, layers, hole count), uploads the board file, shows the prices answered and opens the order page for the price chosen. Needs network access granted."
+ },
+ "vn.thanhduongvs.component-position": {
+  "status": "works",
+  "note": "Driven end to end: both CSV files are opened; every part is listed at its own place and counted once."
+ },
+ "vn.thanhduongvs.fanout-tool": {
+  "status": "works"
+ }
+}
